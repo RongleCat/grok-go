@@ -5,6 +5,9 @@ use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::error::AppResult;
@@ -220,20 +223,21 @@ pub fn load_config() -> AppResult<AppConfig> {
         return Ok(cached);
     }
     let path = config_path()?;
-    if !path.exists() {
-        let cfg = AppConfig::default();
-        save_config(&cfg)?;
-        return Ok(cfg);
-    }
-    let raw = fs::read_to_string(path)?;
-    let cfg: AppConfig = serde_json::from_str(&raw)?;
+    let cfg = match load_json_file::<AppConfig>(&path, "config")? {
+        Some(cfg) => cfg,
+        None => {
+            let cfg = AppConfig::default();
+            save_config(&cfg)?;
+            return Ok(cfg);
+        }
+    };
     *CONFIG_CACHE.write() = Some(cfg.clone());
     Ok(cfg)
 }
 
 pub fn save_config(config: &AppConfig) -> AppResult<()> {
     let path = config_path()?;
-    fs::write(path, serde_json::to_string_pretty(config)?)?;
+    write_json_atomic(&path, config)?;
     *CONFIG_CACHE.write() = Some(config.clone());
     Ok(())
 }
@@ -243,20 +247,21 @@ pub fn load_auth() -> AppResult<AuthStore> {
         return Ok(cached);
     }
     let path = auth_path()?;
-    if !path.exists() {
-        let store = AuthStore::default();
-        save_auth(&store)?;
-        return Ok(store);
-    }
-    let raw = fs::read_to_string(path)?;
-    let store: AuthStore = serde_json::from_str(&raw)?;
+    let store = match load_json_file::<AuthStore>(&path, "auth")? {
+        Some(store) => store,
+        None => {
+            let store = AuthStore::default();
+            save_auth(&store)?;
+            return Ok(store);
+        }
+    };
     *AUTH_CACHE.write() = Some(store.clone());
     Ok(store)
 }
 
 pub fn save_auth(store: &AuthStore) -> AppResult<()> {
     let path = auth_path()?;
-    fs::write(&path, serde_json::to_string_pretty(store)?)?;
+    write_json_atomic(&path, store)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -264,6 +269,133 @@ pub fn save_auth(store: &AuthStore) -> AppResult<()> {
     }
     *AUTH_CACHE.write() = Some(store.clone());
     Ok(())
+}
+
+/// Load a JSON config file, recovering from common Windows first-run failures:
+/// empty file, whitespace-only, UTF-8 BOM, or corrupt JSON.
+///
+/// Returns `Ok(None)` when the file is missing or was reset to defaults (caller
+/// should write a fresh default). Returns `Ok(Some(T))` when parse succeeds.
+fn load_json_file<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    label: &str,
+) -> AppResult<Option<T>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)?;
+    // Strip BOM before trim: Notepad "UTF-8 with BOM" is common on Windows.
+    let trimmed = strip_utf8_bom(&raw).trim();
+    if trimmed.is_empty() {
+        tracing::warn!(
+            "{label} file is empty at {}; recreating defaults",
+            path.display()
+        );
+        backup_corrupt_file(path, label, "empty");
+        return Ok(None);
+    }
+    match serde_json::from_str::<T>(trimmed) {
+        Ok(value) => Ok(Some(value)),
+        Err(err) => {
+            tracing::error!(
+                "{label} file is invalid JSON at {} ({err}); backing up and recreating defaults",
+                path.display()
+            );
+            backup_corrupt_file(path, label, "invalid-json");
+            Ok(None)
+        }
+    }
+}
+
+fn strip_utf8_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
+/// Move a bad file aside under `~/.grok-go/backups/` so users can recover tokens.
+fn backup_corrupt_file(path: &Path, label: &str, reason: &str) {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let backups = parent.join("backups");
+    if let Err(err) = fs::create_dir_all(&backups) {
+        tracing::warn!("failed to create backups dir {}: {err}", backups.display());
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(label);
+    let dest = if backups.is_dir() {
+        backups.join(format!("{file_name}.{reason}.{ts}.bak"))
+    } else {
+        path.with_extension(format!("{reason}.{ts}.bak"))
+    };
+    match fs::rename(path, &dest) {
+        Ok(()) => tracing::warn!("backed up corrupt {label} to {}", dest.display()),
+        Err(err) => {
+            // Windows can fail rename if the file is locked; try copy+remove.
+            tracing::warn!(
+                "rename backup failed for {label} ({}): {err}; trying copy",
+                path.display()
+            );
+            if let Err(copy_err) = fs::copy(path, &dest) {
+                tracing::error!("copy backup also failed for {label}: {copy_err}");
+            } else {
+                let _ = fs::remove_file(path);
+                tracing::warn!("backed up corrupt {label} via copy to {}", dest.display());
+            }
+        }
+    }
+}
+
+/// Atomic-ish JSON write: temp file in the same directory then rename.
+/// Avoids truncated config/auth files if the process crashes mid-write
+/// (empty file → classic `expected value at line 1 column 1` on next launch).
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(value)?;
+    let tmp = atomic_tmp_path(path);
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+    }
+    // Prefer rename. On Windows, rename cannot replace an existing file — remove first.
+    // Keep the temp path in errors so a failed finalize does not silently lose data.
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(err) if path.exists() => {
+            fs::remove_file(path)?;
+            fs::rename(&tmp, path).map_err(|rename_err| {
+                crate::error::AppError::msg(format!(
+                    "failed to finalize {} (temp left at {}): {rename_err} (earlier: {err})",
+                    path.display(),
+                    tmp.display()
+                ))
+            })
+        }
+        Err(err) => Err(crate::error::AppError::msg(format!(
+            "failed to finalize {} (temp left at {}): {err}",
+            path.display(),
+            tmp.display()
+        ))),
+    }
+}
+
+fn atomic_tmp_path(path: &Path) -> PathBuf {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file.json");
+    path.with_file_name(format!(".{file_name}.{ts}.tmp"))
 }
 
 /// Update an account in the in-memory cache only (no disk I/O).
@@ -296,4 +428,87 @@ pub fn resolve_model(config: &AppConfig, requested: &str) -> (String, String) {
         return (requested.to_string(), "passthrough".into());
     }
     (config.default_model.clone(), "default-fallback".into())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("grok-go-config-{label}-{ts}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn strip_bom_and_whitespace() {
+        assert_eq!(strip_utf8_bom("\u{feff}{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(strip_utf8_bom("plain"), "plain");
+    }
+
+    #[test]
+    fn load_json_empty_file_returns_none() {
+        let dir = temp_dir("empty");
+        let path = dir.join("auth.json");
+        fs::write(&path, "").expect("write empty");
+        let result = load_json_file::<AuthStore>(&path, "auth").expect("load");
+        assert!(result.is_none());
+        // Empty file should have been backed up / moved aside.
+        assert!(!path.exists());
+        let backups = dir.join("backups");
+        assert!(backups.is_dir());
+        assert!(fs::read_dir(&backups).unwrap().count() >= 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_json_bom_prefixed_ok() {
+        let dir = temp_dir("bom");
+        let path = dir.join("auth.json");
+        let body = "\u{feff}{\n  \"accounts\": []\n}\n";
+        fs::write(&path, body).expect("write bom");
+        let result = load_json_file::<AuthStore>(&path, "auth").expect("load");
+        assert!(result.is_some());
+        assert!(result.unwrap().accounts.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_json_invalid_backs_up_and_returns_none() {
+        let dir = temp_dir("bad");
+        let path = dir.join("config.json");
+        fs::write(&path, "not-json-at-all").expect("write bad");
+        let result = load_json_file::<AppConfig>(&path, "config").expect("load");
+        assert!(result.is_none());
+        assert!(!path.exists());
+        let backups = dir.join("backups");
+        assert!(backups.is_dir());
+        let count = fs::read_dir(&backups).unwrap().count();
+        assert!(count >= 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_json_atomic_roundtrip() {
+        let dir = temp_dir("atomic");
+        let path = dir.join("config.json");
+        let cfg = AppConfig::default();
+        write_json_atomic(&path, &cfg).expect("write");
+        let loaded: AppConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.preferred_port, cfg.preferred_port);
+        // Overwrite existing (Windows rename path).
+        let mut cfg2 = cfg.clone();
+        cfg2.preferred_port = 9999;
+        write_json_atomic(&path, &cfg2).expect("overwrite");
+        let loaded2: AppConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded2.preferred_port, 9999);
+        let _ = fs::remove_dir_all(dir);
+    }
 }

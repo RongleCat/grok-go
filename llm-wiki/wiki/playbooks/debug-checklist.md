@@ -44,6 +44,15 @@
 1. 怀疑 sanitize 覆盖不全 → 看 `sanitize.rs` 与相关单测
 2. 抓一份最小复现请求体（脱敏）再改转换逻辑
 
+
+## 概览/账号页：`expected value at line 1 column 1`
+
+1. 这是 `config.json` / `auth.json` JSON 解析失败（常见：空文件、写一半崩溃、Windows 记事本 BOM）
+2. 看 `~/.grok-go/backups/` 是否有 `*.bak`（应用会自动备份坏文件并重建默认）
+3. 确认 `~/.grok-go/config.json` 与 `auth.json` 现在是合法 JSON（至少 `{}` / `{"accounts":[]}`）
+4. 若备份里有 token，可手工合并回 `auth.json` 后重启
+5. 仍失败：删空的 config/auth 让应用重建，或查日志目录 `~/.grok-go/logs/`
+
 ## 相关页面
 
 - [[../modules/auth-oauth]]

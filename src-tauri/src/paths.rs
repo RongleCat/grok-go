@@ -60,3 +60,18 @@ pub fn cc_switch_db_path() -> PathBuf {
         .map(|b| b.home_dir().join(".cc-switch").join("cc-switch.db"))
         .unwrap_or_else(|| PathBuf::from(".cc-switch/cc-switch.db"))
 }
+
+/// Official Grok Build / Grok CLI config home (`~/.grok`).
+pub fn grok_build_home() -> PathBuf {
+    std::env::var("GROK_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::BaseDirs::new()
+                .map(|b| b.home_dir().join(".grok"))
+                .unwrap_or_else(|| PathBuf::from(".grok"))
+        })
+}
+
+pub fn grok_build_config_path() -> PathBuf {
+    grok_build_home().join("config.toml")
+}

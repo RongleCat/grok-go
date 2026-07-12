@@ -9,7 +9,7 @@ use crate::error::AppResult;
 use crate::gateway::server::{start_gateway, GatewayState};
 use crate::integrations::{
     import_cc_switch_provider, inject_codex_agents_guide, integration_status, set_codex_mcp_inject,
-    IntegrationStatus,
+    set_grok_build_inject as set_grok_build_inject_impl, IntegrationStatus,
 };
 use crate::router::{list_accounts, remove_account, save_accounts, update_account};
 use crate::usage::{HeatmapDay, RequestLog, UsageStore, UsageSummary};
@@ -357,6 +357,11 @@ pub fn set_mcp_inject(enabled: bool) -> AppResult<IntegrationStatus> {
 #[tauri::command]
 pub fn inject_agents_guide() -> AppResult<IntegrationStatus> {
     inject_codex_agents_guide()
+}
+
+#[tauri::command]
+pub fn set_grok_build_inject(enabled: bool) -> AppResult<IntegrationStatus> {
+    set_grok_build_inject_impl(enabled)
 }
 
 #[tauri::command]

@@ -9,6 +9,7 @@ use crate::config::{load_config, save_config, AppConfig};
 use crate::error::{AppError, AppResult};
 use crate::paths::{
     agents_guide_file_path, app_home, cc_switch_db_path, codex_agents_md_path, codex_config_path,
+    grok_build_config_path,
 };
 
 /// Markers around the short reference line in Codex `AGENTS.md`.
@@ -33,6 +34,9 @@ const MCP_SERVER_ID: &str = "grok-go";
 const MCP_SERVER_ID_LEGACY: &str = "grok-proxy";
 const MCP_SERVER_IDS: &[&str] = &[MCP_SERVER_ID, MCP_SERVER_ID_LEGACY];
 
+/// Legacy mistaken inject key (single custom model) — cleaned up on inject/remove.
+const GROK_BUILD_LEGACY_MODEL_KEY: &str = "grok-go";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationStatus {
@@ -44,8 +48,13 @@ pub struct IntegrationStatus {
     /// Absolute path to the versioned guide file under `~/.grok-go/agents-guide.md`.
     pub agents_guide_file_path: String,
     pub cc_switch_db_path: String,
+    /// Whether `~/.grok/config.toml` has a GrokGo model entry pointing at this gateway.
+    pub grok_build_injected: bool,
+    pub grok_build_config_path: String,
     pub provider_snippet: String,
     pub mcp_snippet: String,
+    /// Ready-to-paste Grok Build custom model block.
+    pub grok_build_snippet: String,
 }
 
 pub fn integration_status() -> AppResult<IntegrationStatus> {
@@ -66,6 +75,13 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
     let guide_file = agents_guide_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    let grok_path = grok_build_config_path();
+    let grok_injected = if grok_path.exists() {
+        let raw = fs::read_to_string(&grok_path).unwrap_or_default();
+        grok_build_is_injected(&raw, &config)
+    } else {
+        false
+    };
     Ok(IntegrationStatus {
         codex_mcp_injected: injected,
         codex_config_path: codex_path.display().to_string(),
@@ -73,8 +89,11 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
         codex_agents_path: agents_path.display().to_string(),
         agents_guide_file_path: guide_file,
         cc_switch_db_path: cc_switch_db_path().display().to_string(),
+        grok_build_injected: grok_injected,
+        grok_build_config_path: grok_path.display().to_string(),
         provider_snippet: provider_snippet(&config),
         mcp_snippet: mcp_snippet(&config),
+        grok_build_snippet: grok_build_snippet(&config),
     })
 }
 
@@ -127,6 +146,166 @@ pub fn set_codex_mcp_inject(enabled: bool) -> AppResult<IntegrationStatus> {
         remove_codex_agents_guide()?;
     }
     integration_status()
+}
+
+/// Point Grok Build's **whole inference endpoint** at this gateway (API-key mode).
+///
+/// Official path (Grok Build docs — Custom Models Endpoint):
+/// - `~/.grok/config.toml` → `[endpoints] models_base_url = "http://127.0.0.1:PORT/v1"`
+/// - `XAI_API_KEY` / Bearer = GrokGo `localToken` (not an xAI console key)
+///
+/// When `models_base_url` is set, Grok Build uses API-key auth for all models
+/// (`GET /models` + inference), not a single `[model.*]` override.
+/// Account pool + weighted routing stay entirely inside GrokGo.
+pub fn set_grok_build_inject(enabled: bool) -> AppResult<IntegrationStatus> {
+    let config = load_config()?;
+    if enabled {
+        inject_grok_build_endpoints(&config)?;
+    } else {
+        remove_grok_build_endpoints(&config)?;
+    }
+    integration_status()
+}
+
+fn gateway_base_url(config: &AppConfig) -> String {
+    let host = if config.lan_enabled {
+        local_lan_host()
+    } else {
+        "127.0.0.1".into()
+    };
+    format!("http://{}:{}/v1", host, config.actual_port)
+}
+
+/// Snippet for copy/paste: endpoints block + env vars (API-key mode).
+fn grok_build_snippet(config: &AppConfig) -> String {
+    let base = gateway_base_url(config);
+    let token = config.local_token.as_str();
+    format!(
+        r#"# ~/.grok/config.toml  — full API-key endpoint (not a single custom model)
+[endpoints]
+models_base_url = "{base}"
+
+# Shell (API key = GrokGo local token; GrokGo routes upstream accounts)
+export GROK_MODELS_BASE_URL="{base}"
+export XAI_API_KEY="{token}"
+"#
+    )
+}
+
+fn url_points_at_gateway(url: &str, config: &AppConfig) -> bool {
+    let u = url.trim().trim_end_matches('/');
+    let expected = gateway_base_url(config).trim_end_matches('/').to_string();
+    if u == expected {
+        return true;
+    }
+    // Port match on loopback / LAN bind
+    let port = config.actual_port;
+    (u.contains(&format!("127.0.0.1:{port}"))
+        || u.contains(&format!("localhost:{port}"))
+        || u.contains(&format!("[::1]:{port}")))
+        && (u.ends_with("/v1") || u.contains("/v1/") || u.ends_with(&format!(":{port}/v1")))
+}
+
+/// True when `[endpoints].models_base_url` points at this GrokGo instance.
+fn grok_build_is_injected(raw: &str, config: &AppConfig) -> bool {
+    let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let Some(endpoints) = doc.get("endpoints").and_then(|i| i.as_table()) else {
+        return false;
+    };
+    let Some(base) = endpoints.get("models_base_url").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    url_points_at_gateway(base, config)
+}
+
+fn inject_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
+    let path = grok_build_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let original = if path.exists() {
+        fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    backup_grok_build_config(&original)?;
+
+    let mut doc = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| AppError::msg(format!("invalid ~/.grok/config.toml: {e}")))?
+    };
+
+    let endpoints = doc
+        .entry("endpoints")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
+    let table = endpoints
+        .as_table_mut()
+        .ok_or_else(|| AppError::msg("endpoints is not a table in ~/.grok/config.toml"))?;
+    table["models_base_url"] = toml_edit::value(gateway_base_url(config));
+
+    // Remove legacy single-model inject if present (wrong approach).
+    if let Some(models) = doc.get_mut("model").and_then(|i| i.as_table_mut()) {
+        models.remove(GROK_BUILD_LEGACY_MODEL_KEY);
+        if models.is_empty() {
+            doc.remove("model");
+        }
+    }
+
+    fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
+fn remove_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
+    let path = grok_build_config_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let original = fs::read_to_string(&path)?;
+    backup_grok_build_config(&original)?;
+    let mut doc = original
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| AppError::msg(format!("invalid ~/.grok/config.toml: {e}")))?;
+
+    if let Some(endpoints) = doc.get_mut("endpoints").and_then(|i| i.as_table_mut()) {
+        let ours = endpoints
+            .get("models_base_url")
+            .and_then(|v| v.as_str())
+            .map(|u| url_points_at_gateway(u, config))
+            .unwrap_or(false);
+        if ours {
+            endpoints.remove("models_base_url");
+        }
+        if endpoints.is_empty() {
+            doc.remove("endpoints");
+        }
+    }
+
+    // Always clean legacy model.grok-go if still around.
+    if let Some(models) = doc.get_mut("model").and_then(|i| i.as_table_mut()) {
+        models.remove(GROK_BUILD_LEGACY_MODEL_KEY);
+        if models.is_empty() {
+            doc.remove("model");
+        }
+    }
+
+    fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
+fn backup_grok_build_config(content: &str) -> AppResult<()> {
+    if content.is_empty() {
+        return Ok(());
+    }
+    let backup_dir = app_home()?.join("backups");
+    fs::create_dir_all(&backup_dir)?;
+    let name = format!("grok-config-{}.toml", Utc::now().format("%Y%m%d-%H%M%S"));
+    fs::write(backup_dir.join(name), content)?;
+    Ok(())
 }
 
 /// Ensure `~/.grok-go/agents-guide.md` is current, then upsert a short fixed
@@ -607,5 +786,30 @@ url = "http://127.0.0.1:8787/mcp"
         ));
         // Header alone without url.
         assert!(!codex_mcp_is_injected("[mcp_servers.grok-go]\nenabled = true\n"));
+    }
+
+    #[test]
+    fn grok_build_detects_endpoints_models_base_url() {
+        let mut cfg = AppConfig::default();
+        cfg.actual_port = 8787;
+        let raw = r#"
+[endpoints]
+models_base_url = "http://127.0.0.1:8787/v1"
+"#;
+        assert!(grok_build_is_injected(raw, &cfg));
+    }
+
+    #[test]
+    fn grok_build_ignores_single_model_only() {
+        let mut cfg = AppConfig::default();
+        cfg.actual_port = 8787;
+        // Wrong legacy approach: only [model.grok-go], no endpoints.
+        let raw = r#"
+[model.grok-go]
+model = "grok-build"
+base_url = "http://127.0.0.1:8787/v1"
+api_key = "x"
+"#;
+        assert!(!grok_build_is_injected(raw, &cfg));
     }
 }

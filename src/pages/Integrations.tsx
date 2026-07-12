@@ -19,7 +19,10 @@ import { useI18n } from "@/i18n/context";
 import { PageLoading } from "@/components/page-loading";
 import { cn } from "@/lib/utils";
 
-type TabId = "codex" | "mcp" | "clients";
+type TabId = "codex" | "mcp" | "clients" | "grok-build";
+
+/** Grok Build API-key endpoint inject — code ready, UI hidden until GA. */
+const SHOW_GROK_BUILD_TAB = false;
 
 type ClientSnippet = {
   id: string;
@@ -163,14 +166,17 @@ export function IntegrationsPage() {
     load().catch((e) => setError(String(e)));
   }, [load]);
 
-  const tabs = useMemo(
-    () => [
-      { id: "codex" as const, label: t.integrations.tabCodex },
-      { id: "mcp" as const, label: t.integrations.tabMcp },
-      { id: "clients" as const, label: t.integrations.tabClients },
-    ],
-    [t]
-  );
+  const tabs = useMemo(() => {
+    const list: { id: TabId; label: string }[] = [
+      { id: "codex", label: t.integrations.tabCodex },
+      { id: "mcp", label: t.integrations.tabMcp },
+      { id: "clients", label: t.integrations.tabClients },
+    ];
+    if (SHOW_GROK_BUILD_TAB) {
+      list.push({ id: "grok-build", label: t.integrations.tabGrokBuild });
+    }
+    return list;
+  }, [t]);
 
   const clients = useMemo(
     () => (config ? buildClientSnippets(config, t) : []),
@@ -495,6 +501,71 @@ export function IntegrationsPage() {
               />
             ))}
           </div>
+        )}
+
+        {SHOW_GROK_BUILD_TAB && tab === "grok-build" && (
+          <Card>
+            <CardHeader className="py-3">
+              <CardTitle className="flex items-center gap-2 text-base">
+                {t.integrations.grokBuild}
+                <Badge variant={status.grokBuildInjected ? "success" : "outline"}>
+                  {status.grokBuildInjected
+                    ? t.integrations.grokBuildInjected
+                    : t.integrations.grokBuildNotInjected}
+                </Badge>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="min-w-0 space-y-1">
+                  {t.integrations.grokBuildDesc ? (
+                    <p className="text-sm text-neutral-500">{t.integrations.grokBuildDesc}</p>
+                  ) : null}
+                  <p className="truncate font-mono text-[11px] text-neutral-400">
+                    {status.grokBuildConfigPath}
+                  </p>
+                  {t.integrations.grokBuildEnvHint ? (
+                    <p className="text-xs text-neutral-500">{t.integrations.grokBuildEnvHint}</p>
+                  ) : null}
+                </div>
+                <Switch
+                  checked={status.grokBuildInjected}
+                  disabled={busy !== null}
+                  onCheckedChange={async (v) => {
+                    setBusy("grok-build");
+                    try {
+                      const next = await api.setGrokBuildInject(v);
+                      setStatus(next);
+                      toast(
+                        v
+                          ? t.integrations.grokBuildInjectedMsg
+                          : t.integrations.grokBuildRemovedMsg,
+                        "success"
+                      );
+                    } catch (e) {
+                      toast(String(e), "error");
+                    } finally {
+                      setBusy(null);
+                    }
+                  }}
+                />
+              </div>
+              {status.grokBuildSnippet ? (
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      void copyText(t.integrations.grokBuild, status.grokBuildSnippet)
+                    }
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    {t.common.copy}
+                  </Button>
+                </div>
+              ) : null}
+            </CardContent>
+          </Card>
         )}
       </div>
 

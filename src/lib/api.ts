@@ -139,8 +139,12 @@ export type IntegrationStatus = {
   /** Versioned full guide under ~/.grok-go/agents-guide.md */
   agentsGuideFilePath: string;
   ccSwitchDbPath: string;
+  /** Grok Build ~/.grok/config.toml has GrokGo model entry. */
+  grokBuildInjected: boolean;
+  grokBuildConfigPath: string;
   providerSnippet: string;
   mcpSnippet: string;
+  grokBuildSnippet: string;
 };
 
 export type ModelOptions = {
@@ -181,6 +185,8 @@ export const api = {
   getIntegrations: () => invoke<IntegrationStatus>("get_integrations"),
   setMcpInject: (enabled: boolean) => invoke<IntegrationStatus>("set_mcp_inject", { enabled }),
   injectAgentsGuide: () => invoke<IntegrationStatus>("inject_agents_guide"),
+  setGrokBuildInject: (enabled: boolean) =>
+    invoke<IntegrationStatus>("set_grok_build_inject", { enabled }),
   importToCcSwitch: () => invoke<string>("import_to_cc_switch"),
   exportProviderSnippet: () => invoke<string>("export_provider_snippet"),
 };

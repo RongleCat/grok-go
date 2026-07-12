@@ -8,9 +8,15 @@ import { formatNumber, formatUsd } from "@/lib/utils";
 import { useI18n } from "@/i18n/context";
 import { PageLoading } from "@/components/page-loading";
 import { useToast } from "@/components/ui/toast";
-import { Copy, Download, RefreshCw } from "lucide-react";
+import { Copy, Download, Eye, EyeOff, RefreshCw } from "lucide-react";
 
 const HEATMAP_DAYS = 371;
+
+function maskToken(token: string): string {
+  if (!token) return "";
+  if (token.length <= 8) return "••••••••";
+  return `${token.slice(0, 4)}${"•".repeat(Math.min(token.length - 8, 24))}${token.slice(-4)}`;
+}
 
 export function OverviewPage() {
   const { t } = useI18n();
@@ -20,6 +26,7 @@ export function OverviewPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
+  const [showToken, setShowToken] = useState(false);
 
   async function refresh() {
     try {
@@ -157,18 +164,39 @@ export function OverviewPage() {
           </Button>
         </CardHeader>
         <CardContent className="space-y-2">
-          {[
-            [t.overview.baseUrl, status.baseUrl],
-            [t.overview.mcp, status.mcpUrl],
-            [t.overview.localToken, status.localToken],
-          ].map(([label, value]) => (
+          {(
+            [
+              [t.overview.baseUrl, status.baseUrl, false],
+              [t.overview.mcp, status.mcpUrl, false],
+              [t.overview.localToken, status.localToken, true],
+            ] as const
+          ).map(([label, value, isToken]) => (
             <div key={label} className="rounded-md border border-neutral-200 p-2.5">
               <div className="mb-1 text-xs font-medium text-neutral-500">{label}</div>
               <div className="flex items-center justify-between gap-3">
-                <code className="truncate text-sm">{value}</code>
-                <Button size="icon" variant="ghost" onClick={() => copy(value)}>
-                  <Copy className="h-4 w-4" />
-                </Button>
+                <code className="min-w-0 truncate text-sm">
+                  {isToken && !showToken ? maskToken(value) : value}
+                </code>
+                <div className="flex shrink-0 items-center gap-0.5">
+                  {isToken ? (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      title={showToken ? t.settings.hideToken : t.settings.showToken}
+                      onClick={() => setShowToken((v) => !v)}
+                    >
+                      {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </Button>
+                  ) : null}
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    title={t.common.copy}
+                    onClick={() => copy(value)}
+                  >
+                    <Copy className="h-4 w-4" />
+                  </Button>
+                </div>
               </div>
             </div>
           ))}

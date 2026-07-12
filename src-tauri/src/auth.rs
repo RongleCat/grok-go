@@ -149,17 +149,21 @@ impl OAuthManager {
             qp.append_pair("response_type", "code");
             qp.append_pair("client_id", &config.xai_client_id);
             qp.append_pair("redirect_uri", &redirect_uri);
-            // grok-cli:access + api:access are required for SuperGrok / API quotas
+            // Match official Grok Build OAuth consent scopes (verified from
+            // ~/.grok/auth.json access-token JWT `scope` claim):
+            // openid/profile/email/offline_access + grok-cli:access + api:access
+            // + conversations:read/write (Grok.com chat history read/write).
             qp.append_pair(
                 "scope",
-                "openid profile email offline_access grok-cli:access api:access",
+                "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write",
             );
             qp.append_pair("state", &state);
             qp.append_pair("code_challenge", &code_challenge);
             qp.append_pair("code_challenge_method", "S256");
-            // Known working params for this public client (hermes-agent style)
+            // Same public client as Grok Build CLI; referrer must be grok-build
+            // so the consent screen and token entitlements match Grok Build.
             qp.append_pair("plan", "generic");
-            qp.append_pair("referrer", "hermes-agent");
+            qp.append_pair("referrer", "grok-build");
         }
 
         {

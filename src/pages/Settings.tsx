@@ -670,55 +670,126 @@ export function SettingsPage() {
         )}
 
         {tab === "models" && (
-          <Card>
-            <CardHeader className="py-3">
-              <CardTitle className="text-base">{t.settings.models}</CardTitle>
-            </CardHeader>
-            <CardContent className="grid gap-3 md:grid-cols-3">
-              {t.settings.modelsDesc ? (
-                <p className="text-sm text-neutral-500 md:col-span-3">{t.settings.modelsDesc}</p>
-              ) : null}
-              <div>
-                <Label>{t.settings.defaultText}</Label>
-                <Select
-                  value={config.defaultModel}
-                  onChange={(e) => void applyPatch({ defaultModel: e.target.value })}
-                >
-                  {ensureOption(models?.grokText, config.defaultModel).map((id) => (
-                    <option key={id} value={id}>
-                      {id}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <div>
-                <Label>{t.settings.defaultImage}</Label>
-                <Select
-                  value={config.defaultImageModel}
-                  onChange={(e) => void applyPatch({ defaultImageModel: e.target.value })}
-                >
-                  {ensureOption(models?.grokImage, config.defaultImageModel).map((id) => (
-                    <option key={id} value={id}>
-                      {id}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <div>
-                <Label>{t.settings.defaultVideo}</Label>
-                <Select
-                  value={config.defaultVideoModel}
-                  onChange={(e) => void applyPatch({ defaultVideoModel: e.target.value })}
-                >
-                  {ensureOption(models?.grokVideo, config.defaultVideoModel).map((id) => (
-                    <option key={id} value={id}>
-                      {id}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-            </CardContent>
-          </Card>
+          <div className="space-y-4">
+            <Card>
+              <CardHeader className="py-3">
+                <CardTitle className="text-base">{t.settings.models}</CardTitle>
+              </CardHeader>
+              <CardContent className="grid gap-3 md:grid-cols-3">
+                {t.settings.modelsDesc ? (
+                  <p className="text-sm text-neutral-500 md:col-span-3">{t.settings.modelsDesc}</p>
+                ) : null}
+                <div>
+                  <Label>{t.settings.defaultText}</Label>
+                  <Select
+                    value={config.defaultModel}
+                    onChange={(e) => void applyPatch({ defaultModel: e.target.value })}
+                  >
+                    {ensureOption(models?.grokText, config.defaultModel).map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <div>
+                  <Label>{t.settings.defaultImage}</Label>
+                  <Select
+                    value={config.defaultImageModel}
+                    onChange={(e) => void applyPatch({ defaultImageModel: e.target.value })}
+                  >
+                    {ensureOption(models?.grokImage, config.defaultImageModel).map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <div>
+                  <Label>{t.settings.defaultVideo}</Label>
+                  <Select
+                    value={config.defaultVideoModel}
+                    onChange={(e) => void applyPatch({ defaultVideoModel: e.target.value })}
+                  >
+                    {ensureOption(models?.grokVideo, config.defaultVideoModel).map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader className="py-3">
+                <CardTitle className="text-base">{t.settings.routing}</CardTitle>
+              </CardHeader>
+              <CardContent className="grid gap-3 md:grid-cols-2">
+                <p className="text-sm text-neutral-500 md:col-span-2">{t.settings.routingDesc}</p>
+                <div className="md:col-span-2">
+                  <Label>{t.settings.routingStrategy}</Label>
+                  <Select
+                    value={config.routingStrategy}
+                    onChange={(e) =>
+                      void applyPatch({
+                        routingStrategy: e.target.value as AppConfig["routingStrategy"],
+                      })
+                    }
+                  >
+                    <option value="weighted-round-robin">{t.settings.routingWrr}</option>
+                    <option value="least-recently-used">{t.settings.routingLru}</option>
+                    <option value="lowest-error-rate">{t.settings.routingLowestError}</option>
+                    <option value="fill-first">{t.settings.routingFillFirst}</option>
+                  </Select>
+                </div>
+                <div className="flex items-center justify-between gap-3 rounded-md border border-neutral-200 px-3 py-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">{t.settings.sessionAffinity}</div>
+                    <div className="text-xs text-neutral-500">{t.settings.sessionAffinityDesc}</div>
+                  </div>
+                  <Switch
+                    checked={config.sessionAffinity !== false}
+                    onCheckedChange={(v) => void applyPatch({ sessionAffinity: v })}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3 rounded-md border border-neutral-200 px-3 py-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">{t.settings.quotaAwareRouting}</div>
+                    <div className="text-xs text-neutral-500">{t.settings.quotaAwareRoutingDesc}</div>
+                  </div>
+                  <Switch
+                    checked={config.quotaAwareRouting !== false}
+                    onCheckedChange={(v) => void applyPatch({ quotaAwareRouting: v })}
+                  />
+                </div>
+                <div className="flex items-center justify-between gap-3 rounded-md border border-neutral-200 px-3 py-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">{t.settings.preferSoonestReset}</div>
+                    <div className="text-xs text-neutral-500">{t.settings.preferSoonestResetDesc}</div>
+                  </div>
+                  <Switch
+                    checked={Boolean(config.preferSoonestReset)}
+                    onCheckedChange={(v) => void applyPatch({ preferSoonestReset: v })}
+                  />
+                </div>
+                <div>
+                  <Label>{t.settings.accountMaxConcurrency}</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    value={config.accountMaxConcurrency ?? 6}
+                    onChange={(e) =>
+                      schedulePatch({
+                        accountMaxConcurrency: Math.max(0, Number(e.target.value) || 0),
+                      })
+                    }
+                  />
+                  <p className="mt-1 text-xs text-neutral-500">{t.settings.accountMaxConcurrencyDesc}</p>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
         )}
 
         {tab === "backup" && (

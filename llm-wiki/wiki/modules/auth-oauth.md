@@ -43,3 +43,9 @@
 - `src-tauri/src/auth.rs`
 - `src-tauri/src/config.rs`（Account / AuthStore）
 - `src-tauri/src/commands.rs`（start_oauth_login）
+
+## SuperGrok 周配额
+
+- 与 rate-limit 头分离；见 [[../concepts/account-quota]]
+- 实现：`src-tauri/src/quota.rs`，写入 `Account.quota`
+

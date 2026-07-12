@@ -293,6 +293,19 @@ pub fn clear_account_cooldown(account_id: String) -> AppResult<Vec<Account>> {
     list_accounts()
 }
 
+/// Fetch SuperGrok weekly credit quota for one account (remaining % + reset time).
+#[tauri::command]
+pub async fn refresh_account_quota(account_id: String) -> AppResult<Vec<Account>> {
+    crate::quota::refresh_account_quota(&account_id).await?;
+    list_accounts()
+}
+
+/// Fetch SuperGrok weekly credit quota for every signed-in account.
+#[tauri::command]
+pub async fn refresh_all_account_quotas() -> AppResult<Vec<Account>> {
+    crate::quota::refresh_all_account_quotas().await
+}
+
 #[tauri::command]
 pub async fn start_oauth_login(
     app: tauri::AppHandle,

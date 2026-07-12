@@ -36,7 +36,20 @@ export type AppConfig = {
   defaultImageModel: string;
   defaultVideoModel: string;
   modelMappings: Record<string, string>;
-  routingStrategy: "weighted-round-robin" | "least-recently-used" | "lowest-error-rate";
+  routingStrategy:
+    | "weighted-round-robin"
+    | "least-recently-used"
+    | "lowest-error-rate"
+    | "fill-first";
+  /** Stick multi-turn sessions to one account (default true). */
+  sessionAffinity?: boolean;
+  sessionAffinityTtlSecs?: number;
+  /** Soft-weight by SuperGrok remaining / rate-limit (default true). */
+  quotaAwareRouting?: boolean;
+  /** Prefer accounts whose weekly quota resets soonest (default false). */
+  preferSoonestReset?: boolean;
+  /** Soft per-account in-flight preference cap; 0 = unlimited (default 6). */
+  accountMaxConcurrency?: number;
   autoInjectCodexMcp: boolean;
   launchOnStartup: boolean;
   minimizeToTray: boolean;
@@ -79,6 +92,22 @@ export function isMcpToolEnabled(
 
 export type AppIconStyle = "dark" | "light";
 
+export type QuotaProductUsage = {
+  productId: number;
+  label: string;
+  usedPercent: number;
+};
+
+export type AccountQuota = {
+  usedPercent: number;
+  remainingPercent: number;
+  periodStartAt?: string | null;
+  resetsAt?: string | null;
+  products: QuotaProductUsage[];
+  fetchedAt: string;
+  lastError?: string | null;
+};
+
 export type Account = {
   id: string;
   name: string;
@@ -103,6 +132,8 @@ export type Account = {
   rateLimitRemaining?: number | null;
   rateLimitResetAt?: string | null;
   lastUpstreamError?: string | null;
+  /** SuperGrok weekly credit quota (remaining + reset). */
+  quota?: AccountQuota | null;
 };
 
 export type RequestLog = {
@@ -168,6 +199,9 @@ export const api = {
   replaceAccounts: (accounts: Account[]) => invoke<Account[]>("replace_accounts", { accounts }),
   clearAccountCooldown: (accountId: string) =>
     invoke<Account[]>("clear_account_cooldown", { accountId }),
+  refreshAccountQuota: (accountId: string) =>
+    invoke<Account[]>("refresh_account_quota", { accountId }),
+  refreshAllAccountQuotas: () => invoke<Account[]>("refresh_all_account_quotas"),
   startOAuthLogin: (opts?: { accountName?: string; accountId?: string }) =>
     invoke<{ accountId: string; authorizeUrl: string; browserOpened: boolean }>(
       "start_oauth_login",

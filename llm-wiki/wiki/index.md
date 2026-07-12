@@ -8,6 +8,8 @@
 - [[syntheses/architecture]]：进程内架构、数据目录、请求主路径
 - [[playbooks/agent-onboarding]]：新 Agent 接手检查清单
 - [[queries/faq]]：高频问题
+- [[queries/account-quota-research]]：反代项目如何获取用量/刷新时间（调研结论）
+- [[queries/proxy-cache-routing-research]]：sub2api/CPA 缓存省量与流量分配策略（可借鉴清单）
 
 ## 模块
 
@@ -25,6 +27,7 @@
 
 - [[concepts/model-mapping]]：请求模型名如何解析到 xAI 模型
 - [[concepts/request-sanitize]]：Codex Responses payload 清洗与回写
+- [[concepts/account-quota]]：SuperGrok 周配额 vs API rate-limit 头，如何取剩余用量与重置时间
 
 ## 操作手册
 

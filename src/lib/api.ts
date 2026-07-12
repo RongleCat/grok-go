@@ -1,0 +1,186 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export type UsageSummary = {
+  totalRequests: number;
+  successRequests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  estimatedCostUsd: number;
+};
+
+export type AppStatus = {
+  running: boolean;
+  preferredPort: number;
+  actualPort: number;
+  bindHost: string;
+  lanEnabled: boolean;
+  requireToken: boolean;
+  localToken: string;
+  baseUrl: string;
+  mcpUrl: string;
+  accountCount: number;
+  healthyAccounts: number;
+  lanAddress?: string | null;
+  today: UsageSummary;
+};
+
+export type AppConfig = {
+  preferredPort: number;
+  actualPort: number;
+  bindHost: string;
+  lanEnabled: boolean;
+  requireToken: boolean;
+  localToken: string;
+  defaultModel: string;
+  defaultImageModel: string;
+  defaultVideoModel: string;
+  modelMappings: Record<string, string>;
+  routingStrategy: "weighted-round-robin" | "least-recently-used" | "lowest-error-rate";
+  autoInjectCodexMcp: boolean;
+  launchOnStartup: boolean;
+  minimizeToTray: boolean;
+  xaiClientId: string;
+  xaiBaseUrl: string;
+  oauthRedirectPort: number;
+  /** When true, upstream xAI / OAuth requests use httpProxyUrl. Default false. */
+  httpProxyEnabled: boolean;
+  /** e.g. http://127.0.0.1:7890 or socks5://127.0.0.1:1080 */
+  httpProxyUrl: string;
+  /** Dock / window / tray brand: dark (default) or light. */
+  appIcon: AppIconStyle;
+  /**
+   * MCP tools exposed via tools/list. null/undefined = all enabled.
+   * Explicit array = only those tool names.
+   */
+  mcpEnabledTools?: string[] | null;
+};
+
+/** Canonical MCP tool ids (order matches gateway catalog). */
+export const MCP_TOOL_CATALOG: {
+  id: string;
+  group: "search" | "image" | "video";
+}[] = [
+  { id: "x_search", group: "search" },
+  { id: "image_gen", group: "image" },
+  { id: "image_generate", group: "image" },
+  { id: "image_edit", group: "image" },
+  { id: "video_generate", group: "video" },
+  { id: "video_edit", group: "video" },
+];
+
+export function isMcpToolEnabled(
+  config: Pick<AppConfig, "mcpEnabledTools">,
+  toolId: string
+): boolean {
+  if (config.mcpEnabledTools == null) return true;
+  return config.mcpEnabledTools.includes(toolId);
+}
+
+export type AppIconStyle = "dark" | "light";
+
+export type Account = {
+  id: string;
+  name: string;
+  email?: string | null;
+  enabled: boolean;
+  weight: number;
+  accessToken?: string | null;
+  refreshToken?: string | null;
+  tokenType?: string | null;
+  expiresAt?: string | null;
+  lastRefresh?: string | null;
+  lastSuccessAt?: string | null;
+  lastFailureAt?: string | null;
+  consecutiveFailures: number;
+  health: "healthy" | "degraded" | "cooldown" | "disabled";
+  cooldownUntil?: string | null;
+  dailyLimitUsd?: number | null;
+  monthlyLimitUsd?: number | null;
+  notes?: string | null;
+  /** From upstream x-ratelimit-* headers when present. */
+  rateLimitLimit?: number | null;
+  rateLimitRemaining?: number | null;
+  rateLimitResetAt?: string | null;
+  lastUpstreamError?: string | null;
+};
+
+export type RequestLog = {
+  requestId: string;
+  accountId?: string | null;
+  endpoint: string;
+  requestedModel?: string | null;
+  resolvedModel?: string | null;
+  statusCode: number;
+  latencyMs: number;
+  firstTokenMs?: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheTokens: number;
+  estimatedCostUsd: number;
+  errorSummary?: string | null;
+  clientSource: string;
+  createdAt: string;
+};
+
+export type HeatmapDay = {
+  date: string;
+  requests: number;
+  tokens: number;
+  costUsd: number;
+};
+
+export type IntegrationStatus = {
+  codexMcpInjected: boolean;
+  codexConfigPath: string;
+  codexAgentsInjected: boolean;
+  /** Codex global AGENTS.md (short reference only when injected). */
+  codexAgentsPath: string;
+  /** Versioned full guide under ~/.grok-go/agents-guide.md */
+  agentsGuideFilePath: string;
+  ccSwitchDbPath: string;
+  providerSnippet: string;
+  mcpSnippet: string;
+};
+
+export type ModelOptions = {
+  codex: string[];
+  grokText: string[];
+  grokImage: string[];
+  grokVideo: string[];
+};
+
+export const api = {
+  getStatus: () => invoke<AppStatus>("get_status"),
+  startServer: () => invoke<AppStatus>("start_server"),
+  getConfig: () => invoke<AppConfig>("get_config"),
+  updateConfig: (config: AppConfig) => invoke<AppConfig>("update_config", { config }),
+  setAppIcon: (style: AppIconStyle) => invoke<AppConfig>("set_app_icon", { style }),
+  rotateToken: () => invoke<AppConfig>("rotate_token"),
+  listModelOptions: () => invoke<ModelOptions>("list_model_options"),
+  getAccounts: () => invoke<Account[]>("get_accounts"),
+  upsertAccount: (account: Account) => invoke<Account[]>("upsert_account", { account }),
+  deleteAccount: (accountId: string) => invoke<Account[]>("delete_account", { accountId }),
+  replaceAccounts: (accounts: Account[]) => invoke<Account[]>("replace_accounts", { accounts }),
+  clearAccountCooldown: (accountId: string) =>
+    invoke<Account[]>("clear_account_cooldown", { accountId }),
+  startOAuthLogin: (opts?: { accountName?: string; accountId?: string }) =>
+    invoke<{ accountId: string; authorizeUrl: string; browserOpened: boolean }>(
+      "start_oauth_login",
+      {
+        // Use null so Tauri always receives Option::None (undefined keys can be dropped).
+        accountName: opts?.accountName ?? null,
+        accountId: opts?.accountId ?? null,
+      }
+    ),
+  getUsageSummary: () => invoke<UsageSummary>("get_usage_summary"),
+  getRecentLogs: (limit = 50, offset = 0) =>
+    invoke<RequestLog[]>("get_recent_logs", { limit, offset }),
+  getHeatmap: (days = 371) => invoke<HeatmapDay[]>("get_heatmap", { days }),
+  clearLogs: () => invoke<void>("clear_logs"),
+  getIntegrations: () => invoke<IntegrationStatus>("get_integrations"),
+  setMcpInject: (enabled: boolean) => invoke<IntegrationStatus>("set_mcp_inject", { enabled }),
+  injectAgentsGuide: () => invoke<IntegrationStatus>("inject_agents_guide"),
+  importToCcSwitch: () => invoke<string>("import_to_cc_switch"),
+  exportProviderSnippet: () => invoke<string>("export_provider_snippet"),
+};

@@ -1,0 +1,41 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+src-tauri/target
+*.db
+*.db-*
+.env
+.env.*
+output/
+website/node_modules/
+website/dist/
+website/.next/
+website/.wrangler/
+
+# Local scratch / demo media
+cat-otter-*.png
+cat-otter-*.jpg
+kitten-*.png
+.codex/
+/icons/

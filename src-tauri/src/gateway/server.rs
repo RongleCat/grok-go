@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -15,12 +15,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::config::{load_config, save_config, AppConfig};
+use crate::config::{load_auth, load_config, save_config, Account, AppConfig};
 use crate::error::{AppError, AppResult};
 use crate::gateway::proxy::{authorize_request, list_models_response, proxy_json, ProxyContext};
-use crate::auth::{ensure_fresh_token};
+use crate::auth::ensure_fresh_token;
 use crate::router::{pick_account, replace_account_tokens};
-use crate::config::load_auth;
 use crate::usage::{estimate_cost, RequestLog};
 use crate::gateway::media_artifacts::{
     materialize_image_response, materialize_video_response, media_summary, mcp_media_content,
@@ -102,6 +101,8 @@ fn build_router(state: GatewayState) -> Router {
         .route("/v1/images/edits", post(image_edits))
         .route("/v1/videos/generations", post(video_generations))
         .route("/v1/videos/edits", post(video_edits))
+        // Deferred video job poll (account-sticky via job_affinity).
+        .route("/v1/videos/{request_id}", get(video_job_status))
         .route("/mcp", any(mcp_endpoint))
         .route("/mcp/", any(mcp_endpoint))
         .with_state(state)
@@ -179,6 +180,106 @@ async fn video_generations(State(state): State<GatewayState>, headers: HeaderMap
 
 async fn video_edits(State(state): State<GatewayState>, headers: HeaderMap, body: Bytes) -> Response {
     proxy_json(&state.proxy, Method::POST, "/videos/edits", headers, body, "videos").await
+}
+
+/// Poll a deferred video job. Uses sticky account from submit when known;
+/// otherwise tries enabled accounts until one owns the job (non-404).
+async fn video_job_status(
+    State(state): State<GatewayState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    if let Err(resp) = authorize_request(&headers, &config).await {
+        return resp;
+    }
+    match poll_video_job_http(&state, &config, &request_id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
+}
+
+/// One-shot GET poll for HTTP clients (Codex/curl), with account affinity.
+async fn poll_video_job_http(
+    state: &GatewayState,
+    config: &AppConfig,
+    request_id: &str,
+) -> AppResult<Value> {
+    let store = load_auth()?;
+    let preferred = crate::gateway::job_affinity::lookup_video_job_account(request_id);
+
+    // Build try order: sticky owner first, then other enabled accounts.
+    let mut ordered: Vec<Account> = Vec::new();
+    if let Some(ref id) = preferred {
+        if let Some(a) = store.accounts.iter().find(|a| &a.id == id) {
+            ordered.push(a.clone());
+        }
+    }
+    for a in &store.accounts {
+        if a.enabled
+            && (a.access_token.is_some() || a.refresh_token.is_some())
+            && !ordered.iter().any(|x| x.id == a.id)
+        {
+            ordered.push(a.clone());
+        }
+    }
+    if ordered.is_empty() {
+        return Err(AppError::msg(
+            "no logged-in accounts available for video poll",
+        ));
+    }
+
+    let client = state.proxy.client();
+    let base = config.xai_base_url.trim_end_matches('/');
+    let url = format!("{base}/videos/{request_id}");
+    let mut last_err = String::new();
+
+    for mut account in ordered {
+        let before = account.access_token.clone();
+        let token = match ensure_fresh_token(config, &mut account).await {
+            Ok(t) => t,
+            Err(err) => {
+                last_err = format!("token refresh failed for {}: {err}", account.id);
+                continue;
+            }
+        };
+        if account.access_token != before {
+            let _ = replace_account_tokens(&account);
+        }
+
+        let resp = client
+            .get(&url)
+            .bearer_auth(&token)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| AppError::msg(format!("video poll failed: {e}")))?;
+        let status = resp.status();
+        let value: Value = resp.json().await.unwrap_or(json!({}));
+        if status.as_u16() == 404 {
+            // Wrong account for this job — try next.
+            last_err = format!("404 on {}: {value}", account.id);
+            continue;
+        }
+        if !status.is_success() {
+            last_err = format!("HTTP {status} on {}: {value}", account.id);
+            // Auth failures: try next account; hard errors still try others once.
+            if matches!(status.as_u16(), 401 | 403) {
+                continue;
+            }
+            return Err(AppError::msg(last_err));
+        }
+        // Pin owner for subsequent polls.
+        crate::gateway::job_affinity::remember_video_job(request_id, &account.id);
+        return Ok(value);
+    }
+
+    Err(AppError::msg(format!(
+        "video poll failed for {request_id}: no account owns this job ({last_err})"
+    )))
 }
 
 /// Preferred protocol versions for Codex / modern MCP clients.
@@ -578,9 +679,9 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "input": query,
                 "tools": [tool]
             });
-            let resp = call_upstream(state, config, "/responses", body, "mcp-x_search").await?;
+            let up = call_upstream(state, config, "/responses", body, "mcp-x_search").await?;
             Ok(json!({
-                "content": [{"type": "text", "text": serde_json::to_string_pretty(&resp)?}]
+                "content": [{"type": "text", "text": serde_json::to_string_pretty(&up.value)?}]
             }))
         }
         // Codex skill looks for `image_gen`; keep `image_generate` as alias.
@@ -597,15 +698,16 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 .to_string();
             let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(1);
             let body = json!({"model": model, "prompt": prompt, "n": n});
-            let resp = call_upstream(state, config, "/images/generations", body, "mcp-image").await?;
+            let up = call_upstream(state, config, "/images/generations", body, "mcp-image").await?;
             let client = state.proxy.client();
-            let files = materialize_image_response(&client, &resp).await?;
+            let files = materialize_image_response(&client, &up.value).await?;
             if files.is_empty() {
                 return Err(AppError::msg(format!(
-                    "image generated but failed to materialize local files; upstream={resp}"
+                    "image generated but failed to materialize local files; upstream={}",
+                    up.value
                 )));
             }
-            let summary = media_summary(name, &model, prompt, &files, &resp, "image");
+            let summary = media_summary(name, &model, prompt, &files, &up.value, "image");
             Ok(mcp_media_content(&summary))
         }
         "image_edit" => {
@@ -629,15 +731,16 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "prompt": prompt,
                 "image": {"url": image_url, "type": "image_url"}
             });
-            let resp = call_upstream(state, config, "/images/edits", body, "mcp-image").await?;
+            let up = call_upstream(state, config, "/images/edits", body, "mcp-image").await?;
             let client = state.proxy.client();
-            let files = materialize_image_response(&client, &resp).await?;
+            let files = materialize_image_response(&client, &up.value).await?;
             if files.is_empty() {
                 return Err(AppError::msg(format!(
-                    "image edit succeeded but failed to materialize local files; upstream={resp}"
+                    "image edit succeeded but failed to materialize local files; upstream={}",
+                    up.value
                 )));
             }
-            let summary = media_summary(name, &model, prompt, &files, &resp, "image");
+            let summary = media_summary(name, &model, prompt, &files, &up.value, "image");
             Ok(mcp_media_content(&summary))
         }
         "video_generate" => {
@@ -695,8 +798,9 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 body["resolution"] = json!(res);
             }
 
-            let submit = call_upstream(state, config, "/videos/generations", body, "mcp-video").await?;
-            let final_resp = resolve_video_job(state, config, &submit).await?;
+            // Submit + poll must use the same OAuth account (job is account-scoped).
+            let up = call_upstream(state, config, "/videos/generations", body, "mcp-video").await?;
+            let final_resp = resolve_video_job(state, config, &up.value, &up.account).await?;
             let client = state.proxy.client();
             let files = materialize_video_response(&client, &final_resp).await?;
             if files.is_empty() {
@@ -728,8 +832,8 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "prompt": prompt,
                 "video": {"url": video_url}
             });
-            let submit = call_upstream(state, config, "/videos/edits", body, "mcp-video").await?;
-            let final_resp = resolve_video_job(state, config, &submit).await?;
+            let up = call_upstream(state, config, "/videos/edits", body, "mcp-video").await?;
+            let final_resp = resolve_video_job(state, config, &up.value, &up.account).await?;
             let client = state.proxy.client();
             let files = materialize_video_response(&client, &final_resp).await?;
             if files.is_empty() {
@@ -744,11 +848,22 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
     }
 }
 
+/// Result of one upstream POST, including the account that made it (needed for sticky video poll).
+struct UpstreamResult {
+    value: Value,
+    account: Account,
+}
+
 /// If submit already contains a playable video URL, return it; otherwise poll by request_id.
+///
+/// **Must** poll with the same account that submitted. xAI video `request_id`s are
+/// account-scoped; polling with a different WRR account returns HTTP 404
+/// `{"code":"not-found","error":"Failed to read static file."}`.
 async fn resolve_video_job(
     state: &GatewayState,
     config: &AppConfig,
     submit: &Value,
+    submit_account: &Account,
 ) -> AppResult<Value> {
     // Immediate result (some paths may embed video.url without polling).
     if submit.pointer("/video/url").and_then(|v| v.as_str()).is_some()
@@ -767,8 +882,7 @@ async fn resolve_video_job(
         .ok_or_else(|| AppError::msg(format!("video submit missing request_id: {submit}")))?
         .to_string();
 
-    let store = load_auth()?;
-    let mut account = pick_account(config, &store)?;
+    let mut account = submit_account.clone();
     let before = account.access_token.clone();
     let token = ensure_fresh_token(config, &mut account).await?;
     if account.access_token != before {
@@ -786,7 +900,13 @@ async fn resolve_video_job(
     .await
 }
 
-async fn call_upstream(state: &GatewayState, config: &AppConfig, path: &str, body: Value, source: &str) -> AppResult<Value> {
+async fn call_upstream(
+    state: &GatewayState,
+    config: &AppConfig,
+    path: &str,
+    body: Value,
+    source: &str,
+) -> AppResult<UpstreamResult> {
     let store = load_auth()?;
     let mut account = pick_account(config, &store)?;
     let before = account.access_token.clone();
@@ -800,7 +920,7 @@ async fn call_upstream(state: &GatewayState, config: &AppConfig, path: &str, bod
         .proxy
         .client()
         .post(url)
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .json(&body)
         .send()
         .await?;
@@ -812,7 +932,7 @@ async fn call_upstream(state: &GatewayState, config: &AppConfig, path: &str, bod
     let cache_tokens = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
     crate::usage::enqueue_request_log(RequestLog {
         request_id: Uuid::new_v4().to_string(),
-        account_id: Some(account.id),
+        account_id: Some(account.id.clone()),
         endpoint: path.to_string(),
         requested_model: body.get("model").and_then(|v| v.as_str()).map(|s| s.to_string()),
         resolved_model: body.get("model").and_then(|v| v.as_str()).map(|s| s.to_string()),
@@ -834,7 +954,13 @@ async fn call_upstream(state: &GatewayState, config: &AppConfig, path: &str, bod
     if !status.is_success() {
         return Err(AppError::msg(format!("upstream {status}: {value}")));
     }
-    Ok(value)
+    // Pin deferred video jobs to the submitting account for sticky poll.
+    if path.contains("/videos/generations") || path.contains("/videos/edits") {
+        if let Some(rid) = crate::gateway::job_affinity::extract_video_request_id(&value) {
+            crate::gateway::job_affinity::remember_video_job(&rid, &account.id);
+        }
+    }
+    Ok(UpstreamResult { value, account })
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {

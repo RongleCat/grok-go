@@ -375,6 +375,15 @@ async fn proxy_json_inner(
             }
         }
 
+        // Deferred video jobs are account-scoped — pin owner for later GET poll.
+        if status.is_success()
+            && (path.contains("/videos/generations") || path.contains("/videos/edits"))
+        {
+            if let Some(rid) = crate::gateway::job_affinity::extract_video_request_id(&value) {
+                crate::gateway::job_affinity::remember_video_job(&rid, &account.id);
+            }
+        }
+
         if status.is_success() && !custom_tool_names.is_empty() {
             let _ = rewrite_responses_payload(&mut value, &custom_tool_names);
         }
@@ -635,7 +644,8 @@ async fn run_image_gen_tool_loop(
 
         let http = ctx.client();
         for call in &calls {
-            let result = fulfill_image_gen_call(&http, config, call).await?;
+            // Stay on the same OAuth account as the parent /responses turn.
+            let result = fulfill_image_gen_call(&http, config, call, Some(token)).await?;
             fulfilled_pairs.push((call.clone(), result.clone()));
             if let Value::Array(ref mut arr) = working_input {
                 arr.push(result);

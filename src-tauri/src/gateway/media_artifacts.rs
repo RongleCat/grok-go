@@ -334,8 +334,15 @@ pub async fn poll_video_result(
         let status = resp.status();
         let value: Value = resp.json().await.unwrap_or(json!({}));
         if !status.is_success() {
+            // xAI returns 404 "Failed to read static file" when the job was submitted
+            // under a different OAuth account (or the id is unknown).
+            let hint = if status.as_u16() == 404 {
+                " (hint: video jobs are account-scoped — submit and poll must use the same OAuth token)"
+            } else {
+                ""
+            };
             return Err(AppError::msg(format!(
-                "video poll HTTP {status}: {value}"
+                "video poll HTTP {status}: {value}{hint}"
             )));
         }
 

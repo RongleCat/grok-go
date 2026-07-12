@@ -77,10 +77,14 @@ pub fn collect_image_gen_calls(response: &Value) -> Vec<Value> {
 }
 
 /// Run Grok Imagine for one image_gen function_call / custom_tool_call item.
+///
+/// Prefer `sticky_token` from the parent `/responses` request so multi-step tool
+/// loops stay on the same OAuth account (avoids WRR flip mid-turn).
 pub async fn fulfill_image_gen_call(
     client: &reqwest::Client,
     config: &AppConfig,
     call: &Value,
+    sticky_token: Option<&str>,
 ) -> AppResult<Value> {
     let call_id = call
         .get("call_id")
@@ -112,13 +116,18 @@ pub async fn fulfill_image_gen_call(
     let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 4) as usize;
     let model = config.default_image_model.clone();
 
-    let store = load_auth()?;
-    let mut account = pick_account(config, &store)?;
-    let before = account.access_token.clone();
-    let token = ensure_fresh_token(config, &mut account).await?;
-    if account.access_token != before {
-        replace_account_tokens(&account)?;
-    }
+    let token = if let Some(t) = sticky_token.map(str::trim).filter(|s| !s.is_empty()) {
+        t.to_string()
+    } else {
+        let store = load_auth()?;
+        let mut account = pick_account(config, &store)?;
+        let before = account.access_token.clone();
+        let t = ensure_fresh_token(config, &mut account).await?;
+        if account.access_token != before {
+            replace_account_tokens(&account)?;
+        }
+        t
+    };
 
     let (path, body) = if let Some(ref url) = image_url {
         (

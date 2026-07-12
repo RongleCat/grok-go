@@ -122,16 +122,23 @@ impl UsageStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> AppResult<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(path)?;
         // Gateway writes while UI reads; without WAL/busy timeout the UI stays on
-        // "Loading…" forever with database-is-locked errors.
-        conn.busy_timeout(Duration::from_secs(5))?;
+        // "Loading…" forever with database-is-locked errors. Fresh installs race the
+        // writer thread vs first UI query — keep timeout generous.
+        conn.busy_timeout(Duration::from_secs(15))?;
+        // journal_mode must be set outside a multi-statement batch on some platforms.
+        let _ = conn.query_row("PRAGMA journal_mode=WAL;", [], |row| row.get::<_, String>(0));
         let _ = conn.execute_batch(
             r#"
-            PRAGMA journal_mode=WAL;
             PRAGMA synchronous=NORMAL;
             PRAGMA temp_store=MEMORY;
             PRAGMA cache_size=-8000;
+            PRAGMA busy_timeout=15000;
             "#,
         );
         let store = Self { conn };
@@ -280,23 +287,25 @@ impl UsageStore {
             r#"
             SELECT
               COUNT(*),
-              SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END),
-              COALESCE(SUM(input_tokens),0),
-              COALESCE(SUM(output_tokens),0),
-              COALESCE(SUM(cache_tokens),0),
-              COALESCE(SUM(estimated_cost_usd),0)
+              COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 400 THEN 1 ELSE 0 END), 0),
+              COALESCE(SUM(input_tokens), 0),
+              COALESCE(SUM(output_tokens), 0),
+              COALESCE(SUM(cache_tokens), 0),
+              COALESCE(SUM(estimated_cost_usd), 0.0)
             FROM request_logs
             WHERE created_at >= ?1 AND created_at <= ?2
             "#,
         )?;
         let summary = stmt.query_row(params![start, end], |row| {
             Ok(UsageSummary {
-                total_requests: row.get::<_, i64>(0)? as u64,
-                success_requests: row.get::<_, i64>(1)? as u64,
-                input_tokens: row.get::<_, i64>(2)? as u64,
-                output_tokens: row.get::<_, i64>(3)? as u64,
-                cache_tokens: row.get::<_, i64>(4)? as u64,
-                estimated_cost_usd: row.get(5)?,
+                total_requests: row.get::<_, i64>(0).unwrap_or(0) as u64,
+                success_requests: row
+                    .get::<_, Option<i64>>(1)?
+                    .unwrap_or(0) as u64,
+                input_tokens: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                output_tokens: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                cache_tokens: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                estimated_cost_usd: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
             })
         })?;
         Ok(summary)
@@ -374,10 +383,88 @@ impl UsageStore {
     }
 }
 
+pub fn empty_summary() -> UsageSummary {
+    UsageSummary {
+        total_requests: 0,
+        success_requests: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_tokens: 0,
+        estimated_cost_usd: 0.0,
+    }
+}
+
 pub fn estimate_cost(input_tokens: u64, output_tokens: u64, cache_tokens: u64) -> f64 {
     // rough placeholder pricing for UI until official rates are configured
     let input = input_tokens as f64 / 1_000_000.0 * 3.0;
     let output = output_tokens as f64 / 1_000_000.0 * 15.0;
     let cache = cache_tokens as f64 / 1_000_000.0 * 0.75;
     input + output + cache
+}
+
+
+#[cfg(test)]
+mod usage_store_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_db() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("grok-go-usage-test-{nanos}.db"))
+    }
+
+    #[test]
+    fn empty_db_summary_and_heatmap_ok() {
+        let path = temp_db();
+        let _ = std::fs::remove_file(&path);
+        let store = UsageStore::open(&path).expect("open empty db");
+        let summary = store.today_summary().expect("today summary");
+        assert_eq!(summary.total_requests, 0);
+        assert_eq!(summary.success_requests, 0);
+        assert_eq!(summary.input_tokens, 0);
+        let heat = store.heatmap(14).expect("heatmap");
+        assert_eq!(heat.len(), 14);
+        assert!(heat.iter().all(|d| d.requests == 0));
+        let recent = store.recent(10, 0).expect("recent");
+        assert!(recent.is_empty());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn insert_then_summary() {
+        let path = temp_db();
+        let _ = std::fs::remove_file(&path);
+        let store = UsageStore::open(&path).expect("open");
+        store
+            .insert(&RequestLog {
+                request_id: "r1".into(),
+                account_id: Some("a".into()),
+                endpoint: "/v1/responses".into(),
+                requested_model: Some("gpt-5.5".into()),
+                resolved_model: Some("grok-4.5".into()),
+                status_code: 200,
+                latency_ms: 12,
+                first_token_ms: Some(5),
+                input_tokens: 10,
+                output_tokens: 20,
+                cache_tokens: 0,
+                estimated_cost_usd: 0.01,
+                error_summary: None,
+                client_source: "test".into(),
+                created_at: Utc::now(),
+            })
+            .expect("insert");
+        let summary = store.today_summary().expect("summary");
+        assert_eq!(summary.total_requests, 1);
+        assert_eq!(summary.success_requests, 1);
+        assert_eq!(summary.input_tokens, 10);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
 }

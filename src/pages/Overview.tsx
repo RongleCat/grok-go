@@ -30,10 +30,17 @@ export function OverviewPage() {
 
   async function refresh() {
     try {
-      const [s, h] = await Promise.all([api.getStatus(), api.getHeatmap(HEATMAP_DAYS)]);
+      const s = await api.getStatus();
       setStatus(s);
-      setHeatmap(h);
       setError("");
+      try {
+        const h = await api.getHeatmap(HEATMAP_DAYS);
+        setHeatmap(h);
+      } catch (heatErr) {
+        // Empty DB / first launch should not blank the whole overview.
+        console.warn("heatmap load failed", heatErr);
+        setHeatmap([]);
+      }
     } catch (e) {
       setError(String(e));
     } finally {

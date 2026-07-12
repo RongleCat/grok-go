@@ -140,6 +140,13 @@ pub fn set_codex_mcp_inject(enabled: bool) -> AppResult<IntegrationStatus> {
     save_config(&config)?;
     if enabled {
         inject_codex_mcp(&config)?;
+        // Keep runtime guide in sync with currently enabled tools.
+        let _ = ensure_agents_guide_file_with(&config);
+        // If user already had agents ref, refresh it; otherwise leave AGENTS.md alone
+        // until they explicitly inject the guide.
+        if agents_guide_ref_present_at(&codex_agents_md_path()) {
+            let _ = write_codex_agents_guide_ref();
+        }
     } else {
         remove_codex_mcp()?;
         // MCP uninject also strips the managed AGENTS.md guide block.
@@ -392,69 +399,108 @@ fn backup_codex_config(content: &str) -> AppResult<()> {
 }
 
 /// Full guide body (versioned) written to `~/.grok-go/agents-guide.md`.
-fn agents_guide_file_body() -> String {
+/// Only documents tools currently enabled in `AppConfig.mcp_enabled_tools`.
+/// Runtime inject file for Codex — separate from the repo project `AGENTS.md` / llm-wiki.
+fn agents_guide_file_body(config: &AppConfig) -> String {
     let version = env!("CARGO_PKG_VERSION");
-    format!(
-        r#"# GrokGo 工具指引
+    let mut tools: Vec<&str> = Vec::new();
+    for id in crate::config::default_mcp_tool_ids() {
+        if !config.mcp_tool_enabled(id) {
+            continue;
+        }
+        // Prefer documenting image_gen; skip alias when both are enabled.
+        if *id == "image_generate" && config.mcp_tool_enabled("image_gen") {
+            continue;
+        }
+        tools.push(*id);
+    }
 
-> 版本：{version}  
-> 本文件由 GrokGo 维护，随软件版本更新。请勿手改（重新注入会覆盖）。
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# GrokGo 工具指引\n\n\
+         > 版本：{version}  \n\
+         > 本文件由 GrokGo 维护，随软件版本与「已启用 MCP 工具」同步更新。请勿手改（重新注入会覆盖）。\n\
+         > 与仓库开发用 `AGENTS.md` / `llm-wiki` 无关；此处只服务运行时 MCP 调用。\n\n\
+         ## 强制规则\n\n\
+         - **参数以 MCP `tools/list` 为准**：直接调用，**禁止** web_search 或翻仓库源码猜参数。\n\
+         - 媒体输入可用：`https://` / `data:` / **本地绝对路径** / `file://`（本地会自动转 data URL）。\n\
+         - 返回一律是 `~/.grok-go/artifacts/` 下的**绝对本地路径** + `markdown`，用 `![image](/abs/path)` 渲染；**不要**展示远程 CDN URL。\n\n\
+         ## 当前已启用工具\n\n"
+    ));
 
-## 强制规则
+    if tools.is_empty() {
+        out.push_str("（当前未启用任何 MCP 工具。可在 GrokGo → 集成 → MCP 中开启。）\n\n");
+    } else {
+        for id in &tools {
+            out.push_str(&tool_guide_section(id));
+            out.push('\n');
+        }
+    }
 
-- **参数以 MCP `tools/list` 为准**：直接调用，**禁止** web_search 或翻仓库源码猜参数。
-- 媒体输入可用：`https://` / `data:` / **本地绝对路径** / `file://`（本地会自动转 data URL）。
-- 返回一律是 `~/.grok-go/artifacts/` 下的**绝对本地路径** + `markdown`，用 `![image](/abs/path)` 渲染；**不要**展示远程 CDN URL。
+    out.push_str(
+        "## 健康检查\n\n\
+         ```bash\n\
+         curl -s http://127.0.0.1:8787/health\n\
+         ```\n\n\
+         Responses API Base：`http://127.0.0.1:8787/v1`  \n\
+         MCP：`http://127.0.0.1:8787/mcp`  \n\
+         产物目录：`~/.grok-go/artifacts/`\n",
+    );
+    out
+}
 
-## 工具速查
-
-### `x_search`
-- 必填：`query`
-- 可选：`allowed_handles` `excluded_handles` `from_date` `to_date`（YYYY-MM-DD）
-
-### `image_gen` / `image_generate`
-- 必填：`prompt`
-- 可选：`n`(1–4) `model` `size` `quality`(low|medium|high)
-
-### `image_edit`
-- 必填：`prompt` + `image_url`（URL 或本地路径）
-- 可选：`model`
-
-### `video_generate`（文生视频 / 图生视频 / 多图参考）
-- 必填：`prompt`
-- 模式（三选一）：
-  1. 文生视频：仅 `prompt`
-  2. 图生视频：`prompt` + `image_url`（首帧）
-  3. 多图参考：`prompt` + `reference_image_urls`（1–7，勿与 `image_url` 同用）
-- 可选：`duration`(1–15) `aspect_ratio`(1:1|16:9|9:16|4:3|3:4|3:2|2:3) `resolution`(480p|720p|1080p) `model`
-- 示例图生视频：
-  `{{"prompt":"轻推镜头，微风吹动毛发","image_url":"/abs/path.png","duration":6}}`
-
-### `video_edit`
-- 必填：`prompt` + `video_url`（URL 或本地路径）
-- 可选：`model`
-- 注意：编辑不支持自定义 duration/aspect_ratio
-
-## 健康检查
-
-```bash
-curl -s http://127.0.0.1:8787/health
-```
-
-Responses API Base：`http://127.0.0.1:8787/v1`  
-MCP：`http://127.0.0.1:8787/mcp`  
-产物目录：`~/.grok-go/artifacts/`
-"#
-    )
+fn tool_guide_section(id: &str) -> String {
+    match id {
+        "x_search" => "### `x_search`\n\
+- 必填：`query`\n\
+- 可选：`allowed_handles` `excluded_handles` `from_date` `to_date`（YYYY-MM-DD）\n"
+            .into(),
+        "image_gen" => "### `image_gen`（`image_generate` 同义别名）\n\
+- 必填：`prompt`\n\
+- 可选：`n`(1–4) `model` `size` `quality`(low|medium|high)\n"
+            .into(),
+        "image_generate" => "### `image_generate`（`image_gen` 别名）\n\
+- 必填：`prompt`\n\
+- 可选：`n`(1–4) `model` `size` `quality`(low|medium|high)\n"
+            .into(),
+        "image_edit" => "### `image_edit`\n\
+- 必填：`prompt` + `image_url`（URL 或本地路径）\n\
+- 可选：`model`\n"
+            .into(),
+        "video_generate" => "### `video_generate`（文生视频 / 图生视频 / 多图参考）\n\
+- 必填：`prompt`\n\
+- 模式（三选一）：\n\
+  1. 文生视频：仅 `prompt`\n\
+  2. 图生视频：`prompt` + `image_url`（首帧）\n\
+  3. 多图参考：`prompt` + `reference_image_urls`（1–7，勿与 `image_url` 同用）\n\
+- 可选：`duration`(1–15) `aspect_ratio`(1:1|16:9|9:16|4:3|3:4|3:2|2:3) `resolution`(480p|720p|1080p) `model`\n\
+- 示例：`{\"prompt\":\"轻推镜头，微风吹动毛发\",\"image_url\":\"/abs/path.png\",\"duration\":6}`\n"
+            .into(),
+        "video_edit" => "### `video_edit`\n\
+- 必填：`prompt` + `video_url`（URL 或本地路径）\n\
+- 可选：`model`\n\
+- 注意：编辑不支持自定义 duration/aspect_ratio\n"
+            .into(),
+        other => format!("### `{other}`\n- 参数以 MCP `tools/list` 为准。\n"),
+    }
 }
 
 /// Write/update the versioned guide under the app config directory.
+pub fn refresh_agents_guide_file() -> AppResult<std::path::PathBuf> {
+    ensure_agents_guide_file()
+}
+
 fn ensure_agents_guide_file() -> AppResult<std::path::PathBuf> {
+    let config = load_config()?;
+    ensure_agents_guide_file_with(&config)
+}
+
+fn ensure_agents_guide_file_with(config: &AppConfig) -> AppResult<std::path::PathBuf> {
     let path = agents_guide_file_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, agents_guide_file_body())?;
+    fs::write(&path, agents_guide_file_body(config))?;
     Ok(path)
 }
 
@@ -612,23 +658,31 @@ fn backup_codex_agents_md(content: &str) -> AppResult<()> {
 
 pub fn import_cc_switch_provider() -> AppResult<String> {
     let config = load_config()?;
+    // If MCP inject is currently on (flag or live codex config), ship MCP with the provider.
+    let include_mcp = config.auto_inject_codex_mcp || codex_mcp_currently_injected();
     let db_path = cc_switch_db_path();
     if !db_path.exists() {
-        let payload = provider_export_json(&config);
+        let payload = provider_export_json(&config, include_mcp);
         let export_path = crate::paths::app_home()?.join("cc-switch-provider-export.json");
         fs::write(&export_path, serde_json::to_string_pretty(&payload)?)?;
         return Ok(format!(
-            "CC Switch DB not found. Exported provider JSON to {}",
-            export_path.display()
+            "CC Switch DB not found. Exported provider JSON to {}{}",
+            export_path.display(),
+            if include_mcp { " (includes MCP)" } else { "" }
         ));
     }
 
-    let conn = Connection::open(db_path)?;
+    let conn = Connection::open(&db_path)?;
     let id = Uuid::new_v4().to_string();
     let name = "GrokGo";
-    let settings = provider_settings_config(&config);
+    let settings = provider_settings_config(&config, include_mcp);
     let settings_text = serde_json::to_string(&settings)?;
     let now = Utc::now().timestamp_millis();
+    let notes = if include_mcp {
+        "Imported from GrokGo (provider + MCP)"
+    } else {
+        "Imported from GrokGo"
+    };
     conn.execute(
         r#"
         INSERT INTO providers (
@@ -637,18 +691,139 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
           cost_multiplier, limit_daily_usd, limit_monthly_usd, provider_type
         ) VALUES (?1,'codex',?2,?3,NULL,'custom',?4,NULL,?5,NULL,NULL,'{}',0,0,'1.0',NULL,NULL,NULL)
         "#,
-        params![id, name, settings_text, now, "Imported from GrokGo"],
+        params![id, name, settings_text, now, notes],
     )?;
-    Ok(format!("Imported provider into CC Switch with id {id}"))
+
+    let mut mcp_note = String::new();
+    if include_mcp {
+        match upsert_cc_switch_mcp_server(&conn, &config) {
+            Ok(msg) => mcp_note = format!("; {msg}"),
+            Err(err) => {
+                tracing::warn!("cc-switch mcp_servers upsert failed: {err}");
+                mcp_note = format!("; MCP table upsert skipped: {err}");
+            }
+        }
+    }
+
+    Ok(format!(
+        "Imported provider into CC Switch with id {id}{}{}",
+        if include_mcp {
+            " (MCP included in provider config)"
+        } else {
+            ""
+        },
+        mcp_note
+    ))
 }
 
-fn provider_settings_config(config: &AppConfig) -> serde_json::Value {
-    let host = if config.lan_enabled { local_lan_host() } else { "127.0.0.1".into() };
+fn codex_mcp_currently_injected() -> bool {
+    let path = codex_config_path();
+    if !path.exists() {
+        return false;
+    }
+    fs::read_to_string(path)
+        .map(|raw| codex_mcp_is_injected(&raw))
+        .unwrap_or(false)
+}
+
+/// Upsert GrokGo into CC Switch `mcp_servers` so MCP can be enabled independently.
+fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResult<String> {
+    let has_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_servers' LIMIT 1",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_table {
+        return Ok("mcp_servers table missing".into());
+    }
+
+    let host = if config.lan_enabled {
+        local_lan_host()
+    } else {
+        "127.0.0.1".into()
+    };
+    let url = format!("http://{}:{}/mcp", host, config.actual_port);
+    let mut server = json!({
+        "type": "http",
+        "url": url,
+    });
+    if config.require_token && !config.local_token.trim().is_empty() {
+        server["headers"] = json!({
+            "Authorization": format!("Bearer {}", config.local_token.trim())
+        });
+    }
+    let server_text = serde_json::to_string(&server)?;
+    let id = "grok-go";
+    let name = "GrokGo";
+    let description = "GrokGo local MCP (x_search / image / video)";
+
+    let existing: bool = conn
+        .query_row(
+            "SELECT 1 FROM mcp_servers WHERE id = ?1 LIMIT 1",
+            params![id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if existing {
+        conn.execute(
+            r#"
+            UPDATE mcp_servers
+            SET name = ?1,
+                server_config = ?2,
+                description = ?3,
+                enabled_codex = 1
+            WHERE id = ?4
+            "#,
+            params![name, server_text, description, id],
+        )?;
+        Ok("updated mcp_servers.grok-go (enabled_codex=1)".into())
+    } else {
+        conn.execute(
+            r#"
+            INSERT INTO mcp_servers (id, name, server_config, description, tags, enabled_codex)
+            VALUES (?1, ?2, ?3, ?4, '[]', 1)
+            "#,
+            params![id, name, server_text, description],
+        )?;
+        Ok("inserted mcp_servers.grok-go (enabled_codex=1)".into())
+    }
+}
+
+fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
+    let host = if config.lan_enabled {
+        local_lan_host()
+    } else {
+        "127.0.0.1".into()
+    };
     let base = format!("http://{}:{}/v1", host, config.actual_port);
-    let toml = format!(
-        "model_provider = \"custom\"\nmodel = \"{}\"\ndisable_response_storage = true\n\n[model_providers.custom]\nname = \"grok-go\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"{}\"\nexperimental_bearer_token = \"{}\"\n",
+    let mut toml = format!(
+        "model_provider = \"custom\"\n\
+         model = \"{}\"\n\
+         disable_response_storage = true\n\
+         \n\
+         [model_providers.custom]\n\
+         name = \"grok-go\"\n\
+         wire_api = \"responses\"\n\
+         requires_openai_auth = true\n\
+         base_url = \"{}\"\n\
+         experimental_bearer_token = \"{}\"\n",
         config.default_model, base, config.local_token
     );
+    if include_mcp {
+        let mcp_url = format!("http://{}:{}/mcp", host, config.actual_port);
+        toml.push_str("\n[mcp_servers.grok-go]\n");
+        toml.push_str(&format!("url = \"{mcp_url}\"\n"));
+        if config.require_token && !config.local_token.trim().is_empty() {
+            toml.push_str("\n[mcp_servers.grok-go.http_headers]\n");
+            toml.push_str(&format!(
+                "Authorization = \"Bearer {}\"\n",
+                config.local_token.trim()
+            ));
+        }
+    }
     json!({
         "auth": {"OPENAI_API_KEY": config.local_token},
         "config": toml,
@@ -660,11 +835,11 @@ fn provider_settings_config(config: &AppConfig) -> serde_json::Value {
     })
 }
 
-fn provider_export_json(config: &AppConfig) -> serde_json::Value {
+fn provider_export_json(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
     json!({
         "app_type": "codex",
         "name": "GrokGo",
-        "settings_config": provider_settings_config(config)
+        "settings_config": provider_settings_config(config, include_mcp)
     })
 }
 
@@ -755,6 +930,34 @@ mod tests {
         let content = upsert_agents_guide_ref_content("", guide);
         assert!(content.contains(AGENTS_GUIDE_REF_ANCHOR));
         assert!(content.contains(AGENTS_GUIDE_START));
+    }
+
+    #[test]
+    fn agents_guide_lists_only_enabled_tools() {
+        let mut cfg = AppConfig::default();
+        cfg.mcp_enabled_tools = Some(vec!["x_search".into(), "image_gen".into()]);
+        let body = agents_guide_file_body(&cfg);
+        assert!(body.contains("`x_search`"));
+        assert!(body.contains("`image_gen`"));
+        assert!(!body.contains("`video_generate`"));
+        assert!(!body.contains("`video_edit`"));
+        assert!(body.contains("与仓库开发用"));
+    }
+
+    #[test]
+    fn provider_settings_includes_mcp_when_requested() {
+        let mut cfg = AppConfig::default();
+        cfg.actual_port = 8787;
+        cfg.local_token = "tok123".into();
+        cfg.require_token = true;
+        let with_mcp = provider_settings_config(&cfg, true);
+        let toml = with_mcp["config"].as_str().unwrap();
+        assert!(toml.contains("[mcp_servers.grok-go]"));
+        assert!(toml.contains("http://127.0.0.1:8787/mcp"));
+        assert!(toml.contains("Bearer tok123"));
+        let no_mcp = provider_settings_config(&cfg, false);
+        let toml2 = no_mcp["config"].as_str().unwrap();
+        assert!(!toml2.contains("[mcp_servers.grok-go]"));
     }
 
     #[test]

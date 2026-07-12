@@ -1,6 +1,6 @@
 [package]
 name = "grok-go"
-version = "0.1.1"
+version = "0.1.2"
 description = "GrokGo — local Grok gateway for Codex"
 authors = ["RongleCat"]
 edition = "2021"

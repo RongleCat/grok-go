@@ -115,8 +115,12 @@ pub fn run() {
     // ensure config/db exist; start async usage writer (prune + WAL checkpoint)
     let _ = config::load_config();
     let _ = config::load_auth();
+    // Schema first so the first UI query never hits a missing table.
+    match usage::UsageStore::open_default() {
+        Ok(_) => tracing::info!("usage database ready"),
+        Err(err) => tracing::error!("failed to initialize usage database: {err}"),
+    }
     usage::init_log_writer();
-    let _ = usage::UsageStore::open_default();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

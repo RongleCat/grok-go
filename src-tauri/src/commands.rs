@@ -43,14 +43,16 @@ pub async fn get_status(gateway: State<'_, GatewayState>) -> AppResult<AppStatus
     } else {
         "127.0.0.1".into()
     };
-    let today = UsageStore::open_default()?.today_summary().unwrap_or(UsageSummary {
-        total_requests: 0,
-        success_requests: 0,
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_tokens: 0,
-        estimated_cost_usd: 0.0,
-    });
+    let today = match UsageStore::open_default() {
+        Ok(store) => store.today_summary().unwrap_or_else(|err| {
+            tracing::warn!("today_summary failed: {err}");
+            crate::usage::empty_summary()
+        }),
+        Err(err) => {
+            tracing::warn!("usage db open failed in get_status: {err}");
+            crate::usage::empty_summary()
+        }
+    };
     Ok(AppStatus {
         running,
         preferred_port: config.preferred_port,
@@ -109,6 +111,7 @@ pub fn update_config(
         || existing.http_proxy_url != config.http_proxy_url
         || existing.xai_base_url != config.xai_base_url;
     let icon_changed = existing.app_icon != config.app_icon;
+    let mcp_tools_changed = existing.mcp_enabled_tools != config.mcp_enabled_tools;
     save_config(&config)?;
     if proxy_changed {
         gateway.proxy.rebuild_client(&config)?;
@@ -117,6 +120,12 @@ pub fn update_config(
     if icon_changed {
         if let Err(err) = crate::apply_app_icon(&app, config.app_icon) {
             tracing::warn!("apply app icon after config update: {err}");
+        }
+    }
+    if mcp_tools_changed {
+        // Keep ~/.grok-go/agents-guide.md aligned with enabled MCP tools.
+        if let Err(err) = crate::integrations::refresh_agents_guide_file() {
+            tracing::warn!("refresh agents-guide after mcp tools change: {err}");
         }
     }
     Ok(config)
@@ -325,23 +334,58 @@ pub async fn start_oauth_login(
 
 #[tauri::command]
 pub fn get_usage_summary() -> AppResult<UsageSummary> {
-    Ok(UsageStore::open_default()?.today_summary()?)
+    match UsageStore::open_default() {
+        Ok(store) => store.today_summary().or_else(|err| {
+            tracing::warn!("get_usage_summary: {err}");
+            Ok(crate::usage::empty_summary())
+        }),
+        Err(err) => {
+            tracing::warn!("get_usage_summary open: {err}");
+            Ok(crate::usage::empty_summary())
+        }
+    }
 }
 
 #[tauri::command]
 pub fn get_recent_logs(limit: Option<usize>, offset: Option<usize>) -> AppResult<Vec<RequestLog>> {
-    Ok(UsageStore::open_default()?.recent(limit.unwrap_or(50), offset.unwrap_or(0))?)
+    match UsageStore::open_default() {
+        Ok(store) => store
+            .recent(limit.unwrap_or(50), offset.unwrap_or(0))
+            .or_else(|err| {
+                tracing::warn!("get_recent_logs: {err}");
+                Ok(Vec::new())
+            }),
+        Err(err) => {
+            tracing::warn!("get_recent_logs open: {err}");
+            Ok(Vec::new())
+        }
+    }
 }
 
 #[tauri::command]
 pub fn get_heatmap(days: Option<i64>) -> AppResult<Vec<HeatmapDay>> {
     // Default: ~1 full year (53 weeks), same span as GitHub contribution graph.
-    Ok(UsageStore::open_default()?.heatmap(days.unwrap_or(371))?)
+    match UsageStore::open_default() {
+        Ok(store) => store.heatmap(days.unwrap_or(371)).or_else(|err| {
+            tracing::warn!("get_heatmap: {err}");
+            Ok(Vec::new())
+        }),
+        Err(err) => {
+            tracing::warn!("get_heatmap open: {err}");
+            Ok(Vec::new())
+        }
+    }
 }
 
 #[tauri::command]
 pub fn clear_logs() -> AppResult<()> {
-    UsageStore::open_default()?.clear()
+    match UsageStore::open_default() {
+        Ok(store) => store.clear(),
+        Err(err) => {
+            tracing::warn!("clear_logs open: {err}");
+            Ok(())
+        }
+    }
 }
 
 #[tauri::command]

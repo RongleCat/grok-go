@@ -179,6 +179,10 @@ Authorization = "Bearer <localToken>"
 - React + TypeScript + Vite
 - Tailwind CSS
 
+## 给 Agent / 贡献者
+
+若你是 AI Agent 或要改源码：先读项目知识库 [`llm-wiki/README.md`](./llm-wiki/README.md)（架构、模块地图、接手清单）。
+
 ## 贡献
 
 欢迎 Issue 与 PR，详见 [CONTRIBUTING.md](./CONTRIBUTING.md)。  

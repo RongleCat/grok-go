@@ -17,10 +17,16 @@ export function UsagePage() {
   async function refresh() {
     setLoading(true);
     try {
-      const [s, h] = await Promise.all([api.getUsageSummary(), api.getHeatmap(371)]);
+      const s = await api.getUsageSummary();
       setSummary(s);
-      setHeatmap(h);
       setError("");
+      try {
+        const h = await api.getHeatmap(371);
+        setHeatmap(h);
+      } catch (heatErr) {
+        console.warn("heatmap load failed", heatErr);
+        setHeatmap([]);
+      }
     } catch (e) {
       setError(String(e));
     } finally {

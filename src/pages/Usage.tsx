@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api, type HeatmapDay, type UsageSummary } from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Heatmap } from "@/components/heatmap";
-import { formatNumber, formatUsd } from "@/lib/utils";
+import { formatCacheHitRate, formatNumber, formatUsd } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n/context";
 import { PageLoading } from "@/components/page-loading";
@@ -65,7 +65,7 @@ export function UsagePage() {
         </Button>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-4">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="text-xl">{formatNumber(summary.totalRequests)}</CardTitle>
@@ -83,6 +83,25 @@ export function UsagePage() {
             <CardTitle className="text-xl">{formatNumber(summary.outputTokens)}</CardTitle>
           </CardHeader>
           <CardContent className="text-sm text-neutral-500">{t.usage.outputTokens}</CardContent>
+        </Card>
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-xl text-emerald-700">
+              {formatNumber(summary.cacheTokens)}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-0.5 text-sm text-neutral-500">
+            <div>{t.usage.cacheTokens}</div>
+            <div
+              className="text-xs text-neutral-400"
+              title={t.usage.cacheHitRateHint}
+            >
+              {t.usage.cacheHitRate}{" "}
+              <span className="font-medium text-neutral-600">
+                {formatCacheHitRate(summary.inputTokens, summary.cacheTokens)}
+              </span>
+            </div>
+          </CardContent>
         </Card>
         <Card>
           <CardHeader className="pb-2">

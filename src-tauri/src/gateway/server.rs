@@ -927,9 +927,24 @@ async fn call_upstream(
     let status = resp.status();
     let value: Value = resp.json().await.unwrap_or(json!({}));
     let usage = value.get("usage").cloned().unwrap_or(json!({}));
-    let input_tokens = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let output_tokens = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-    let cache_tokens = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    // xAI: input_tokens_details.cached_tokens (not Anthropic cache_read_input_tokens).
+    let cache_tokens = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     crate::usage::enqueue_request_log(RequestLog {
         request_id: Uuid::new_v4().to_string(),
         account_id: Some(account.id.clone()),

@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
@@ -26,9 +27,11 @@ use crate::gateway::sanitize::{
     rewrite_sse_data_line, sanitize_responses_request, strip_opaque_context,
 };
 use crate::http_client::build_http_client;
+use crate::concurrency::AccountPermit;
 use crate::router::{
-    pick_account_excluding, replace_account_tokens, routable_account_count, touch_account_cache,
+    pick_account_decision, replace_account_tokens, routable_account_count, touch_account_cache,
 };
+use crate::session_affinity;
 use crate::usage::{enqueue_request_log, estimate_cost, RequestLog};
 
 #[derive(Clone)]
@@ -124,9 +127,12 @@ async fn proxy_json_inner(
     let mut parsed_request: Option<Value> = None;
     let mut has_image_gen_tools = false;
     let mut client_wants_stream = false;
+    // Capture session key before sanitize strips previous_response_id etc.
+    let mut session_key: Option<String> = None;
 
     if matches!(method, Method::POST | Method::PUT | Method::PATCH) && !outbound_body.is_empty() {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&outbound_body) {
+            session_key = session_affinity::extract_session_key(&headers, Some(&value));
             let mut body_changed = false;
             client_wants_stream = value
                 .get("stream")
@@ -216,18 +222,46 @@ async fn proxy_json_inner(
         .unwrap_or("application/json")
         .to_string();
 
-    let build_upstream = |client: &reqwest::Client, token: &str, body: Bytes| {
-        let mut req = client
-            .request(method.clone(), &url)
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::ACCEPT, accept.as_str());
-        if !body.is_empty() || matches!(method, Method::POST | Method::PUT | Method::PATCH) {
-            // Force a single JSON content type for mutating requests (even empty body).
-            req = req
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(body);
+    // Header-only session key when body was empty / non-JSON.
+    if session_key.is_none() {
+        session_key = session_affinity::extract_session_key(&headers, parsed_request.as_ref());
+    }
+
+    // Ensure stable prompt_cache_key (never inject rotating previous_response_id).
+    if let (Some(key), Some(mut value)) = (session_key.as_ref(), parsed_request.clone()) {
+        if session_affinity::ensure_prompt_cache_key(&mut value, key) {
+            if let Ok(bytes) = serde_json::to_vec(&value) {
+                outbound_body = Bytes::from(bytes);
+                parsed_request = Some(value);
+            }
         }
-        req
+    }
+
+    // CPA-style conversation id header for xAI prefix/session continuity.
+    let conv_header = session_key
+        .as_deref()
+        .and_then(session_affinity::stable_cache_key);
+
+    let build_upstream = {
+        let conv_header = conv_header.clone();
+        let url = url.clone();
+        let accept = accept.clone();
+        move |client: &reqwest::Client, token: &str, body: Bytes| {
+            let mut req = client
+                .request(method.clone(), &url)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::ACCEPT, accept.as_str());
+            if let Some(ref cid) = conv_header {
+                req = req.header("x-grok-conv-id", cid.as_str());
+            }
+            if !body.is_empty() || matches!(method, Method::POST | Method::PUT | Method::PATCH) {
+                // Force a single JSON content type for mutating requests (even empty body).
+                req = req
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body);
+            }
+            req
+        }
     };
 
     // Single-account happy path is unchanged (one pick + one send).
@@ -239,6 +273,7 @@ async fn proxy_json_inner(
         &url,
         &build_upstream,
         outbound_body.clone(),
+        session_key.as_deref(),
     )
     .await?;
 
@@ -259,33 +294,41 @@ async fn proxy_json_inner(
         if status.is_success() {
             mark_success(&mut account);
             touch_account_cache(&account);
+            if let Some(key) = session_key.as_ref() {
+                if config.session_affinity {
+                    session_affinity::bind(key, &account.id, config.session_affinity_ttl_secs);
+                }
+            }
         } else {
             apply_status_failure(&mut account, status, &upstream_headers);
             let _ = replace_account_tokens(&account);
         }
         let custom_names = custom_tool_names.clone();
-        let stream = upstream.bytes_stream().map(move |chunk| {
-            chunk
-                .map(|bytes| rewrite_sse_chunk(&bytes, &custom_names))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        });
-        let body = Body::from_stream(stream);
-        log_request(
-            &request_id,
+        // Scan SSE for usage (xAI puts cached_tokens under input_tokens_details).
+        // Log on stream drop so streaming traffic is not silently recorded as 0 tokens.
+        let usage_tracker = Arc::new(StreamUsageTracker::new(
+            request_id.clone(),
             Some(account.id.clone()),
-            path,
+            path.to_string(),
             requested_model.clone(),
             resolved_model.clone(),
             status.as_u16(),
             latency_ms,
-            None,
-            0,
-            0,
-            0,
-            None,
-            client_source,
-            mapping_reason.clone(),
-        );
+            client_source.to_string(),
+            config.session_affinity,
+            config.session_affinity_ttl_secs,
+            account.id.clone(),
+        ));
+        let tracker = usage_tracker.clone();
+        let stream = upstream.bytes_stream().map(move |chunk| {
+            chunk
+                .map(|bytes| {
+                    tracker.note_chunk(&bytes);
+                    rewrite_sse_chunk(&bytes, &custom_names)
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        });
+        let body = Body::from_stream(stream);
         let mut response = Response::builder().status(status).body(body).unwrap_or_else(|_| Response::new(Body::empty()));
         copy_safe_headers(upstream_headers, response.headers_mut());
         return Ok(response);
@@ -389,14 +432,27 @@ async fn proxy_json_inner(
         }
         bytes = Bytes::from(serde_json::to_vec(&value).unwrap_or_else(|_| bytes.to_vec()));
 
-        if let Some(usage) = value.get("usage") {
-            input_tokens = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-            output_tokens = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0);
-            cache_tokens = usage
-                .get("cache_read_input_tokens")
-                .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+        let (i, o, c) = extract_usage_tokens(&value);
+        input_tokens = i;
+        output_tokens = o;
+        cache_tokens = c;
+        if status.is_success() {
+            if let Some(rid) = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| value.pointer("/response/id").and_then(|v| v.as_str()))
+            {
+                session_affinity::bind_response_chain(
+                    rid,
+                    &account.id,
+                    config.session_affinity_ttl_secs,
+                );
+            }
+            if let Some(key) = session_key.as_ref() {
+                if config.session_affinity {
+                    session_affinity::bind(key, &account.id, config.session_affinity_ttl_secs);
+                }
+            }
         }
     }
     let error_summary = if status.is_success() {
@@ -404,6 +460,16 @@ async fn proxy_json_inner(
     } else {
         Some(String::from_utf8_lossy(&bytes).chars().take(500).collect())
     };
+    if cache_tokens > 0 {
+        tracing::debug!(
+            account = %account.id,
+            input_tokens,
+            output_tokens,
+            cache_tokens,
+            hit_pct = (cache_tokens as f64 / input_tokens.max(1) as f64 * 100.0),
+            "prompt cache hit recorded"
+        );
+    }
     log_request(
         &request_id,
         Some(account.id.clone()),
@@ -761,6 +827,7 @@ async fn send_with_account_failover<F>(
     url: &str,
     build_upstream: F,
     body: Bytes,
+    session_key: Option<&str>,
 ) -> AppResult<(crate::config::Account, String, reqwest::Response)>
 where
     F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
@@ -780,8 +847,8 @@ where
             load_auth()?
         };
 
-        let mut account = match pick_account_excluding(config, &store, &excluded) {
-            Ok(a) => a,
+        let decision = match pick_account_decision(config, &store, &excluded, session_key) {
+            Ok(d) => d,
             Err(err) => {
                 if let Some(detail) = last_transport.take() {
                     let hint = crate::http_client::proxy_status_hint(config);
@@ -792,7 +859,19 @@ where
                 return Err(err);
             }
         };
+        let mut account = decision.account;
         excluded.push(account.id.clone());
+        // Soft in-flight counter for this attempt (released when permit drops).
+        let _permit = AccountPermit::acquire(&account.id);
+
+        tracing::debug!(
+            account = %account.id,
+            layer = decision.layer,
+            sticky = decision.sticky_hit,
+            attempt,
+            session = session_key.unwrap_or(""),
+            "account selected"
+        );
 
         let token_before = account.access_token.clone();
         let mut token = match ensure_fresh_token(config, &mut account).await {
@@ -803,8 +882,11 @@ where
                     attempt,
                     "token refresh failed; trying next account: {err}"
                 );
-                mark_failure_kind(&mut account, FailureKind::Auth);
+                mark_failure_kind(&mut account, FailureKind::Unauthorized);
                 let _ = replace_account_tokens(&account);
+                if let Some(key) = session_key {
+                    session_affinity::invalidate(key);
+                }
                 last_transport = Some(format!("token refresh failed: {err}"));
                 continue;
             }
@@ -828,8 +910,11 @@ where
                     }
                     Err(err) => {
                         tracing::warn!(account = %account.id, "401 refresh failed: {err}");
-                        mark_failure_kind(&mut account, FailureKind::Auth);
+                        mark_failure_kind(&mut account, FailureKind::Unauthorized);
                         let _ = replace_account_tokens(&account);
+                        if let Some(key) = session_key {
+                            session_affinity::invalidate(key);
+                        }
                         last_transport = Some(format!("401 refresh failed: {err}"));
                         continue;
                     }
@@ -842,17 +927,22 @@ where
                 let status = resp.status();
                 let can_failover = status_is_account_failover(status) && attempt + 1 < max_tries;
                 if can_failover {
-                    // Peek whether another account exists before consuming the body away
-                    // from a final error response… we always consume for failure marking.
                     let more = load_auth()
                         .ok()
-                        .and_then(|s| pick_account_excluding(config, &s, &excluded).ok())
+                        .and_then(|s| {
+                            pick_account_decision(config, &s, &excluded, session_key)
+                                .ok()
+                                .map(|_| ())
+                        })
                         .is_some();
                     if more {
                         let headers = resp.headers().clone();
                         let body_bytes = resp.bytes().await.unwrap_or_default();
                         apply_status_failure(&mut account, status, &headers);
                         let _ = replace_account_tokens(&account);
+                        if let Some(key) = session_key {
+                            session_affinity::invalidate(key);
+                        }
                         let preview: String = String::from_utf8_lossy(&body_bytes)
                             .chars()
                             .take(160)
@@ -861,10 +951,22 @@ where
                             account = %account.id,
                             %status,
                             attempt,
+                            layer = decision.layer,
                             "upstream account-scoped failure; failing over. body={preview}"
                         );
                         last_transport = Some(format!("upstream {status}: {preview}"));
                         continue;
+                    }
+                }
+                if status.is_success() {
+                    if let Some(key) = session_key {
+                        if config.session_affinity {
+                            session_affinity::bind(
+                                key,
+                                &account.id,
+                                config.session_affinity_ttl_secs,
+                            );
+                        }
                     }
                 }
                 if attempt > 0 {
@@ -872,6 +974,7 @@ where
                         account = %account.id,
                         attempt,
                         %status,
+                        sticky = decision.sticky_hit,
                         "account failover succeeded"
                     );
                 }
@@ -913,8 +1016,10 @@ fn apply_status_failure(
     if code == 429 {
         let secs = retry_after_secs(headers).unwrap_or(60);
         mark_failure_kind(account, FailureKind::RateLimit { retry_after_secs: secs });
-    } else if code == 401 || code == 403 {
-        mark_failure_kind(account, FailureKind::Auth);
+    } else if code == 401 {
+        mark_failure_kind(account, FailureKind::Unauthorized);
+    } else if code == 403 {
+        mark_failure_kind(account, FailureKind::Forbidden);
     } else if status.is_server_error() {
         mark_failure_kind(account, FailureKind::Soft);
     } else {
@@ -928,6 +1033,205 @@ fn apply_status_failure(
         } else {
             account.last_upstream_error = Some(format!("upstream {code}"));
         }
+    }
+}
+
+/// Pull token usage from xAI / OpenAI-shaped Responses or Chat payloads.
+///
+/// xAI Responses (confirmed by sub2api fixtures) uses:
+/// `usage.input_tokens_details.cached_tokens`
+/// not Anthropic-style `cache_read_input_tokens`.
+fn extract_usage_tokens(value: &Value) -> (u64, u64, u64) {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.pointer("/response/usage"));
+    let Some(usage) = usage else {
+        return (0, 0, 0);
+    };
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    (input, output, cache)
+}
+
+/// Scans SSE chunks for `response.completed` usage and logs once when dropped.
+struct StreamUsageTracker {
+    request_id: String,
+    account_id: Option<String>,
+    endpoint: String,
+    requested_model: Option<String>,
+    resolved_model: Option<String>,
+    status_code: u16,
+    latency_ms: u64,
+    client_source: String,
+    session_affinity: bool,
+    session_affinity_ttl_secs: u64,
+    account_id_for_bind: String,
+    input: AtomicU64,
+    output: AtomicU64,
+    cache: AtomicU64,
+    logged: AtomicBool,
+    /// Carry incomplete UTF-8 / partial SSE lines across chunks.
+    pending: parking_lot::Mutex<String>,
+}
+
+impl StreamUsageTracker {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        request_id: String,
+        account_id: Option<String>,
+        endpoint: String,
+        requested_model: Option<String>,
+        resolved_model: Option<String>,
+        status_code: u16,
+        latency_ms: u64,
+        client_source: String,
+        session_affinity: bool,
+        session_affinity_ttl_secs: u64,
+        account_id_for_bind: String,
+    ) -> Self {
+        Self {
+            request_id,
+            account_id,
+            endpoint,
+            requested_model,
+            resolved_model,
+            status_code,
+            latency_ms,
+            client_source,
+            session_affinity,
+            session_affinity_ttl_secs,
+            account_id_for_bind,
+            input: AtomicU64::new(0),
+            output: AtomicU64::new(0),
+            cache: AtomicU64::new(0),
+            logged: AtomicBool::new(false),
+            pending: parking_lot::Mutex::new(String::new()),
+        }
+    }
+
+    fn note_chunk(&self, bytes: &[u8]) {
+        let chunk = String::from_utf8_lossy(bytes);
+        let mut pending = self.pending.lock();
+        pending.push_str(&chunk);
+        // Process complete lines; keep trailing partial line.
+        while let Some(pos) = pending.find('\n') {
+            let line = pending[..pos].trim_end_matches('\r').to_string();
+            *pending = pending[pos + 1..].to_string();
+            self.note_sse_line(&line);
+        }
+        // Bound pending buffer against pathological streams.
+        if pending.len() > 512 * 1024 {
+            pending.clear();
+        }
+    }
+
+    fn note_sse_line(&self, line: &str) {
+        let data = if let Some(rest) = line.strip_prefix("data:") {
+            rest.trim()
+        } else if line.starts_with('{') {
+            line
+        } else {
+            return;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        // Bind new response id for sticky chain when present.
+        if let Some(rid) = value
+            .pointer("/response/id")
+            .and_then(|v| v.as_str())
+            .or_else(|| value.get("id").and_then(|v| v.as_str()))
+        {
+            if !rid.is_empty()
+                && value
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t == "response.completed" || t.ends_with(".completed"))
+                    .unwrap_or(true)
+            {
+                session_affinity::bind_response_chain(
+                    rid,
+                    &self.account_id_for_bind,
+                    self.session_affinity_ttl_secs,
+                );
+            }
+        }
+        let (i, o, c) = extract_usage_tokens(&value);
+        // Also nested under event.response.usage when type is response.completed
+        let (i2, o2, c2) = value
+            .get("response")
+            .map(extract_usage_tokens)
+            .unwrap_or((0, 0, 0));
+        let input = i.max(i2);
+        let output = o.max(o2);
+        let cache = c.max(c2);
+        if input > 0 {
+            self.input.fetch_max(input, AtomicOrdering::Relaxed);
+        }
+        if output > 0 {
+            self.output.fetch_max(output, AtomicOrdering::Relaxed);
+        }
+        if cache > 0 {
+            self.cache.fetch_max(cache, AtomicOrdering::Relaxed);
+        }
+        let _ = self.session_affinity;
+    }
+
+    fn finish(&self) {
+        if self.logged.swap(true, AtomicOrdering::SeqCst) {
+            return;
+        }
+        let input = self.input.load(AtomicOrdering::Relaxed);
+        let output = self.output.load(AtomicOrdering::Relaxed);
+        let cache = self.cache.load(AtomicOrdering::Relaxed);
+        if cache > 0 {
+            tracing::debug!(
+                input,
+                output,
+                cache,
+                "stream prompt cache hit recorded"
+            );
+        }
+        log_request(
+            &self.request_id,
+            self.account_id.clone(),
+            &self.endpoint,
+            self.requested_model.clone(),
+            self.resolved_model.clone(),
+            self.status_code,
+            self.latency_ms,
+            None,
+            input,
+            output,
+            cache,
+            None,
+            &self.client_source,
+            None,
+        );
+    }
+}
+
+impl Drop for StreamUsageTracker {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -965,6 +1269,51 @@ fn log_request(
         client_source: client_source.to_string(),
         created_at: Utc::now(),
     });
+}
+
+#[cfg(test)]
+mod usage_extract_tests {
+    use super::extract_usage_tokens;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_xai_input_tokens_details_cached() {
+        let v = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 5,
+                "input_tokens_details": { "cached_tokens": 80 }
+            }
+        });
+        assert_eq!(extract_usage_tokens(&v), (100, 5, 80));
+    }
+
+    #[test]
+    fn extracts_nested_response_usage() {
+        let v = json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 2,
+                    "input_tokens_details": { "cached_tokens": 40 }
+                }
+            }
+        });
+        assert_eq!(extract_usage_tokens(&v), (50, 2, 40));
+    }
+
+    #[test]
+    fn extracts_openai_prompt_tokens_details() {
+        let v = json!({
+            "usage": {
+                "prompt_tokens": 20,
+                "completion_tokens": 3,
+                "prompt_tokens_details": { "cached_tokens": 10 }
+            }
+        });
+        assert_eq!(extract_usage_tokens(&v), (20, 3, 10));
+    }
 }
 
 fn response_to_text(resp: Response) -> String {

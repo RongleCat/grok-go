@@ -529,9 +529,13 @@ pub fn mark_success(account: &mut Account) {
 pub enum FailureKind {
     /// TCP/TLS/proxy/DNS — do not lock the account.
     Transport,
-    /// 401/403 after refresh path — degraded, re-login may be needed.
+    /// 401 after refresh path — token likely dead; longer skip for multi-account failover.
+    Unauthorized,
+    /// 403 entitlement / subscription tier — do not tight-loop refresh.
+    Forbidden,
+    /// Legacy alias for unauthorized (call sites / hard flag).
     Auth,
-    /// 5xx / other soft errors — degrade; cooldown only after many consecutive hits.
+    /// 5xx / other soft errors — degrade; short cooldown after a few consecutive hits.
     Soft,
     /// Explicit 429 / rate-limit headers — temporary cooldown (honors Retry-After when known).
     RateLimit { retry_after_secs: u64 },
@@ -542,7 +546,7 @@ pub fn mark_failure(account: &mut Account, hard: bool) {
     mark_failure_kind(
         account,
         if hard {
-            FailureKind::Auth
+            FailureKind::Unauthorized
         } else {
             FailureKind::Soft
         },
@@ -563,28 +567,42 @@ pub fn mark_failure_kind(account: &mut Account, kind: FailureKind) {
             account.last_upstream_error =
                 Some("transport error (network/proxy); account not locked".into());
         }
-        FailureKind::Auth => {
-            // Short local cooldown so multi-account routing skips this account on the next
-            // pick (and in-request failover can move on). Not a permanent ban — Accounts
-            // UI can clear cooldown; single-account users only wait briefly.
+        FailureKind::Unauthorized | FailureKind::Auth => {
+            // Align with common multi-account proxies: skip broken OAuth for a while.
             if account.health != AccountHealth::Disabled {
-                const AUTH_COOLDOWN_SECS: i64 = 60;
+                const SECS: i64 = 600; // 10 minutes
                 account.health = AccountHealth::Cooldown;
-                account.cooldown_until =
-                    Some(Utc::now() + Duration::seconds(AUTH_COOLDOWN_SECS));
+                account.cooldown_until = Some(Utc::now() + Duration::seconds(SECS));
                 account.last_upstream_error = Some(format!(
-                    "auth error (401/403); cooldown {AUTH_COOLDOWN_SECS}s — re-login or fix console.x.ai permissions"
+                    "auth error (401); cooldown {SECS}s — re-login if multi-account keeps failing over"
                 ));
+                crate::session_affinity::invalidate_account(&account.id);
+            }
+        }
+        FailureKind::Forbidden => {
+            // Entitlement / plan denial — longer skip; re-login rarely helps immediately.
+            if account.health != AccountHealth::Disabled {
+                const SECS: i64 = 1800; // 30 minutes
+                account.health = AccountHealth::Cooldown;
+                account.cooldown_until = Some(Utc::now() + Duration::seconds(SECS));
+                account.last_upstream_error = Some(format!(
+                    "forbidden (403); cooldown {SECS}s — check subscription / console.x.ai permissions"
+                ));
+                crate::session_affinity::invalidate_account(&account.id);
             }
         }
         FailureKind::Soft => {
             if account.health != AccountHealth::Disabled {
-                // Only escalate to cooldown after many consecutive soft failures.
-                if account.consecutive_failures >= 8 {
+                // Escalate earlier than before (3× / 2m) so multi-account pools rotate faster,
+                // but still avoid locking a solo account on a single 5xx blip.
+                if account.consecutive_failures >= 3 {
+                    const SECS: i64 = 120;
                     account.health = AccountHealth::Cooldown;
-                    account.cooldown_until = Some(Utc::now() + Duration::seconds(60));
-                    account.last_upstream_error =
-                        Some("many consecutive upstream errors; short cooldown".into());
+                    account.cooldown_until = Some(Utc::now() + Duration::seconds(SECS));
+                    account.last_upstream_error = Some(format!(
+                        "consecutive upstream 5xx; cooldown {SECS}s"
+                    ));
+                    crate::session_affinity::invalidate_account(&account.id);
                 } else {
                     account.health = AccountHealth::Degraded;
                     account.last_upstream_error = Some("upstream soft error".into());
@@ -598,6 +616,7 @@ pub fn mark_failure_kind(account: &mut Account, kind: FailureKind) {
             account.last_upstream_error = Some(format!(
                 "rate limited (429); cooldown {secs}s — not a permanent ban"
             ));
+            crate::session_affinity::invalidate_account(&account.id);
         }
     }
 }

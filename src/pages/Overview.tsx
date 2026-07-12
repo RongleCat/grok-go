@@ -156,8 +156,16 @@ export function OverviewPage() {
               )}
             </CardTitle>
           </CardHeader>
-          <CardContent className="text-sm text-neutral-500">
-            {t.overview.est} {formatUsd(status.today.estimatedCostUsd)}
+          <CardContent className="space-y-0.5 text-sm text-neutral-500">
+            <div>
+              {t.overview.todayTokensBreakdown
+                .replace("{input}", formatNumber(status.today.inputTokens))
+                .replace("{output}", formatNumber(status.today.outputTokens))
+                .replace("{cache}", formatNumber(status.today.cacheTokens))}
+            </div>
+            <div>
+              {t.overview.est} {formatUsd(status.today.estimatedCostUsd)}
+            </div>
           </CardContent>
         </Card>
       </div>

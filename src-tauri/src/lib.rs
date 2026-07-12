@@ -1,12 +1,15 @@
 mod auth;
 mod commands;
+mod concurrency;
 mod config;
 mod error;
 mod gateway;
 mod http_client;
 mod integrations;
 mod paths;
+mod quota;
 mod router;
+mod session_affinity;
 mod usage;
 
 use auth::OAuthManager;
@@ -171,6 +174,8 @@ pub fn run() {
             commands::delete_account,
             commands::replace_accounts,
             commands::clear_account_cooldown,
+            commands::refresh_account_quota,
+            commands::refresh_all_account_quotas,
             commands::start_oauth_login,
             commands::get_usage_summary,
             commands::get_recent_logs,

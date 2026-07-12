@@ -28,6 +28,21 @@ pub struct AppConfig {
     pub default_video_model: String,
     pub model_mappings: BTreeMap<String, String>,
     pub routing_strategy: RoutingStrategy,
+    /// Stick multi-turn sessions to the same account (prompt-cache friendly). Default true.
+    #[serde(default = "default_true")]
+    pub session_affinity: bool,
+    /// How long session→account bindings live (seconds). Default 3600.
+    #[serde(default = "default_affinity_ttl")]
+    pub session_affinity_ttl_secs: u64,
+    /// Soft-weight picks by SuperGrok remaining % / rate-limit remaining. Default true.
+    #[serde(default = "default_true")]
+    pub quota_aware_routing: bool,
+    /// Prefer accounts whose weekly quota resets soonest (use-it-or-lose-it). Default false.
+    #[serde(default)]
+    pub prefer_soonest_reset: bool,
+    /// Soft per-account in-flight cap used as a pick preference. 0 = unlimited. Default 6.
+    #[serde(default = "default_account_max_concurrency")]
+    pub account_max_concurrency: u32,
     pub auto_inject_codex_mcp: bool,
     pub launch_on_startup: bool,
     pub minimize_to_tray: bool,
@@ -88,12 +103,26 @@ pub enum RoutingStrategy {
     WeightedRoundRobin,
     LeastRecentlyUsed,
     LowestErrorRate,
+    /// Drain the primary healthy account before using backups (cold standby).
+    FillFirst,
 }
 
 impl Default for RoutingStrategy {
     fn default() -> Self {
         Self::WeightedRoundRobin
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_affinity_ttl() -> u64 {
+    3600
+}
+
+fn default_account_max_concurrency() -> u32 {
+    6
 }
 
 impl Default for AppConfig {
@@ -113,6 +142,11 @@ impl Default for AppConfig {
                 ("gpt-5.5".into(), "grok-4.5".into()),
             ]),
             routing_strategy: RoutingStrategy::WeightedRoundRobin,
+            session_affinity: true,
+            session_affinity_ttl_secs: 3600,
+            quota_aware_routing: true,
+            prefer_soonest_reset: false,
+            account_max_concurrency: 6,
             auto_inject_codex_mcp: false,
             launch_on_startup: false,
             minimize_to_tray: true,
@@ -169,6 +203,9 @@ pub struct Account {
     /// Short last upstream error (status / rate-limit hint), for UI diagnostics.
     #[serde(default)]
     pub last_upstream_error: Option<String>,
+    /// SuperGrok weekly credit quota from grok.com GrokBuildBilling.
+    #[serde(default)]
+    pub quota: Option<crate::quota::AccountQuotaSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +248,7 @@ impl Account {
             rate_limit_remaining: None,
             rate_limit_reset_at: None,
             last_upstream_error: None,
+            quota: None,
         }
     }
 }

@@ -48,6 +48,16 @@
 - `load_*` 读 cache；`save_*` 写盘并更新 cache
 - 成功热路径可用 `patch_account_cache` 避免频繁写 auth
 
+
+
+## 加载与持久化（稳健性）
+
+- `load_config` / `load_auth` 经 `load_json_file`：
+  - 缺失 → 写默认
+  - **空文件 / 仅空白 / UTF-8 BOM / 非法 JSON** → 备份到 `~/.grok-go/backups/*.bak` 后重建默认（避免 Windows 上 UI 整页 `expected value at line 1 column 1`）
+- `save_config` / `save_auth` 经 `write_json_atomic`：同目录临时文件 → `sync` → rename（Windows 先删目标再 rename）
+- Unix 上 `auth.json` 仍尝试 `0600` 权限
+
 ## 相关页面
 
 - [[../concepts/model-mapping]]

@@ -1,0 +1,115 @@
+# Build & publish desktop installers for macOS (ARM + Intel) and Windows.
+# Trigger: push tag v*  (e.g. v0.1.1)  or manual workflow_dispatch.
+#
+# Prerequisites (repo Settings → Actions → General → Workflow permissions):
+#   - Read and write permissions (so the job can create/update Releases)
+#
+# Optional signing secrets (unsigned builds still work; macOS may warn):
+#   - Apple: APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#            APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID  (see Tauri macOS signing docs)
+#   - Windows: TAURI_SIGNING_PRIVATE_KEY (+ PASSWORD) if using Tauri updater signing
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild (e.g. v0.1.0). Leave empty to use package version draft."
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            name: macOS-ARM64
+          - platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            name: macOS-x64
+          - platform: windows-latest
+            args: ""
+            name: Windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: ${{ matrix.name }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri app & attach to GitHub Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional macOS / updater signing — set in repo secrets when ready.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # Root package.json + src-tauri/ layout (create-tauri-app style)
+          projectPath: .
+          # Prefer the pushed git tag; fallback replaces __VERSION__ from tauri.conf.json
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          releaseName: "GrokGo v__VERSION__"
+          releaseBody: |
+            ## GrokGo desktop release
+
+            Download the installer for your platform from **Assets**.
+
+            | Platform | File (typical) |
+            |----------|----------------|
+            | macOS Apple Silicon | `*.dmg` |
+            | macOS Intel | `*.dmg` |
+            | Windows x64 | `*-setup.exe` / `*.msi` |
+
+            ### Notes
+            - First launch on macOS (unsigned): right-click → Open, or `xattr -cr /path/to/GrokGo.app`.
+            - Windows may prompt for SmartScreen until code signing is configured.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+          includeUpdaterJson: false

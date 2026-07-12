@@ -8,6 +8,12 @@
     "dev:ui": "vite",
     "build": "tauri build",
     "build:ui": "tsc && vite build",
+    "build:mac-arm": "tauri build --target aarch64-apple-darwin",
+    "build:mac-intel": "tauri build --target x86_64-apple-darwin",
+    "build:mac-all": "bash scripts/build-local.sh all-mac",
+    "build:win": "tauri build --target x86_64-pc-windows-msvc",
+    "setup:cross": "bash scripts/setup-cross-compile.sh",
+    "release:tag": "bash scripts/release-tag.sh",
     "preview": "vite preview",
     "tauri": "tauri"
   },

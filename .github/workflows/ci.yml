@@ -2,7 +2,13 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ui:
@@ -16,7 +22,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
       - run: pnpm build:ui
 
   rust:
@@ -24,9 +30,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
       - name: Install Linux deps for Tauri
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - run: cargo check
+      - name: cargo check
+        run: cargo check
+        working-directory: src-tauri
+      - name: cargo test
+        run: cargo test --lib
         working-directory: src-tauri

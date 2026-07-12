@@ -402,7 +402,7 @@ fn agents_guide_file_body() -> String {
 
 ## 强制规则
 
-- **参数以 MCP `tools/list` 为准**：直接调用，**禁止** web_search / 翻仓库 / 读 HANDOFF、server.rs 查参数。
+- **参数以 MCP `tools/list` 为准**：直接调用，**禁止** web_search 或翻仓库源码猜参数。
 - 媒体输入可用：`https://` / `data:` / **本地绝对路径** / `file://`（本地会自动转 data URL）。
 - 返回一律是 `~/.grok-go/artifacts/` 下的**绝对本地路径** + `markdown`，用 `![image](/abs/path)` 渲染；**不要**展示远程 CDN URL。
 

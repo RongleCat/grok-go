@@ -107,8 +107,8 @@ jobs:
             | Windows x64 | `*-setup.exe` / `*.msi` |
 
             ### Notes
-            - First launch on macOS (unsigned): right-click → Open, or `xattr -cr /path/to/GrokGo.app`.
-            - Windows may prompt for SmartScreen until code signing is configured.
+            - **macOS** (unsigned / not notarized): if macOS says the app is damaged or cannot be verified, run `xattr -cr /Applications/GrokGo.app`, or right-click → Open. See README for details.
+            - **Windows** may show SmartScreen until code signing is configured.
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

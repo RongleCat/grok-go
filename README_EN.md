@@ -55,6 +55,16 @@ Connecting **Grok / xAI** to **Codex** or other AI tools usually means wiring OA
 
 ## Quick start
 
+### Download
+
+Get installers from [Releases](https://github.com/RongleCat/grok-go/releases):
+
+| Platform | Artifact |
+|----------|----------|
+| macOS Apple Silicon | `GrokGo_*_aarch64.dmg` |
+| macOS Intel | `GrokGo_*_x64.dmg` |
+| Windows x64 | `.msi` / `.exe` |
+
 ### Develop
 
 ```bash
@@ -73,6 +83,49 @@ pnpm dev:ui
 ```bash
 pnpm tauri build
 ```
+
+See [docs/BUILD.md](./docs/BUILD.md) for cross-compile and release details.
+
+## macOS: “damaged”, “unidentified developer”, or “cannot be opened”
+
+Release builds are **not Apple-notarized** (requires a paid Developer ID). Gatekeeper often blocks the app after download — that is expected. Fixes:
+
+### Option 1: Clear quarantine (recommended)
+
+1. Drag `GrokGo.app` into Applications
+2. Run in Terminal:
+
+```bash
+xattr -cr /Applications/GrokGo.app
+# or wherever you put it:
+# xattr -cr ~/Downloads/GrokGo.app
+```
+
+3. Open the app again
+
+### Option 2: Right-click → Open
+
+1. In Finder, **right-click** (or Control-click) `GrokGo.app`
+2. Choose **Open**
+3. Confirm **Open** in the dialog
+
+> A normal double-click may still be blocked; use the context-menu Open once.
+
+### Option 3: System Settings
+
+1. **System Settings → Privacy & Security**
+2. If you see a block message for GrokGo, click **Open Anyway**
+3. Confirm with your password
+
+### Still stuck?
+
+```bash
+xattr -l /Applications/GrokGo.app   # quarantine attribute should be gone
+xattr -cr /Applications/GrokGo.app
+open /Applications/GrokGo.app
+```
+
+Only download from this repo’s official [Releases](https://github.com/RongleCat/grok-go/releases). Once Apple signing + notarization are configured, these steps will no longer be needed.
 
 ## Connect Codex
 

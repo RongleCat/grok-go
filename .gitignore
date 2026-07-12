@@ -7,12 +7,13 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Dependencies & build output
 node_modules
 dist
 dist-ssr
 *.local
 
-# Editor directories and files
+# Editor / OS
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -22,20 +23,41 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+Thumbs.db
+
+# Tauri / Rust
 src-tauri/target
+
+# Local runtime data & secrets
 *.db
 *.db-*
 .env
 .env.*
-output/
-website/node_modules/
-website/dist/
-website/.next/
-website/.wrangler/
+*.pem
+*.p12
+*.key
+auth.json
+config.local.*
 
-# Local scratch / demo media
+# Scratch / demo media (never ship)
+output/
 cat-otter-*.png
 cat-otter-*.jpg
 kitten-*.png
+kitten-*.jpg
+.tmp*/
+tmp/
+temp/
+
+# Local tooling / nested experiments (not part of this repo)
 .codex/
+website/
+
+# Duplicate icon dumps (canonical icons live under src-tauri/icons/)
 /icons/
+
+# Tooling caches
+.cache/
+.turbo/
+.eslintcache
+*.tsbuildinfo

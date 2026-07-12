@@ -55,6 +55,16 @@
 
 ## 快速开始
 
+### 下载安装
+
+从 [Releases](https://github.com/RongleCat/grok-go/releases) 下载对应平台安装包：
+
+| 平台 | 文件 |
+|------|------|
+| macOS Apple Silicon | `GrokGo_*_aarch64.dmg` |
+| macOS Intel | `GrokGo_*_x64.dmg` |
+| Windows x64 | `.msi` / `.exe` 安装包 |
+
 ### 开发
 
 ```bash
@@ -73,6 +83,54 @@ pnpm dev:ui
 ```bash
 pnpm tauri build
 ```
+
+更完整的交叉编译与发布说明见 [docs/BUILD.md](./docs/BUILD.md)。
+
+## macOS：提示「已损坏」/「无法验证开发者」/「不安全」
+
+当前 Release 安装包**未做 Apple 公证**（需要付费开发者账号）。从 GitHub 下载后，macOS Gatekeeper 常会拦截，属于预期行为，可按下面处理：
+
+### 方法一：移除隔离属性（推荐）
+
+1. 将 `GrokGo.app` 拖到「应用程序」
+2. 打开「终端」，执行（路径按实际调整）：
+
+```bash
+# 若装在应用程序
+xattr -cr /Applications/GrokGo.app
+
+# 或针对 DMG 内 / 下载目录中的 app
+xattr -cr ~/Downloads/GrokGo.app
+```
+
+3. 再双击打开
+
+### 方法二：右键打开
+
+1. 在 Finder 中 **右键**（或 Control + 点击）`GrokGo.app`
+2. 选择 **打开**
+3. 在弹窗中再次点 **打开**
+
+> 仅「双击」可能仍被拦截；必须用右键菜单里的「打开」。
+
+### 方法三：系统设置放行
+
+1. 打开 **系统设置 → 隐私与安全性**
+2. 若看到「已阻止使用 GrokGo…」，点击 **仍要打开**
+3. 按提示输入密码确认
+
+### 仍打不开时
+
+```bash
+# 确认隔离标记是否已清掉（无 com.apple.quarantine 即正常）
+xattr -l /Applications/GrokGo.app
+
+# 再清一次并尝试启动
+xattr -cr /Applications/GrokGo.app
+open /Applications/GrokGo.app
+```
+
+**说明：** 这些步骤只是绕过「未签名/未公证」的系统保护，请仅从本仓库官方 [Releases](https://github.com/RongleCat/grok-go/releases) 下载。后续若配置了 Apple 签名与公证，上述提示会消失。
 
 ## 接入 Codex
 

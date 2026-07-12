@@ -7,9 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-13
+
+### Added
+- SuperGrok weekly credit quota on Accounts (remaining %, reset time, API / Grok Build breakdown) via `GetGrokCreditsConfig`
+- Multi-account routing: session affinity, quota-aware weighted round-robin, fill-first, prefer-soonest-reset, soft per-account concurrency
+- Settings → Models → Routing panel for strategy and affinity toggles
+- Usage / Logs / Overview show **cache tokens** and cache hit rate
+
 ### Fixed
+- Prompt cache accounting: parse xAI `input_tokens_details.cached_tokens`; scan SSE streams for usage (was always 0)
+- Stable `prompt_cache_key` + `x-grok-conv-id` (do not inject rotating `previous_response_id`)
+- Graded cooldowns for 401 / 403 / 429 / 5xx with sticky invalidation
 - Windows: empty/corrupt/`UTF-8 BOM` `config.json` / `auth.json` no longer crash Overview & Accounts with `expected value at line 1 column 1`; bad files are backed up under `~/.grok-go/backups/` and recreated with defaults
 - Config/auth writes use temp-file + rename (Windows-safe replace) to avoid truncated empty JSON after a crash mid-write
+
+### Changed
+- Accounts cards compacted (tags + icon actions); weight explained in page subtitle
 
 ## [0.1.2] - 2026-07-12
 

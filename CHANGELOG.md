@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-13
+
+> 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
+
+### Added
+
+- **Batch account import** for CPA `xai-*.json`, sub2api multi-line refresh tokens, GrokGo `auth.json`, and card lines `email----password----SSO` (web SSO JWT).
+- **SSO → OAuth Device Flow** (pure Rust): card SSO cookies are converted via `auth.x.ai` device authorization, then accounts use the existing OAuth gateway path (no grok.com reverse proxy).
+- **Batch account ops**: multi-select enable/disable, media flags, weight, cooldown clear, verified multi-delete with disk persistence check.
+- **Per-account media capability**: `supportsImage` / `supportsVideo` filters routing for image/video jobs.
+- **Custom `Select` component** (portal dropdown) for consistent cross-platform UI (Accounts filter, Settings models/routing, Mapping).
+- **Logs**: routed account label, denser layout (account/time + status tag, source/endpoint stack, wider Token column).
+- **Quota refresh probe**: manual refresh also hits `GET {xai_base}/models` to refresh API `x-ratelimit-*` headers alongside SuperGrok weekly credits.
+
+**中文 · 新增**
+
+- **批量导入账号**：CPA `xai-*.json`、sub2api 多行 RT、GrokGo `auth.json`、卡密 `邮箱----密码----SSO`。
+- **SSO→OAuth（纯 Rust Device Flow）**：卡密 SSO 经 `auth.x.ai` 设备授权换成 access/refresh，之后走现有 OAuth 网关（已移除 grok.com 逆向反代）。
+- **批量操作**：多选启用/禁用、图/视能力、权重、清冷却、删除后写盘校验。
+- **账号媒体能力**：`supportsImage` / `supportsVideo` 参与图/视频选号。
+- **统一 Select 组件**：自绘下拉，账号筛选 / 设置模型与路由 / 模型映射跨端一致。
+- **日志页**：展示路由命中账号；账号/时间+状态标签、来源/端点合并；Token 列加宽。
+- **刷新用量**：在 SuperGrok 周额度之外，额外探测 API `x-ratelimit-*`。
+
+### Fixed
+
+- **Windows OAuth login**: `cmd /C start` split OAuth URLs on `&`, so browsers opened without `client_id` → `Missing or invalid client_id`. Now uses `rundll32 url.dll,FileProtocolHandler` (with quoted `cmd` / PowerShell fallbacks).
+- **Empty OAuth `client_id`**: config defaults + `effective_xai_client_id()` + refuse to persist empty client id on settings save/import.
+- **Batch delete not durable**: async quota/token writers re-saved stale full account lists after delete. Auth writes are locked; post-await updates merge into the **live** store and never re-insert deleted ids; delete re-reads disk to verify.
+- **Batch delete UI no-op**: replace `window.confirm` (often broken in WKWebView) with in-app `ConfirmDialog`.
+- **Unused SuperGrok payload**: accounts with no `used%` / empty products no longer error as `could not parse quota percent`; default to 0% used / 100% remaining and show API rate-limit tags clearly.
+- **Quota refresh clobbering concurrent rate limits**: merge prefers fresher live rate-limit / success markers when applying snapshots after `await`.
+
+**中文 · 修复**
+
+- **Windows 授权登录**：`cmd start` 未引用 URL，`&` 截断 query，浏览器丢失 `client_id`。改为 `rundll32` 打开完整链接。
+- **空 client_id**：配置默认值与运行时回落，禁止把空 client_id 写入配置。
+- **批量删除“假删”**：异步额度/token 写回旧整表。现已加锁、按 id 合并、删除后校验磁盘。
+- **批量删除无响应**：去掉 `window.confirm`，改用应用内确认框。
+- **未使用 SuperGrok 号**：空账单响应不再报解析错误；默认 0%/100%，并突出 API 限额标签。
+- **刷新额度覆盖并发状态**：合并写入时保留更新的 rate-limit / 成功时间戳。
+
+### Changed
+
+- Removed the experimental **grok.com SSO reverse** channel (`sso/*`, `sso_dispatch`, browser-impersonation deps). Card SSO is import-time conversion only.
+- Accounts UI: SuperGrok (`SG`) vs API rate-limit (`API n/n`) dual display; post-import auto quota refresh; import/convert status messaging.
+- Cost formatting uses `$x.xxxx` without locale `US$` prefix.
+- Logs cost / layout / account routing display as above.
+
+**中文 · 变更**
+
+- 移除 **grok.com SSO 逆向** 通道；卡密仅在导入时转为 OAuth。
+- 账号页区分 SuperGrok 周额度与 API 请求限额；导入成功自动刷额度。
+- 费用显示为 `$` 前缀（无 `US$`）。
+- 日志布局与命中账号展示见上。
+
 ## [0.1.3] - 2026-07-13
 
 ### Added
@@ -62,3 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Product renamed from Grok Proxy to GrokGo
 - Config home moved to `~/.grok-go`
+
+[Unreleased]: https://github.com/RongleCat/grok-go/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/RongleCat/grok-go/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/RongleCat/grok-go/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/RongleCat/grok-go/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/RongleCat/grok-go/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/RongleCat/grok-go/releases/tag/v0.1.0

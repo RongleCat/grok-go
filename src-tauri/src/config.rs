@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::paths::{auth_path, config_path};
 
 /// In-memory config/auth to avoid re-reading JSON on every proxy request.
 static CONFIG_CACHE: Lazy<RwLock<Option<AppConfig>>> = Lazy::new(|| RwLock::new(None));
 static AUTH_CACHE: Lazy<RwLock<Option<AuthStore>>> = Lazy::new(|| RwLock::new(None));
+/// Serializes load-modify-save on auth.json so async workers cannot resurrect deleted accounts.
+static AUTH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,8 +51,13 @@ pub struct AppConfig {
     pub auto_inject_codex_mcp: bool,
     pub launch_on_startup: bool,
     pub minimize_to_tray: bool,
+    /// Public hermes/grok-cli OAuth client id. Empty values are rejected at runtime
+    /// and replaced with [`DEFAULT_XAI_CLIENT_ID`].
+    #[serde(default = "default_xai_client_id")]
     pub xai_client_id: String,
+    #[serde(default = "default_xai_base_url")]
     pub xai_base_url: String,
+    #[serde(default = "default_oauth_redirect_port")]
     pub oauth_redirect_port: u16,
     /// When true, upstream xAI/OAuth HTTP goes through `http_proxy_url`.
     #[serde(default)]
@@ -65,6 +72,16 @@ pub struct AppConfig {
     /// `None` = all catalog tools (legacy default). `Some(list)` = only those names.
     #[serde(default)]
     pub mcp_enabled_tools: Option<Vec<String>>,
+    /// Legacy: grok.com SSO reverse channel removed. Card SSO is converted to OAuth via Device Flow.
+    /// Kept for config.json compatibility; ignored at runtime.
+    #[serde(default)]
+    pub sso_enabled: bool,
+    /// Legacy unused (SSO reverse removed).
+    #[serde(default)]
+    pub sso_cf_clearance: String,
+    /// Legacy unused (SSO reverse removed).
+    #[serde(default)]
+    pub sso_user_agent: String,
 }
 
 /// Canonical MCP tool ids shipped by the gateway (order matches tools/list).
@@ -85,6 +102,16 @@ impl AppConfig {
         match &self.mcp_enabled_tools {
             None => true,
             Some(list) => list.iter().any(|t| t == name),
+        }
+    }
+
+    /// Non-empty OAuth client id; falls back to the built-in public client.
+    pub fn effective_xai_client_id(&self) -> &str {
+        let t = self.xai_client_id.trim();
+        if t.is_empty() {
+            DEFAULT_XAI_CLIENT_ID
+        } else {
+            t
         }
     }
 }
@@ -128,6 +155,21 @@ fn default_account_max_concurrency() -> u32 {
     6
 }
 
+/// Public hermes / grok-cli client registered with xAI (redirect `http://127.0.0.1:56121/callback`).
+pub const DEFAULT_XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+
+fn default_xai_client_id() -> String {
+    DEFAULT_XAI_CLIENT_ID.into()
+}
+
+fn default_xai_base_url() -> String {
+    "https://api.x.ai/v1".into()
+}
+
+fn default_oauth_redirect_port() -> u16 {
+    56121
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -155,13 +197,16 @@ impl Default for AppConfig {
             minimize_to_tray: true,
             // Public hermes/grok-cli client — redirect_uri must match the
             // allowlist registered with xAI (exact port + path).
-            xai_client_id: "b1a00492-073a-47ea-816f-4c329264a828".into(),
-            xai_base_url: "https://api.x.ai/v1".into(),
-            oauth_redirect_port: 56121,
+            xai_client_id: default_xai_client_id(),
+            xai_base_url: default_xai_base_url(),
+            oauth_redirect_port: default_oauth_redirect_port(),
             http_proxy_enabled: false,
             http_proxy_url: String::new(),
             app_icon: AppIconStyle::Dark,
             mcp_enabled_tools: None,
+            sso_enabled: false,
+            sso_cf_clearance: String::new(),
+            sso_user_agent: String::new(),
         }
     }
 }
@@ -171,6 +216,27 @@ impl Default for AppConfig {
 pub struct AuthStore {
     #[serde(default)]
     pub accounts: Vec<Account>,
+}
+
+/// How this account authenticates to upstream Grok/xAI.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccountAuthKind {
+    /// Official xAI OAuth (access/refresh → api.x.ai / cli-chat-proxy).
+    #[default]
+    Oauth,
+    /// Legacy: card SSO before conversion. Not routable until converted to OAuth.
+    Sso,
+}
+
+/// Legacy SSO pool tier (reverse channel removed). Kept for auth.json compatibility.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SsoPoolTier {
+    #[default]
+    Basic,
+    Super,
+    Heavy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,8 +249,20 @@ pub struct Account {
     pub email: Option<String>,
     pub enabled: bool,
     pub weight: u32,
+    /// Authentication channel. Runtime routing requires OAuth tokens.
+    #[serde(default)]
+    pub auth_kind: AccountAuthKind,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
+    /// Original card SSO JWT (kept after SSO→OAuth convert for re-import; not used for API).
+    #[serde(default)]
+    pub sso_token: Option<String>,
+    /// Optional password from card import (local notes only; never sent upstream).
+    #[serde(default)]
+    pub password_hint: Option<String>,
+    /// Legacy field (SSO reverse removed).
+    #[serde(default)]
+    pub sso_pool: SsoPoolTier,
     pub token_type: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub last_refresh: Option<DateTime<Utc>>,
@@ -209,6 +287,13 @@ pub struct Account {
     /// SuperGrok weekly credit quota from grok.com GrokBuildBilling.
     #[serde(default)]
     pub quota: Option<crate::quota::AccountQuotaSnapshot>,
+    /// Whether this account may be selected for image generation. Default true.
+    /// Toggle off for text-only / non-media subscription accounts.
+    #[serde(default = "default_true")]
+    pub supports_image: bool,
+    /// Whether this account may be selected for video generation. Default true.
+    #[serde(default = "default_true")]
+    pub supports_video: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,8 +319,12 @@ impl Account {
             email: None,
             enabled: true,
             weight: 1,
+            auth_kind: AccountAuthKind::Oauth,
             access_token: None,
             refresh_token: None,
+            sso_token: None,
+            password_hint: None,
+            sso_pool: SsoPoolTier::Basic,
             token_type: Some("Bearer".into()),
             expires_at: None,
             last_refresh: None,
@@ -252,7 +341,38 @@ impl Account {
             rate_limit_reset_at: None,
             last_upstream_error: None,
             quota: None,
+            supports_image: true,
+            supports_video: true,
         }
+    }
+
+    /// True if this account can be used for upstream OAuth API calls.
+    /// Legacy `auth_kind=sso` rows without access/refresh are **not** credentialed
+    /// (convert with SSO→OAuth first).
+    pub fn is_credentialed(&self) -> bool {
+        self.access_token
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+            || self
+                .refresh_token
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+    }
+
+    /// Effective SSO JWT (prefers dedicated field, falls back to access_token).
+    pub fn effective_sso_token(&self) -> Option<&str> {
+        self.sso_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.access_token
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && s.starts_with("eyJ"))
+            })
     }
 }
 
@@ -281,6 +401,16 @@ pub fn save_config(config: &AppConfig) -> AppResult<()> {
 }
 
 pub fn load_auth() -> AppResult<AuthStore> {
+    let _guard = AUTH_LOCK.lock();
+    load_auth_unlocked()
+}
+
+pub fn save_auth(store: &AuthStore) -> AppResult<()> {
+    let _guard = AUTH_LOCK.lock();
+    save_auth_unlocked(store)
+}
+
+fn load_auth_unlocked() -> AppResult<AuthStore> {
     if let Some(cached) = AUTH_CACHE.read().clone() {
         return Ok(cached);
     }
@@ -289,7 +419,7 @@ pub fn load_auth() -> AppResult<AuthStore> {
         Some(store) => store,
         None => {
             let store = AuthStore::default();
-            save_auth(&store)?;
+            save_auth_unlocked(&store)?;
             return Ok(store);
         }
     };
@@ -297,7 +427,7 @@ pub fn load_auth() -> AppResult<AuthStore> {
     Ok(store)
 }
 
-pub fn save_auth(store: &AuthStore) -> AppResult<()> {
+fn save_auth_unlocked(store: &AuthStore) -> AppResult<()> {
     let path = auth_path()?;
     write_json_atomic(&path, store)?;
     #[cfg(unix)]
@@ -306,7 +436,166 @@ pub fn save_auth(store: &AuthStore) -> AppResult<()> {
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
     *AUTH_CACHE.write() = Some(store.clone());
+    tracing::debug!(
+        path = %path.display(),
+        accounts = store.accounts.len(),
+        "auth.json saved"
+    );
     Ok(())
+}
+
+/// Atomically load → mutate → save under the auth lock.
+/// Use for any multi-step mutation that must not race with deletes.
+#[allow(dead_code)]
+pub fn with_auth_mut<F, R>(f: F) -> AppResult<R>
+where
+    F: FnOnce(&mut AuthStore) -> AppResult<R>,
+{
+    let _guard = AUTH_LOCK.lock();
+    let mut store = load_auth_unlocked()?;
+    let out = f(&mut store)?;
+    save_auth_unlocked(&store)?;
+    Ok(out)
+}
+
+/// Merge fields of an existing account into the **current** store.
+///
+/// Critical: never re-inserts an account that was deleted while async work ran.
+/// Call this after `await` (token refresh, quota probe, etc.) instead of
+/// `save_auth` on a stale full-store clone.
+///
+/// Concurrent proxy traffic may have fresher rate-limit / success timestamps on
+/// the live slot — those win over a stale snapshot that started before `await`.
+///
+/// Returns `true` if the account was found and updated, `false` if it was gone
+/// (deleted) — callers should treat that as a no-op, not re-create the row.
+pub fn apply_account_update(account: &Account) -> AppResult<bool> {
+    let _guard = AUTH_LOCK.lock();
+    let mut store = load_auth_unlocked()?;
+    if let Some(slot) = store.accounts.iter_mut().find(|a| a.id == account.id) {
+        let live_rl_limit = slot.rate_limit_limit;
+        let live_rl_rem = slot.rate_limit_remaining;
+        let live_rl_reset = slot.rate_limit_reset_at;
+        let live_success = slot.last_success_at;
+        let live_failure = slot.last_failure_at;
+        let live_upstream_err = slot.last_upstream_error.clone();
+        let live_failures = slot.consecutive_failures;
+        let live_health = slot.health.clone();
+        let live_cooldown = slot.cooldown_until;
+
+        *slot = account.clone();
+
+        // Prefer the more-consumed rate-limit snapshot (lower remaining = newer traffic).
+        match (live_rl_rem, slot.rate_limit_remaining) {
+            (Some(live), Some(incoming)) if live < incoming => {
+                slot.rate_limit_remaining = Some(live);
+                if live_rl_limit.is_some() {
+                    slot.rate_limit_limit = live_rl_limit;
+                }
+                if live_rl_reset.is_some() {
+                    slot.rate_limit_reset_at = live_rl_reset;
+                }
+            }
+            (Some(live), None) => {
+                slot.rate_limit_remaining = Some(live);
+                slot.rate_limit_limit = live_rl_limit.or(slot.rate_limit_limit);
+                slot.rate_limit_reset_at = live_rl_reset.or(slot.rate_limit_reset_at);
+            }
+            _ => {}
+        }
+        // Prefer newer success / failure markers from the hot path.
+        match (live_success, slot.last_success_at) {
+            (Some(l), Some(i)) if l > i => slot.last_success_at = Some(l),
+            (Some(l), None) => slot.last_success_at = Some(l),
+            _ => {}
+        }
+        match (live_failure, slot.last_failure_at) {
+            (Some(l), Some(i)) if l > i => {
+                slot.last_failure_at = Some(l);
+                slot.consecutive_failures = live_failures;
+                slot.last_upstream_error = live_upstream_err.or(slot.last_upstream_error.clone());
+                slot.health = live_health;
+                slot.cooldown_until = live_cooldown;
+            }
+            (Some(l), None) => {
+                slot.last_failure_at = Some(l);
+                slot.consecutive_failures = live_failures.max(slot.consecutive_failures);
+                if slot.last_upstream_error.is_none() {
+                    slot.last_upstream_error = live_upstream_err;
+                }
+            }
+            _ => {}
+        }
+
+        save_auth_unlocked(&store)?;
+        Ok(true)
+    } else {
+        tracing::info!(
+            account_id = %account.id,
+            "skip account update — id no longer in auth store (deleted)"
+        );
+        Ok(false)
+    }
+}
+
+/// Append new accounts to the live store (used by import after async convert).
+pub fn append_accounts(new_accounts: Vec<Account>) -> AppResult<Vec<Account>> {
+    if new_accounts.is_empty() {
+        return Ok(load_auth()?.accounts);
+    }
+    let _guard = AUTH_LOCK.lock();
+    let mut store = load_auth_unlocked()?;
+    store.accounts.extend(new_accounts);
+    save_auth_unlocked(&store)?;
+    Ok(store.accounts)
+}
+
+/// Remove accounts by id and **verify** the write hit disk.
+pub fn delete_accounts_persistent(account_ids: &[String]) -> AppResult<usize> {
+    if account_ids.is_empty() {
+        return Ok(0);
+    }
+    let id_set: std::collections::HashSet<String> = account_ids
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if id_set.is_empty() {
+        return Ok(0);
+    }
+
+    let _guard = AUTH_LOCK.lock();
+    let mut store = load_auth_unlocked()?;
+    let before = store.accounts.len();
+    store.accounts.retain(|a| !id_set.contains(a.id.trim()));
+    let removed = before.saturating_sub(store.accounts.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+    save_auth_unlocked(&store)?;
+
+    // Drop cache and re-read from disk to prove persistence (catches write failures).
+    *AUTH_CACHE.write() = None;
+    let verified = load_auth_unlocked()?;
+    let still_present: Vec<&str> = verified
+        .accounts
+        .iter()
+        .filter(|a| id_set.contains(a.id.trim()))
+        .map(|a| a.id.as_str())
+        .collect();
+    if !still_present.is_empty() {
+        return Err(AppError::msg(format!(
+            "delete did not persist: {} id(s) still on disk",
+            still_present.len()
+        )));
+    }
+    tracing::info!(
+        removed,
+        remaining = verified.accounts.len(),
+        path = %auth_path()?.display(),
+        "accounts deleted and verified on disk"
+    );
+    Ok(removed)
 }
 
 /// Load a JSON config file, recovering from common Windows first-run failures:

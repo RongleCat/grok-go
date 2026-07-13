@@ -10,7 +10,7 @@ use crate::config::{load_auth, AppConfig};
 use crate::error::AppResult;
 use crate::gateway::media_artifacts::{materialize_image_response, materialize_image_response_sync};
 use crate::paths::artifacts_dir;
-use crate::router::{pick_account, replace_account_tokens};
+use crate::router::{pick_account_for, replace_account_tokens, MediaCapability};
 
 /// Names we treat as Codex / OpenAI image generation tools.
 pub fn is_image_gen_name(name: &str) -> bool {
@@ -120,7 +120,7 @@ pub async fn fulfill_image_gen_call(
         t.to_string()
     } else {
         let store = load_auth()?;
-        let mut account = pick_account(config, &store)?;
+        let mut account = pick_account_for(config, &store, MediaCapability::Image)?;
         let before = account.access_token.clone();
         let t = ensure_fresh_token(config, &mut account).await?;
         if account.access_token != before {

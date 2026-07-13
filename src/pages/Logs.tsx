@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type RequestLog } from "@/lib/api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, type Account, type RequestLog } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -11,7 +11,7 @@ import {
 import { useI18n } from "@/i18n/context";
 
 const PAGE_SIZE = 50;
-const ROW_HEIGHT = 52;
+const ROW_HEIGHT = 56;
 const OVERSCAN = 8;
 
 /** Dense token cell: total + in/out/cache + hit rate when cache > 0. */
@@ -36,8 +36,8 @@ function TokenCell({
 
   return (
     <div className="min-w-0 leading-tight" title={detail}>
-      <div className="truncate text-xs font-medium tabular-nums">{formatTokenCompact(total)}</div>
-      <div className="truncate text-[10px] tabular-nums text-neutral-400">
+      <div className="text-xs font-medium tabular-nums">{formatTokenCompact(total)}</div>
+      <div className="text-[10px] tabular-nums text-neutral-400 whitespace-nowrap">
         <span className="text-neutral-500">{labels.tokenIn}</span> {formatTokenCompact(input)}
         <span className="mx-0.5 text-neutral-300">·</span>
         <span className="text-neutral-500">{labels.tokenOut}</span> {formatTokenCompact(output)}
@@ -59,9 +59,23 @@ function TokenCell({
   );
 }
 
+function accountLabel(
+  accountId: string | null | undefined,
+  byId: Map<string, Account>
+): string {
+  if (!accountId) return "—";
+  const acc = byId.get(accountId);
+  if (!acc) {
+    // Fallback: short id when account was deleted
+    return accountId.length > 12 ? `${accountId.slice(0, 8)}…` : accountId;
+  }
+  return (acc.email || acc.name || accountId).trim() || accountId;
+}
+
 export function LogsPage() {
   const { t, locale } = useI18n();
   const [logs, setLogs] = useState<RequestLog[]>([]);
+  const [accounts, setAccounts] = useState<Account[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [hasMore, setHasMore] = useState(true);
@@ -69,6 +83,12 @@ export function LogsPage() {
   const [viewportH, setViewportH] = useState(400);
   const listRef = useRef<HTMLDivElement>(null);
   const loadingMore = useRef(false);
+
+  const accountById = useMemo(() => {
+    const m = new Map<string, Account>();
+    for (const a of accounts) m.set(a.id, a);
+    return m;
+  }, [accounts]);
 
   const loadPage = useCallback(async (offset: number, replace: boolean) => {
     if (loadingMore.current) return;
@@ -89,11 +109,17 @@ export function LogsPage() {
 
   async function refresh() {
     setHasMore(true);
+    try {
+      const list = await api.getAccounts();
+      setAccounts(list);
+    } catch {
+      /* non-fatal for logs */
+    }
     await loadPage(0, true);
   }
 
   useEffect(() => {
-    refresh();
+    void refresh();
   }, []);
 
   useEffect(() => {
@@ -124,15 +150,16 @@ export function LogsPage() {
   const padTop = start * ROW_HEIGHT;
   const padBottom = Math.max(0, (total - end) * ROW_HEIGHT);
 
+  // Account/time(+status) | Source+Endpoint | Model | Latency | Token (wide) | Cost
   const gridCols =
-    "grid-cols-[138px_minmax(0,1fr)_100px_48px_64px_minmax(132px,1.1fr)_72px_72px]";
+    "grid-cols-[minmax(196px,1.35fr)_minmax(100px,1fr)_minmax(88px,0.85fr)_52px_minmax(200px,1.7fr)_60px]";
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
       <div className="flex shrink-0 items-center justify-between gap-3">
         <h1 className="text-xl font-semibold tracking-tight">{t.logs.title}</h1>
         <div className="flex gap-2">
-          <Button variant="outline" size="sm" onClick={refresh}>
+          <Button variant="outline" size="sm" onClick={() => void refresh()}>
             {t.common.refresh}
           </Button>
           <Button
@@ -155,16 +182,17 @@ export function LogsPage() {
         <CardContent className="flex min-h-0 flex-1 flex-col p-0">
           <div className="shrink-0 border-b border-neutral-200 px-4">
             <div className={`grid ${gridCols} gap-2 py-2 text-xs font-medium text-neutral-500`}>
-              <div>{t.logs.time}</div>
-              <div>{t.logs.endpoint}</div>
+              <div>{t.logs.accountTime}</div>
+              <div>
+                <div>{t.logs.source}</div>
+                <div className="font-normal text-neutral-400">{t.logs.endpoint}</div>
+              </div>
               <div>{t.logs.model}</div>
-              <div>{t.logs.status}</div>
               <div>{t.logs.latency}</div>
               <div title={`${t.logs.tokenIn} / ${t.logs.tokenOut} / ${t.logs.tokenCache}`}>
                 {t.logs.tokens}
               </div>
               <div>{t.logs.cost}</div>
-              <div>{t.logs.source}</div>
             </div>
           </div>
 
@@ -178,41 +206,103 @@ export function LogsPage() {
             ) : (
               <div style={{ height: total * ROW_HEIGHT + (hasMore || loading ? 36 : 0) }}>
                 <div style={{ height: padTop }} />
-                {visible.map((log) => (
-                  <div
-                    key={log.requestId}
-                    className={`grid ${gridCols} items-center gap-2 border-b border-neutral-100 text-sm`}
-                    style={{ height: ROW_HEIGHT }}
-                  >
-                    <div className="truncate text-xs text-neutral-600">
-                      {new Date(log.createdAt).toLocaleString(
-                        locale === "zh-CN" ? "zh-CN" : "en-US"
-                      )}
-                    </div>
-                    <div className="truncate font-mono text-xs">{log.endpoint}</div>
-                    <div className="min-w-0 truncate text-xs">
-                      <div className="truncate">{log.resolvedModel || "-"}</div>
-                      {log.requestedModel && log.requestedModel !== log.resolvedModel ? (
-                        <div className="truncate text-[10px] text-neutral-400">
-                          {t.logs.from} {log.requestedModel}
+                {visible.map((log) => {
+                  const hitAccount = accountLabel(log.accountId, accountById);
+                  const ok = log.statusCode >= 200 && log.statusCode < 400;
+                  const timeStr = new Date(log.createdAt).toLocaleString(
+                    locale === "zh-CN" ? "zh-CN" : "en-US",
+                    {
+                      month: "numeric",
+                      day: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      second: "2-digit",
+                      hour12: false,
+                    }
+                  );
+                  return (
+                    <div
+                      key={log.requestId}
+                      className={`grid ${gridCols} items-center gap-2 border-b border-neutral-100 text-sm`}
+                      style={{ height: ROW_HEIGHT }}
+                    >
+                      <div className="min-w-0 leading-tight">
+                        <div
+                          className="truncate text-[11px] font-medium text-neutral-800"
+                          title={
+                            log.accountId
+                              ? `${hitAccount} (${log.accountId})`
+                              : t.logs.accountUnknown
+                          }
+                        >
+                          {hitAccount}
                         </div>
-                      ) : null}
+                        <div className="mt-0.5 flex min-w-0 items-center gap-1.5">
+                          <span
+                            className={
+                              ok
+                                ? "inline-flex shrink-0 items-center rounded px-1 py-px text-[10px] font-semibold tabular-nums leading-none bg-emerald-600 text-white"
+                                : "inline-flex shrink-0 items-center rounded px-1 py-px text-[10px] font-semibold tabular-nums leading-none bg-red-600 text-white"
+                            }
+                            title={`${t.logs.status} ${log.statusCode}`}
+                          >
+                            {log.statusCode}
+                          </span>
+                          <span
+                            className="min-w-0 truncate text-[10px] tabular-nums text-neutral-500"
+                            title={new Date(log.createdAt).toLocaleString(
+                              locale === "zh-CN" ? "zh-CN" : "en-US"
+                            )}
+                          >
+                            {timeStr}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="min-w-0 leading-tight">
+                        <div
+                          className="truncate text-[11px] text-neutral-700"
+                          title={log.clientSource || undefined}
+                        >
+                          {log.clientSource || "—"}
+                        </div>
+                        <div
+                          className="truncate font-mono text-[10px] text-neutral-500"
+                          title={log.endpoint}
+                        >
+                          {log.endpoint}
+                        </div>
+                      </div>
+                      <div className="min-w-0 truncate text-xs">
+                        <div className="truncate" title={log.resolvedModel || undefined}>
+                          {log.resolvedModel || "-"}
+                        </div>
+                        {log.requestedModel && log.requestedModel !== log.resolvedModel ? (
+                          <div
+                            className="truncate text-[10px] text-neutral-400"
+                            title={`${t.logs.from} ${log.requestedModel}`}
+                          >
+                            {t.logs.from} {log.requestedModel}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div className="text-xs tabular-nums text-neutral-600">
+                        {log.latencyMs}ms
+                      </div>
+                      <TokenCell
+                        log={log}
+                        labels={{
+                          tokenIn: t.logs.tokenIn,
+                          tokenOut: t.logs.tokenOut,
+                          tokenCache: t.logs.tokenCache,
+                          tokenCacheHit: t.logs.tokenCacheHit,
+                        }}
+                      />
+                      <div className="text-xs tabular-nums text-neutral-700">
+                        {formatUsd(log.estimatedCostUsd)}
+                      </div>
                     </div>
-                    <div className="text-xs">{log.statusCode}</div>
-                    <div className="text-xs">{log.latencyMs}ms</div>
-                    <TokenCell
-                      log={log}
-                      labels={{
-                        tokenIn: t.logs.tokenIn,
-                        tokenOut: t.logs.tokenOut,
-                        tokenCache: t.logs.tokenCache,
-                        tokenCacheHit: t.logs.tokenCacheHit,
-                      }}
-                    />
-                    <div className="text-xs">{formatUsd(log.estimatedCostUsd)}</div>
-                    <div className="truncate text-xs text-neutral-500">{log.clientSource}</div>
-                  </div>
-                ))}
+                  );
+                })}
                 <div style={{ height: padBottom }} />
                 {loading ? (
                   <div className="py-2 text-center text-xs text-neutral-400">{t.common.loading}</div>

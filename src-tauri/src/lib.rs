@@ -1,3 +1,4 @@
+mod account_import;
 mod auth;
 mod commands;
 mod concurrency;
@@ -10,6 +11,7 @@ mod paths;
 mod quota;
 mod router;
 mod session_affinity;
+mod sso_convert;
 mod usage;
 
 use auth::OAuthManager;
@@ -173,6 +175,10 @@ pub fn run() {
             commands::upsert_account,
             commands::delete_account,
             commands::replace_accounts,
+            commands::import_accounts,
+            commands::convert_sso_accounts,
+            commands::batch_delete_accounts,
+            commands::batch_patch_accounts,
             commands::clear_account_cooldown,
             commands::refresh_account_quota,
             commands::refresh_all_account_quotas,

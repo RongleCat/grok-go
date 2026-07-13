@@ -151,12 +151,38 @@ pub fn open_browser_url(url: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        // CRITICAL: OAuth URLs contain `&` query separators. Unquoted
+        // `cmd /C start "" <url>` treats `&` as a command separator, so the
+        // browser only gets `...?response_type=code` and auth.x.ai returns
+        // "Missing or invalid client_id".
+        //
+        // `rundll32 url.dll,FileProtocolHandler` passes the full URL intact
+        // (preferred). Fallbacks quote the URL for `cmd start` / PowerShell.
+        match std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => tracing::warn!("rundll32 FileProtocolHandler failed: {err}"),
+        }
+        let quoted = format!("\"{}\"", url.replace('"', ""));
         match std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(["/C", "start", "", &quoted])
             .spawn()
         {
             Ok(_) => return Ok(()),
             Err(err) => tracing::warn!("cmd start failed: {err}"),
+        }
+        let ps = format!(
+            "Start-Process '{}'",
+            url.replace('\'', "''")
+        );
+        match std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(err) => tracing::warn!("powershell Start-Process failed: {err}"),
         }
     }
     #[cfg(target_os = "linux")]

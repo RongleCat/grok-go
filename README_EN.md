@@ -38,8 +38,9 @@ Connecting **Grok / xAI** to **Codex** or other AI tools usually means wiring OA
 - **Responses + OpenAI-compatible APIs**: `/v1/responses`, `/v1/chat/completions`, `/v1/models`
 - **MCP tools**: `x_search`, image generate/edit, video generate/edit
 - **Multi-account OAuth**: host multiple accounts with weighted load balancing and auto refresh
+- **Batch import**: CPA `xai-*.json` / sub2api RTs / card SSO→OAuth (Device Flow) / GrokGo `auth.json`
 - **Native media endpoints**: images/videos through the same authenticated gateway; artifacts under `~/.grok-go/artifacts/`
-- **Usage visibility**: request logs, token totals, GitHub-style heatmap
+- **Usage visibility**: request logs (routed account), tokens, SuperGrok weekly + API rate limits, GitHub-style heatmap
 - **Codex / CC Switch ready**: one-click inject for `mcp_servers.grok-go` and provider import
 - **Optional LAN access** protected by a local bearer token
 

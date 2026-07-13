@@ -10,8 +10,8 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::auth::ensure_fresh_token;
-use crate::config::{load_auth, load_config, save_auth, Account};
+use crate::auth::{apply_rate_limit_headers, ensure_fresh_token};
+use crate::config::{load_auth, load_config, Account};
 use crate::error::{AppError, AppResult};
 use crate::http_client::build_http_client;
 
@@ -86,14 +86,15 @@ pub async fn refresh_account_quota(account_id: &str) -> AppResult<Account> {
     if !exists {
         return Err(AppError::msg("account not found"));
     }
-    let signed_in = store
+    let account = store
         .accounts
         .iter()
         .find(|a| a.id == account_id)
-        .map(|a| a.access_token.is_some() || a.refresh_token.is_some())
-        .unwrap_or(false);
-    if !signed_in {
-        return Err(AppError::msg("account is not signed in"));
+        .ok_or_else(|| AppError::msg("account not found"))?;
+    if !account.is_credentialed() {
+        return Err(AppError::msg(
+            "account is not signed in (SSO cards must be converted to OAuth first)",
+        ));
     }
     refresh_account_quota_inner(&config, account_id).await?;
     let store = load_auth()?;
@@ -111,7 +112,7 @@ pub async fn refresh_all_account_quotas() -> AppResult<Vec<Account>> {
     let ids: Vec<String> = store
         .accounts
         .iter()
-        .filter(|a| a.access_token.is_some() || a.refresh_token.is_some())
+        .filter(|a| a.auth_kind == crate::config::AccountAuthKind::Oauth && a.is_credentialed())
         .map(|a| a.id.clone())
         .collect();
 
@@ -123,47 +124,119 @@ pub async fn refresh_all_account_quotas() -> AppResult<Vec<Account>> {
 }
 
 async fn refresh_account_quota_inner(config: &crate::config::AppConfig, account_id: &str) -> AppResult<()> {
-    let mut store = load_auth()?;
-    let account = store
-        .accounts
-        .iter_mut()
-        .find(|a| a.id == account_id)
-        .ok_or_else(|| AppError::msg("account not found"))?;
+    // Clone one account only — never hold a full-store snapshot across `.await`
+    // (that was resurrecting deleted accounts when save_auth wrote the old list).
+    let mut account = {
+        let store = load_auth()?;
+        store
+            .accounts
+            .into_iter()
+            .find(|a| a.id == account_id)
+            .ok_or_else(|| AppError::msg("account not found"))?
+    };
 
-    let token = match ensure_fresh_token(config, account).await {
+    let token = match ensure_fresh_token(config, &mut account).await {
         Ok(t) => t,
         Err(err) => {
-            stamp_quota_error(account, err.to_string());
-            save_auth(&store)?;
+            stamp_quota_error(&mut account, err.to_string());
+            let _ = crate::config::apply_account_update(&account);
             return Err(err);
         }
     };
 
-    match fetch_quota_snapshot(config, &token).await {
+    // SuperGrok weekly credits (grok.com) — may be empty for never-used / free-tier cards.
+    let super_result = fetch_quota_snapshot(config, &token).await;
+    // API rate-limit headers (api.x.ai) — what routing actually consumes for chat.
+    // Manual "refresh quota" previously only hit SuperGrok, so RL stayed stale after imports.
+    probe_api_rate_limits(config, &mut account, &token).await;
+
+    match super_result {
         Ok(snap) => {
+            tracing::info!(
+                account_id = %account_id,
+                used = snap.used_percent,
+                remaining = snap.remaining_percent,
+                products = snap.products.len(),
+                rl_rem = ?account.rate_limit_remaining,
+                rl_lim = ?account.rate_limit_limit,
+                "quota refresh ok"
+            );
             account.quota = Some(snap);
-            save_auth(&store)?;
+            crate::config::apply_account_update(&account)?;
             Ok(())
         }
         Err(err) => {
-            stamp_quota_error(account, err.to_string());
-            save_auth(&store)?;
+            tracing::warn!(
+                account_id = %account_id,
+                error = %err,
+                rl_rem = ?account.rate_limit_remaining,
+                "SuperGrok quota refresh failed (RL probe may still have updated)"
+            );
+            stamp_quota_error(&mut account, err.to_string());
+            let _ = crate::config::apply_account_update(&account);
             Err(err)
+        }
+    }
+}
+
+/// Best-effort GET `{xai_base}/models` to refresh `x-ratelimit-*` on the account.
+async fn probe_api_rate_limits(config: &crate::config::AppConfig, account: &mut Account, token: &str) {
+    let base = config.xai_base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return;
+    }
+    let url = format!("{base}/models");
+    let client = match build_http_client(config) {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::debug!(error = %err, "rate-limit probe: no http client");
+            return;
+        }
+    };
+    match client
+        .get(&url)
+        .timeout(Duration::from_secs(15))
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            apply_rate_limit_headers(account, resp.headers());
+            if !status.is_success() {
+                tracing::debug!(%status, "rate-limit probe non-success (headers may still apply)");
+            }
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "rate-limit probe request failed");
         }
     }
 }
 
 fn stamp_quota_error(account: &mut Account, msg: String) {
     let prev = account.quota.clone();
+    let used = prev.as_ref().map(|q| q.used_percent).unwrap_or(0.0);
+    // Default remaining to 100% when we have no prior snapshot (unused / never-fetched).
+    let remaining = prev
+        .as_ref()
+        .map(|q| q.remaining_percent)
+        .unwrap_or_else(|| (100.0 - used).max(0.0));
     account.quota = Some(AccountQuotaSnapshot {
-        used_percent: prev.as_ref().map(|q| q.used_percent).unwrap_or(0.0),
-        remaining_percent: prev.as_ref().map(|q| q.remaining_percent).unwrap_or(0.0),
+        used_percent: used,
+        remaining_percent: remaining,
         period_start_at: prev.as_ref().and_then(|q| q.period_start_at),
         resets_at: prev.as_ref().and_then(|q| q.resets_at),
         products: prev.as_ref().map(|q| q.products.clone()).unwrap_or_default(),
         fetched_at: Utc::now(),
         last_error: Some(msg),
     });
+}
+
+/// Unused / never-billed SuperGrok accounts often return an empty or minimal
+/// GetGrokCreditsConfig payload (no fixed32 field 1). Treat as 0% used.
+pub fn default_unused_quota_snapshot() -> AccountQuotaSnapshot {
+    AccountQuotaSnapshot::from_used(0.0, None, None, Vec::new())
 }
 
 pub async fn fetch_quota_snapshot(
@@ -347,19 +420,26 @@ pub fn parse_grpc_web_quota(data: &[u8]) -> AppResult<AccountQuotaSnapshot> {
     if payloads.is_empty() && looks_like_protobuf(data) {
         payloads = vec![data.to_vec()];
     }
-    if payloads.is_empty() {
-        return Err(AppError::msg("quota response empty"));
+    // Successful RPC with no data frames (or empty body): unused SuperGrok limit.
+    if payloads.is_empty() || payloads.iter().all(|p| p.is_empty()) {
+        tracing::debug!("quota payload empty — treating as unused (0% used)");
+        return Ok(default_unused_quota_snapshot());
     }
 
     let mut used_percent: Option<f32> = None;
     let mut period_start: Option<DateTime<Utc>> = None;
     let mut resets_at: Option<DateTime<Utc>> = None;
     let products: Vec<QuotaProductUsage> = Vec::new();
+    let mut saw_structured = false;
 
     for payload in &payloads {
         // Preferred structured parse of field 1 message (observed layout).
         if let Some(parsed) = try_parse_credits_config(payload) {
             return Ok(parsed);
+        }
+        // Structured shell without used field still counts as a valid response.
+        if try_parse_credits_config_shell(payload) {
+            saw_structured = true;
         }
         // Fallback: CodexBar-style field scan.
         let scan = scan_protobuf(payload, 0, &[]);
@@ -374,6 +454,15 @@ pub fn parse_grpc_web_quota(data: &[u8]) -> AppResult<AccountQuotaSnapshot> {
                         .cmp(&b.path.len())
                         .then(a.order.cmp(&b.order))
                 })
+                .map(|f| f.value);
+        }
+        // Also accept 0.0 fixed32 anywhere shallow if field path ends with 1.
+        if used_percent.is_none() {
+            used_percent = scan
+                .fixed32
+                .iter()
+                .filter(|f| f.path.last() == Some(&1) && f.value == 0.0)
+                .min_by_key(|f| f.path.len())
                 .map(|f| f.value);
         }
         let epochs: Vec<(Vec<u64>, DateTime<Utc>)> = scan
@@ -407,8 +496,27 @@ pub fn parse_grpc_web_quota(data: &[u8]) -> AppResult<AccountQuotaSnapshot> {
         }
     }
 
-    let used = used_percent.ok_or_else(|| AppError::msg("could not parse quota percent"))?;
+    // Missing used percent after a successful RPC is normal for never-used cards.
+    let used = used_percent.unwrap_or(0.0);
+    if used_percent.is_none() {
+        tracing::debug!(
+            saw_structured,
+            "quota percent missing — defaulting to 0% used / 100% remaining"
+        );
+    }
     Ok(AccountQuotaSnapshot::from_used(used, period_start, resets_at, products))
+}
+
+/// True when payload looks like GetGrokCreditsConfig outer field-1 message (even if empty).
+fn try_parse_credits_config_shell(payload: &[u8]) -> bool {
+    let mut i = 0usize;
+    let Some((key, next)) = read_varint(payload, i) else {
+        return payload.is_empty();
+    };
+    i = next;
+    let field = key >> 3;
+    let wire = key & 7;
+    field == 1 && wire == 2
 }
 
 /// Structured parse matching observed GetGrokCreditsConfig payload layout.
@@ -497,7 +605,8 @@ fn try_parse_credits_config(payload: &[u8]) -> Option<AccountQuotaSnapshot> {
         }
     }
 
-    let used = used?;
+    // Unused accounts often omit fixed32 field 1 entirely — default 0% used.
+    let used = used.unwrap_or(0.0);
     // Product without percent still listed with 0 for visibility of known id.
     for p in &mut products {
         if !p.used_percent.is_finite() {
@@ -768,6 +877,32 @@ mod tests {
         payload.extend(varint(inner.len() as u64));
         payload.extend(inner);
         payload
+    }
+
+    #[test]
+    fn empty_payload_defaults_to_unused() {
+        let snap = parse_grpc_web_quota(&[]).expect("empty ok");
+        assert_eq!(snap.used_percent, 0.0);
+        assert_eq!(snap.remaining_percent, 100.0);
+        assert!(snap.last_error.is_none());
+    }
+
+    #[test]
+    fn structured_without_used_field_defaults_zero() {
+        // Outer field 1 message with only field 4 timestamp (no fixed32 used%).
+        let mut inner = Vec::new();
+        let ts = encode_timestamp(1_783_711_988);
+        inner.push(0x22); // field 4
+        inner.extend(varint(ts.len() as u64));
+        inner.extend(ts);
+        let mut payload = Vec::new();
+        payload.push(0x0a);
+        payload.extend(varint(inner.len() as u64));
+        payload.extend(inner);
+        let snap = parse_grpc_web_quota(&payload).expect("parse");
+        assert_eq!(snap.used_percent, 0.0);
+        assert_eq!(snap.remaining_percent, 100.0);
+        assert!(snap.period_start_at.is_some());
     }
 
     #[test]

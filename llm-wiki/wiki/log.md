@@ -1,6 +1,22 @@
 # Wiki 日志
 
+## 2026-07-13（v0.1.4 发布准备）
+
+- 批量导入 + SSO→OAuth Device Flow（`sso_convert.rs`）定稿；**移除** grok.com SSO 逆向（anti-bot）。
+- Auth 写锁 + 按 id 合并，修复批量删除被异步额度写回复活。
+- Windows OAuth：`rundll32` 打开完整授权 URL，修复 `Missing or invalid client_id`。
+- 额度：SuperGrok 空账单兜底；刷新时探测 API rate-limit；UI 区分 API / SG。
+- 日志页布局与统一 Select 组件；费用 `$` 前缀。
+
+## 2026-07-13（账号批量导入 / 管理）
+
+- 分支 `feat/account-batch-import-cpa-sub2api`。
+- `account_import.rs`：CPA / sub2api RT / 卡密 SSO / GrokGo auth。
+- `supports_image` / `supports_video`；批量导入/删/改 UI。
+- 卡密 SSO 导入后 Device Flow 转 OAuth，网关只走 OAuth。
+
 ## 2026-07-12（hotfix Windows JSON）
+
 
 - 分支 `hotfix/windows-json-config-load`：修复 Windows 下概览/账号页 `expected value at line 1 column 1`。
 - 根因：`config.json`/`auth.json` 空文件、BOM 或损坏时 `serde_json::from_str` 硬失败，Tauri invoke 错误直出 UI。
@@ -56,3 +72,10 @@
 - SSE 流式路径原先 `log_request(0,0,0)` 不解析 usage。
 - 曾用 `previous_response_id` 注入 `prompt_cache_key`（每轮变化）破坏前缀缓存。
 - 修复：多路径解析 cache、SSE 扫描 usage、稳定 cache key、`x-grok-conv-id`、response id 链式 sticky。
+
+## 2026-07-13 — Drop SSO reverse; pure-Rust SSO→OAuth
+
+- Removed grok.com reverse channel (`sso/`, `sso_dispatch`, wreq) after anti-bot 403.
+- Card SSO import now runs OIDC Device Flow in Rust (`sso_convert.rs`): SSO cookie → access/refresh, then official OAuth gateway path.
+- Added `convert_sso_accounts` for legacy SSO rows already on disk.
+- UI: hide SSO pool; show convert button for legacy SSO.

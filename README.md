@@ -38,8 +38,9 @@
 - **Responses + OpenAI 兼容**：`/v1/responses`、`/v1/chat/completions`、`/v1/models`
 - **MCP 工具**：`x_search`、图片生成/编辑、视频生成/编辑
 - **多账号 OAuth**：托管多个账号，加权负载均衡，自动 refresh
+- **批量导入**：CPA `xai-*.json` / sub2api RT / 卡密 SSO→OAuth（Device Flow）/ GrokGo `auth.json`
 - **原生媒体接口**：图片 / 视频走同一鉴权网关，产物落在 `~/.grok-go/artifacts/`
-- **用量可视**：请求日志、Token 统计、GitHub 风格热力图
+- **用量可视**：请求日志（命中账号）、Token 统计、SuperGrok 周额度 + API 限额、GitHub 风格热力图
 - **Codex / CC Switch**：一键注入 `mcp_servers.grok-go`，一键导入 provider
 - **局域网可选访问**：本地 bearer token 保护
 

@@ -316,7 +316,7 @@ export function SettingsPage() {
           autoInjectCodexMcp: b.autoInjectCodexMcp ?? next.autoInjectCodexMcp,
           launchOnStartup: b.launchOnStartup ?? next.launchOnStartup,
           minimizeToTray: b.minimizeToTray ?? next.minimizeToTray,
-          xaiClientId: b.xaiClientId ?? next.xaiClientId,
+          xaiClientId: b.xaiClientId?.trim() || next.xaiClientId,
           xaiBaseUrl: b.xaiBaseUrl ?? next.xaiBaseUrl,
           oauthRedirectPort: b.oauthRedirectPort ?? next.oauthRedirectPort,
           httpProxyEnabled: b.httpProxyEnabled ?? next.httpProxyEnabled,

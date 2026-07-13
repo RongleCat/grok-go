@@ -1,17 +1,30 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  CheckSquare,
+  Image as ImageIcon,
   KeyRound,
   RefreshCw,
+  Square,
   TimerOff,
   Trash2,
+  Upload,
+  Video,
 } from "lucide-react";
-import { api, type Account, type AccountQuota } from "@/lib/api";
+import {
+  api,
+  type Account,
+  type AccountQuota,
+  type ImportAccountsOptions,
+} from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { ConfirmDialog, Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { useI18n } from "@/i18n/context";
 import { useToast } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
@@ -72,6 +85,14 @@ function remainingTone(
   return "success";
 }
 
+function supportsImage(account: Account): boolean {
+  return account.supportsImage !== false;
+}
+
+function supportsVideo(account: Account): boolean {
+  return account.supportsVideo !== false;
+}
+
 /** Compact tag: short text, full label via native title (hover). */
 function Tag({
   children,
@@ -129,7 +150,9 @@ function AccountCard({
   locale,
   busy,
   quotaBusy,
+  selected,
   labels,
+  onToggleSelect,
   onSave,
   onRemove,
   onClearCooldown,
@@ -140,6 +163,7 @@ function AccountCard({
   locale: string;
   busy: boolean;
   quotaBusy: boolean;
+  selected: boolean;
   labels: {
     enabled: string;
     weight: string;
@@ -154,6 +178,8 @@ function AccountCard({
     unknown: string;
     needLogin: string;
     error: string;
+    unusedQuota: string;
+    unusedQuotaShort: string;
     rateLimit: string;
     refreshQuota: string;
     refreshingQuota: string;
@@ -161,21 +187,47 @@ function AccountCard({
     loggingIn: string;
     clearCooldown: string;
     remove: string;
+    imageOn: string;
+    imageOff: string;
+    videoOn: string;
+    videoOff: string;
   };
+  onToggleSelect: (id: string) => void;
   onSave: (account: Account) => void;
   onRemove: (id: string) => void;
   onClearCooldown: (id: string) => void;
   onRelogin: (id: string) => void;
   onRefreshQuota: (id: string) => void;
 }) {
-  const signedIn = Boolean(account.accessToken);
+  const signedIn = Boolean(account.accessToken || account.refreshToken);
   const quota: AccountQuota | null | undefined = account.quota;
-  const used = quota?.usedPercent ?? null;
-  const remaining =
-    quota?.remainingPercent ?? (used == null ? null : Math.max(0, 100 - used));
+  // Soft-heal legacy bad stamps: parse failure stored used=0 remaining=0 + lastError.
+  const softUnused =
+    !!quota?.lastError &&
+    (quota.usedPercent ?? 0) === 0 &&
+    (quota.remainingPercent ?? 0) === 0;
+  const used = softUnused ? 0 : (quota?.usedPercent ?? null);
+  const remaining = softUnused
+    ? 100
+    : (quota?.remainingPercent ??
+      (used == null ? null : Math.max(0, 100 - used)));
   const usedClamped = Math.max(0, Math.min(100, used ?? 0));
   const hasQuota = signedIn && quota != null && used != null;
+  const showHardQuotaError =
+    !!quota?.lastError &&
+    !softUnused &&
+    !/could not parse quota percent/i.test(quota.lastError);
+  // Fresh SuperGrok week with no product breakdown (common for CPA / never SuperGrok-billed).
+  const superGrokEmpty =
+    hasQuota &&
+    used === 0 &&
+    remaining === 100 &&
+    (quota?.products?.length ?? 0) === 0;
   const name = account.email || account.name;
+  const imgOk = supportsImage(account);
+  const vidOk = supportsVideo(account);
+  const hasRateLimit =
+    account.rateLimitRemaining != null || account.rateLimitLimit != null;
 
   const healthVariant =
     account.health === "healthy"
@@ -189,9 +241,23 @@ function AccountCard({
     .slice(0, 3);
 
   return (
-    <Card className="overflow-hidden">
+    <Card className={cn("overflow-hidden", selected && "ring-2 ring-neutral-900/15")}>
       <CardContent className="p-0">
-        <div className="grid grid-cols-1 gap-2 px-3 py-2.5 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto] sm:items-center sm:gap-3">
+        <div className="grid grid-cols-1 gap-2 px-3 py-2.5 sm:grid-cols-[auto_minmax(0,1.2fr)_minmax(0,1fr)_auto] sm:items-center sm:gap-3">
+          <button
+            type="button"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+            title={selected ? "Unselect" : "Select"}
+            aria-pressed={selected}
+            onClick={() => onToggleSelect(account.id)}
+          >
+            {selected ? (
+              <CheckSquare className="h-4 w-4" />
+            ) : (
+              <Square className="h-4 w-4" />
+            )}
+          </button>
+
           {/* Identity */}
           <div className="flex min-w-0 items-center gap-2">
             <div className="min-w-0 flex-1">
@@ -219,16 +285,59 @@ function AccountCard({
                     )}
                   />
                 </span>
-                {quota?.lastError ? (
-                  <Tag title={`${labels.error}: ${quota.lastError}`} variant="danger">
+                {account.authKind === "sso" ? (
+                  <Tag
+                    title="Legacy SSO — needs convert to OAuth (re-import or convert)"
+                    variant="warning"
+                  >
+                    SSO→OAuth
+                  </Tag>
+                ) : null}
+                <Tag
+                  title={imgOk ? labels.imageOn : labels.imageOff}
+                  variant={imgOk ? "success" : "outline"}
+                  className="cursor-pointer"
+                >
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-0.5"
+                    onClick={() =>
+                      onSave({ ...account, supportsImage: !imgOk })
+                    }
+                  >
+                    <ImageIcon className="h-3 w-3" />
+                    {imgOk ? "图" : "图×"}
+                  </button>
+                </Tag>
+                <Tag
+                  title={vidOk ? labels.videoOn : labels.videoOff}
+                  variant={vidOk ? "success" : "outline"}
+                >
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-0.5"
+                    onClick={() =>
+                      onSave({ ...account, supportsVideo: !vidOk })
+                    }
+                  >
+                    <Video className="h-3 w-3" />
+                    {vidOk ? "视" : "视×"}
+                  </button>
+                </Tag>
+                {showHardQuotaError ? (
+                  <Tag title={`${labels.error}: ${quota?.lastError}`} variant="danger">
                     Err
+                  </Tag>
+                ) : softUnused || superGrokEmpty ? (
+                  <Tag title={labels.unusedQuota} variant="outline">
+                    {labels.unusedQuotaShort}
                   </Tag>
                 ) : null}
               </div>
             </div>
           </div>
 
-          {/* Quota — always same block height for layout consistency */}
+          {/* Quota */}
           <div className="min-w-0 space-y-1.5">
             <div className="h-1.5 overflow-hidden rounded-full bg-neutral-100">
               <div
@@ -240,26 +349,46 @@ function AccountCard({
               />
             </div>
             <div className="flex min-h-5 flex-wrap items-center gap-1">
+              {/* API rate limit — updated on chat traffic and on quota refresh probe */}
+              {hasRateLimit ? (
+                <Tag
+                  title={`${labels.rateLimit}: ${
+                    account.rateLimitRemaining != null && account.rateLimitLimit != null
+                      ? `${account.rateLimitRemaining}/${account.rateLimitLimit}`
+                      : String(account.rateLimitRemaining ?? account.rateLimitLimit ?? "—")
+                  }${
+                    account.rateLimitResetAt
+                      ? ` · ${formatFullDateTime(account.rateLimitResetAt, locale)}`
+                      : ""
+                  }`}
+                  variant="success"
+                >
+                  API{" "}
+                  {account.rateLimitRemaining != null && account.rateLimitLimit != null
+                    ? `${account.rateLimitRemaining}/${account.rateLimitLimit}`
+                    : String(account.rateLimitRemaining ?? account.rateLimitLimit ?? "—")}
+                </Tag>
+              ) : null}
               {hasQuota ? (
                 <>
                   <Tag
-                    title={`${labels.remaining} ${formatPercent(remaining)} · ${labels.used} ${formatPercent(used)}`}
+                    title={`SuperGrok ${labels.remaining} ${formatPercent(remaining)} · ${labels.used} ${formatPercent(used)}`}
                     variant={remainingTone(used)}
                   >
-                    {formatPercent(remaining)}
+                    SG {formatPercent(remaining)}
                   </Tag>
                   <Tag
-                    title={`${labels.resetsAt}: ${formatFullDateTime(quota.resetsAt, locale)}${
-                      quota.periodStartAt
+                    title={`${labels.resetsAt}: ${formatFullDateTime(quota?.resetsAt, locale)}${
+                      quota?.periodStartAt
                         ? ` · ${labels.periodStart}: ${formatFullDateTime(quota.periodStartAt, locale)}`
                         : ""
                     }${
-                      quota.fetchedAt
+                      quota?.fetchedAt
                         ? ` · ${labels.fetchedAt}: ${formatFullDateTime(quota.fetchedAt, locale)}`
                         : ""
                     }`}
                   >
-                    ↻ {formatShortDateTime(quota.resetsAt, locale)}
+                    ↻ {formatShortDateTime(quota?.resetsAt, locale)}
                   </Tag>
                   {productTags.map((p) => (
                     <Tag
@@ -269,32 +398,14 @@ function AccountCard({
                       {p.label} {formatPercent(p.usedPercent)}
                     </Tag>
                   ))}
-                  {account.rateLimitRemaining != null || account.rateLimitLimit != null ? (
-                    <Tag
-                      title={`${labels.rateLimit}: ${
-                        account.rateLimitRemaining != null && account.rateLimitLimit != null
-                          ? `${account.rateLimitRemaining}/${account.rateLimitLimit}`
-                          : String(account.rateLimitRemaining ?? "—")
-                      }${
-                        account.rateLimitResetAt
-                          ? ` · ${formatFullDateTime(account.rateLimitResetAt, locale)}`
-                          : ""
-                      }`}
-                    >
-                      RL{" "}
-                      {account.rateLimitRemaining != null && account.rateLimitLimit != null
-                        ? `${account.rateLimitRemaining}/${account.rateLimitLimit}`
-                        : String(account.rateLimitRemaining ?? "—")}
-                    </Tag>
-                  ) : null}
                 </>
-              ) : (
+              ) : !hasRateLimit ? (
                 <Tag title={signedIn ? labels.unknown : labels.needLogin}>—</Tag>
-              )}
+              ) : null}
             </div>
           </div>
 
-          {/* Controls — fixed action set */}
+          {/* Controls */}
           <div className="flex flex-wrap items-center justify-end gap-1.5 sm:flex-nowrap">
             <div className="flex h-8 items-center gap-1.5 rounded-md border border-neutral-200 px-2">
               <span className="select-none text-xs text-neutral-500">{labels.enabled}</span>
@@ -338,7 +449,6 @@ function AccountCard({
                 <TimerOff className="h-3.5 w-3.5" />
               </IconAction>
             ) : (
-              // Keep action rail width stable when not in cooldown.
               <span className="hidden h-8 w-8 sm:inline-block" aria-hidden />
             )}
 
@@ -374,9 +484,26 @@ export function AccountsPage() {
   const [busy, setBusy] = useState(false);
   const [quotaBusyId, setQuotaBusyId] = useState<string | null>(null);
   const [quotaBusyAll, setQuotaBusyAll] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
+  const [filterMedia, setFilterMedia] = useState<"all" | "image" | "video" | "text-only">("all");
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const [importOpts, setImportOpts] = useState<ImportAccountsOptions>({
+    weight: 1,
+    supportsImage: true,
+    supportsVideo: true,
+    skipDuplicates: true,
+    validateRefresh: true,
+  });
+  const [bulkWeight, setBulkWeight] = useState("1");
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const waitingAccountId = useRef<string | null>(null);
   const autoQuotaRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const stopPoll = useCallback(() => {
     if (pollRef.current) {
@@ -450,6 +577,33 @@ export function AccountsPage() {
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [refresh]);
+
+  // Drop selection for removed accounts.
+  useEffect(() => {
+    setSelected((prev) => {
+      const ids = new Set(accounts.map((a) => a.id));
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (ids.has(id)) next.add(id);
+      }
+      return next.size === prev.size ? prev : next;
+    });
+  }, [accounts]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return accounts.filter((a) => {
+      if (filterMedia === "image" && !supportsImage(a)) return false;
+      if (filterMedia === "video" && !supportsVideo(a)) return false;
+      if (filterMedia === "text-only" && (supportsImage(a) || supportsVideo(a))) return false;
+      if (!q) return true;
+      const hay = `${a.email ?? ""} ${a.name} ${a.notes ?? ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [accounts, filterMedia, query]);
+
+  const allFilteredSelected =
+    filtered.length > 0 && filtered.every((a) => selected.has(a.id));
 
   function startWaitingFor(accountId: string) {
     stopPoll();
@@ -553,8 +707,22 @@ export function AccountsPage() {
     setQuotaBusyId(id);
     setError("");
     try {
-      setAccounts(await api.refreshAccountQuota(id));
-      toast(t.common.saved, "success");
+      const list = await api.refreshAccountQuota(id);
+      setAccounts(list);
+      const acc = list.find((a) => a.id === id);
+      const sg = acc?.quota;
+      const rl =
+        acc?.rateLimitRemaining != null && acc?.rateLimitLimit != null
+          ? `API ${acc.rateLimitRemaining}/${acc.rateLimitLimit}`
+          : null;
+      const superPart =
+        sg != null
+          ? `SuperGrok ${formatPercent(sg.remainingPercent ?? Math.max(0, 100 - (sg.usedPercent ?? 0)))} ${t.accounts.remaining}`
+          : null;
+      toast(
+        [rl, superPart].filter(Boolean).join(" · ") || t.common.saved,
+        "success"
+      );
     } catch (e) {
       try {
         setAccounts(await api.getAccounts());
@@ -587,8 +755,182 @@ export function AccountsPage() {
     }
   }
 
+  function toggleSelect(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleSelectAllFiltered() {
+    if (allFilteredSelected) {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const a of filtered) next.delete(a.id);
+        return next;
+      });
+    } else {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const a of filtered) next.add(a.id);
+        return next;
+      });
+    }
+  }
+
+  async function runBatchPatch(
+    patch: Parameters<typeof api.batchPatchAccounts>[1],
+    emptyMsg?: string
+  ) {
+    const ids = [...selected];
+    if (ids.length === 0) {
+      toast(emptyMsg ?? t.accounts.bulkNeedSelection, "warning");
+      return;
+    }
+    try {
+      setAccounts(await api.batchPatchAccounts(ids, patch));
+      toast(t.accounts.bulkUpdated.replace("{count}", String(ids.length)), "success");
+    } catch (e) {
+      setError(String(e));
+      toast(String(e), "error");
+    }
+  }
+
+  function requestBatchDelete() {
+    if (selected.size === 0) {
+      toast(t.accounts.bulkNeedSelection, "warning");
+      return;
+    }
+    // Do not use window.confirm — WKWebView/Tauri often returns undefined/false
+    // without showing a dialog, which silently aborts the delete.
+    setDeleteConfirmOpen(true);
+  }
+
+  async function runBatchDelete() {
+    const ids = [...selected].filter((id) => typeof id === "string" && id.trim().length > 0);
+    if (ids.length === 0) {
+      toast(t.accounts.bulkNeedSelection, "warning");
+      setDeleteConfirmOpen(false);
+      return;
+    }
+    setDeleteBusy(true);
+    setError("");
+    try {
+      const next = await api.batchDeleteAccounts(ids);
+      setAccounts(next);
+      setSelected(new Set());
+      setDeleteConfirmOpen(false);
+      toast(t.accounts.bulkDeleted.replace("{count}", String(ids.length)), "success");
+    } catch (e) {
+      // Refresh list in case partial / stale selection.
+      try {
+        setAccounts(await api.getAccounts());
+      } catch {
+        /* ignore */
+      }
+      setError(String(e));
+      toast(String(e), "error");
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
+  async function runImport() {
+    const payload = importText.trim();
+    if (!payload) {
+      toast(t.accounts.importEmpty, "warning");
+      return;
+    }
+    setImportBusy(true);
+    setError("");
+    try {
+      const result = await api.importAccounts(payload, importOpts);
+      setAccounts(result.accounts);
+      const summary = t.accounts.importResult
+        .replace("{added}", String(result.added))
+        .replace("{skipped}", String(result.skipped))
+        .replace("{failed}", String(result.failed));
+      if (result.failed > 0 && result.added === 0) {
+        toast(summary, "error");
+        setError(result.errors.map((e) => `#${e.index}: ${e.detail}`).join("\n"));
+      } else if (result.failed > 0) {
+        toast(summary, "warning");
+        setError(result.errors.map((e) => `#${e.index}: ${e.detail}`).join("\n"));
+      } else {
+        toast(summary, "success");
+        setImportOpen(false);
+        setImportText("");
+      }
+    } catch (e) {
+      setError(String(e));
+      toast(String(e), "error");
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function onPickImportFiles(files: FileList | null) {
+    if (!files?.length) return;
+    const parts: string[] = [];
+    for (const file of Array.from(files)) {
+      try {
+        parts.push(await file.text());
+      } catch (e) {
+        toast(`${file.name}: ${String(e)}`, "error");
+      }
+    }
+    // Prefer JSON array merge when all are JSON objects.
+    const objects: unknown[] = [];
+    let allJson = true;
+    for (const p of parts) {
+      try {
+        const v = JSON.parse(p);
+        if (Array.isArray(v)) objects.push(...v);
+        else objects.push(v);
+      } catch {
+        allJson = false;
+        break;
+      }
+    }
+    setImportText(allJson ? JSON.stringify(objects, null, 2) : parts.join("\n"));
+  }
+
   const dateLocale = locale === "en" ? "en-US" : "zh-CN";
-  const hasSignedIn = accounts.some((a) => a.accessToken);
+  const hasSignedIn = accounts.some((a) => a.accessToken || a.refreshToken);
+  const hasLegacySso = accounts.some(
+    (a) => a.authKind === "sso" || (a.ssoToken && !a.refreshToken)
+  );
+
+  async function runConvertSso() {
+    setImportBusy(true);
+    setError("");
+    try {
+      const result = await api.convertSsoAccounts();
+      setAccounts(result.accounts);
+      const summary = t.accounts.convertSsoResult
+        .replace("{added}", String(result.added))
+        .replace("{skipped}", String(result.skipped))
+        .replace("{failed}", String(result.failed));
+      if (result.added === 0 && result.failed === 0) {
+        toast(t.accounts.convertSsoNone, "warning");
+      } else if (result.failed > 0 && result.added === 0) {
+        toast(summary, "error");
+        setError(result.errors.map((e) => `#${e.index}: ${e.detail}`).join("\n"));
+      } else if (result.failed > 0) {
+        toast(summary, "warning");
+        setError(result.errors.map((e) => `#${e.index}: ${e.detail}`).join("\n"));
+      } else {
+        toast(summary, "success");
+      }
+    } catch (e) {
+      setError(String(e));
+      toast(String(e), "error");
+    } finally {
+      setImportBusy(false);
+    }
+  }
 
   const cardLabels = {
     enabled: t.common.enabled,
@@ -604,6 +946,8 @@ export function AccountsPage() {
     unknown: t.accounts.quotaUnknown,
     needLogin: t.accounts.quotaNeedLogin,
     error: t.accounts.quotaError,
+    unusedQuota: t.accounts.quotaUnused,
+    unusedQuotaShort: t.accounts.quotaUnusedShort,
     rateLimit: t.accounts.rateLimitHint,
     refreshQuota: t.accounts.refreshQuota,
     refreshingQuota: t.accounts.refreshingQuota,
@@ -611,6 +955,10 @@ export function AccountsPage() {
     loggingIn: t.accounts.loggingIn,
     clearCooldown: t.accounts.clearCooldown,
     remove: t.common.remove,
+    imageOn: t.accounts.imageOn,
+    imageOff: t.accounts.imageOff,
+    videoOn: t.accounts.videoOn,
+    videoOff: t.accounts.videoOff,
   };
 
   return (
@@ -635,11 +983,155 @@ export function AccountsPage() {
               {quotaBusyAll ? t.accounts.refreshingQuota : t.accounts.refreshAllQuotas}
             </Button>
           ) : null}
+          {hasLegacySso ? (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={busy || importBusy}
+              onClick={() => void runConvertSso()}
+              title={t.accounts.convertSsoTitle}
+            >
+              <KeyRound className={cn("h-3.5 w-3.5", importBusy && "animate-pulse")} />
+              {t.accounts.convertSso}
+            </Button>
+          ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={busy || importBusy}
+            onClick={() => setImportOpen(true)}
+          >
+            <Upload className="h-3.5 w-3.5" />
+            {t.accounts.importAccounts}
+          </Button>
           <Button size="sm" disabled={busy} onClick={() => login()}>
             {busy ? t.accounts.loggingIn : t.accounts.addAccount}
           </Button>
         </div>
       </div>
+
+      {/* Search / filter */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          className="h-8 w-full max-w-xs text-sm"
+          placeholder={t.accounts.searchPlaceholder}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        <Select
+          size="sm"
+          className="w-[8.5rem] shrink-0"
+          value={filterMedia}
+          onChange={(e) =>
+            setFilterMedia(e.target.value as typeof filterMedia)
+          }
+        >
+          <option value="all">{t.accounts.filterAll}</option>
+          <option value="image">{t.accounts.filterImage}</option>
+          <option value="video">{t.accounts.filterVideo}</option>
+          <option value="text-only">{t.accounts.filterTextOnly}</option>
+        </Select>
+        <span className="text-xs text-neutral-500">
+          {t.accounts.shownCount
+            .replace("{shown}", String(filtered.length))
+            .replace("{total}", String(accounts.length))}
+        </span>
+        {filtered.length > 0 ? (
+          <Button type="button" size="sm" variant="ghost" onClick={toggleSelectAllFiltered}>
+            {allFilteredSelected ? t.accounts.unselectPage : t.accounts.selectPage}
+          </Button>
+        ) : null}
+      </div>
+
+      {/* Bulk actions */}
+      {selected.size > 0 ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2">
+          <span className="text-xs font-medium text-neutral-700">
+            {t.accounts.bulkSelected.replace("{count}", String(selected.size))}
+          </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runBatchPatch({ enabled: true })}
+          >
+            {t.accounts.bulkEnable}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runBatchPatch({ enabled: false })}
+          >
+            {t.accounts.bulkDisable}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runBatchPatch({ supportsImage: true })}
+          >
+            {t.accounts.bulkImageOn}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runBatchPatch({ supportsImage: false })}
+          >
+            {t.accounts.bulkImageOff}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runBatchPatch({ supportsVideo: true })}
+          >
+            {t.accounts.bulkVideoOn}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runBatchPatch({ supportsVideo: false })}
+          >
+            {t.accounts.bulkVideoOff}
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => void runBatchPatch({ clearCooldown: true })}
+          >
+            {t.accounts.bulkClearCooldown}
+          </Button>
+          <div className="flex items-center gap-1">
+            <Input
+              className="h-8 w-14 text-center text-xs"
+              type="number"
+              min={1}
+              value={bulkWeight}
+              onChange={(e) => setBulkWeight(e.target.value)}
+              title={t.common.weight}
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() =>
+                void runBatchPatch({
+                  weight: Math.max(1, Number(bulkWeight) || 1),
+                })
+              }
+            >
+              {t.accounts.bulkSetWeight}
+            </Button>
+          </div>
+          <Button
+            size="sm"
+            variant="destructive"
+            disabled={deleteBusy}
+            onClick={() => requestBatchDelete()}
+          >
+            {t.accounts.bulkDelete}
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>
+            {t.accounts.bulkClearSelection}
+          </Button>
+        </div>
+      ) : null}
 
       {error ? (
         <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 whitespace-pre-wrap">
@@ -658,14 +1150,16 @@ export function AccountsPage() {
       ) : null}
 
       <div className="space-y-2">
-        {accounts.map((account) => (
+        {filtered.map((account) => (
           <AccountCard
             key={account.id}
             account={account}
             locale={dateLocale}
             busy={busy}
             quotaBusy={quotaBusyAll || quotaBusyId === account.id}
+            selected={selected.has(account.id)}
             labels={cardLabels}
+            onToggleSelect={toggleSelect}
             onSave={(a) => void save(a)}
             onRemove={(id) => void remove(id)}
             onClearCooldown={(id) => void clearCooldown(id)}
@@ -675,8 +1169,137 @@ export function AccountsPage() {
         ))}
         {accounts.length === 0 ? (
           <div className="text-sm text-neutral-500">{t.accounts.empty}</div>
+        ) : filtered.length === 0 ? (
+          <div className="text-sm text-neutral-500">{t.accounts.noMatch}</div>
         ) : null}
       </div>
+
+      <ConfirmDialog
+        open={deleteConfirmOpen}
+        title={t.accounts.bulkDelete}
+        description={t.accounts.bulkDeleteConfirm.replace(
+          "{count}",
+          String(selected.size)
+        )}
+        cancelLabel={t.common.cancel}
+        confirmLabel={t.common.remove}
+        busy={deleteBusy}
+        onCancel={() => {
+          if (!deleteBusy) setDeleteConfirmOpen(false);
+        }}
+        onConfirm={() => void runBatchDelete()}
+      />
+
+      {/* Import dialog */}
+      <Dialog
+        open={importOpen}
+        title={t.accounts.importTitle}
+        description={t.accounts.importHint}
+        className="max-w-xl"
+        onClose={importBusy ? undefined : () => setImportOpen(false)}
+      >
+        <div className="space-y-3">
+          <Textarea
+            className="min-h-[180px] font-mono text-xs"
+            placeholder={t.accounts.importPlaceholder}
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+            disabled={importBusy}
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              accept="application/json,.json,.txt,.ndjson"
+              multiple
+              onChange={(e) => {
+                void onPickImportFiles(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={importBusy}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              {t.accounts.importPickFiles}
+            </Button>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
+            <label className="flex items-center gap-2 rounded-md border border-neutral-200 px-2 py-1.5">
+              <span className="text-neutral-500">{t.common.weight}</span>
+              <Input
+                className="h-7 w-14 border-0 px-1 text-center shadow-none"
+                type="number"
+                min={1}
+                value={importOpts.weight ?? 1}
+                onChange={(e) =>
+                  setImportOpts((o) => ({
+                    ...o,
+                    weight: Math.max(1, Number(e.target.value) || 1),
+                  }))
+                }
+              />
+            </label>
+            <label className="flex items-center justify-between gap-2 rounded-md border border-neutral-200 px-2 py-1.5">
+              <span>{t.accounts.importSupportsImage}</span>
+              <Switch
+                checked={importOpts.supportsImage !== false}
+                onCheckedChange={(v) =>
+                  setImportOpts((o) => ({ ...o, supportsImage: v }))
+                }
+              />
+            </label>
+            <label className="flex items-center justify-between gap-2 rounded-md border border-neutral-200 px-2 py-1.5">
+              <span>{t.accounts.importSupportsVideo}</span>
+              <Switch
+                checked={importOpts.supportsVideo !== false}
+                onCheckedChange={(v) =>
+                  setImportOpts((o) => ({ ...o, supportsVideo: v }))
+                }
+              />
+            </label>
+            <label className="flex items-center justify-between gap-2 rounded-md border border-neutral-200 px-2 py-1.5">
+              <span>{t.accounts.importSkipDup}</span>
+              <Switch
+                checked={importOpts.skipDuplicates !== false}
+                onCheckedChange={(v) =>
+                  setImportOpts((o) => ({ ...o, skipDuplicates: v }))
+                }
+              />
+            </label>
+            <label className="col-span-2 flex items-center justify-between gap-2 rounded-md border border-neutral-200 px-2 py-1.5 sm:col-span-2">
+              <span>{t.accounts.importValidateRt}</span>
+              <Switch
+                checked={importOpts.validateRefresh !== false}
+                onCheckedChange={(v) =>
+                  setImportOpts((o) => ({ ...o, validateRefresh: v }))
+                }
+              />
+            </label>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={importBusy}
+              onClick={() => setImportOpen(false)}
+            >
+              {t.common.cancel}
+            </Button>
+            <Button
+              type="button"
+              disabled={importBusy || !importText.trim()}
+              onClick={() => void runImport()}
+            >
+              {importBusy ? t.accounts.importing : t.accounts.importSubmit}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 }

@@ -19,7 +19,7 @@ use crate::config::{load_auth, load_config, save_config, Account, AppConfig};
 use crate::error::{AppError, AppResult};
 use crate::gateway::proxy::{authorize_request, list_models_response, proxy_json, ProxyContext};
 use crate::auth::ensure_fresh_token;
-use crate::router::{pick_account, replace_account_tokens};
+use crate::router::{pick_account_for, replace_account_tokens, MediaCapability};
 use crate::usage::{estimate_cost, RequestLog};
 use crate::gateway::media_artifacts::{
     materialize_image_response, materialize_video_response, media_summary, mcp_media_content,
@@ -219,10 +219,7 @@ async fn poll_video_job_http(
         }
     }
     for a in &store.accounts {
-        if a.enabled
-            && (a.access_token.is_some() || a.refresh_token.is_some())
-            && !ordered.iter().any(|x| x.id == a.id)
-        {
+        if a.enabled && a.is_credentialed() && !ordered.iter().any(|x| x.id == a.id) {
             ordered.push(a.clone());
         }
     }
@@ -908,7 +905,8 @@ async fn call_upstream(
     source: &str,
 ) -> AppResult<UpstreamResult> {
     let store = load_auth()?;
-    let mut account = pick_account(config, &store)?;
+    let capability = MediaCapability::from_upstream_path(path);
+    let mut account = pick_account_for(config, &store, capability)?;
     let before = account.access_token.clone();
     let token = ensure_fresh_token(config, &mut account).await?;
     if account.access_token != before {

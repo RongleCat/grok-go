@@ -61,3 +61,7 @@ website/
 .turbo/
 .eslintcache
 *.tsbuildinfo
+
+# SSO→OAuth converter local venv
+.venv-sso/
+

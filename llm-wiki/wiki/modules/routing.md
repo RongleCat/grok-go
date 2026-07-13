@@ -16,9 +16,12 @@
 
 1. `enabled`
 2. 有 access 或 refresh token
-3. 不在 exclude 列表（本请求已失败的号）
-4. 非 Disabled；Cooldown 仅当 cooldown 已过期
-5. 优先 `Healthy && consecutive_failures==0`；否则按失败次数软排序
+3. **媒体能力**（`MediaCapability`）：图片路径要求 `supports_image`；视频路径要求 `supports_video`；文本为 `Any`
+4. 不在 exclude 列表（本请求已失败的号）
+5. 非 Disabled；Cooldown 仅当 cooldown 已过期
+6. 优先 `Healthy && consecutive_failures==0`；否则按失败次数软排序
+
+入口：`pick_account_decision_cap`；`send_with_account_failover` / MCP `call_upstream` / image_bridge 按 upstream path 自动推导能力。
 
 ## Failover 细节
 

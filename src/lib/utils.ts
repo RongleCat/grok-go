@@ -9,12 +9,14 @@ export function formatNumber(n: number) {
   return new Intl.NumberFormat().format(n || 0);
 }
 
+/** Format USD without locale-specific "US$" prefix (always `$x.xxxx`). */
 export function formatUsd(n: number) {
-  return new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency: "USD",
+  const v = Number.isFinite(n) ? n : 0;
+  const body = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
     maximumFractionDigits: 4,
-  }).format(n || 0);
+  }).format(v);
+  return `$${body}`;
 }
 
 /** Compact token count for dense tables (e.g. 327.0k). */

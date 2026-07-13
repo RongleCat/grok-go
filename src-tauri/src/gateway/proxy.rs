@@ -29,7 +29,8 @@ use crate::gateway::sanitize::{
 use crate::http_client::build_http_client;
 use crate::concurrency::AccountPermit;
 use crate::router::{
-    pick_account_decision, replace_account_tokens, routable_account_count, touch_account_cache,
+    pick_account_decision_cap, replace_account_tokens, routable_account_count_cap,
+    touch_account_cache, MediaCapability,
 };
 use crate::session_affinity;
 use crate::usage::{enqueue_request_log, estimate_cost, RequestLog};
@@ -834,9 +835,10 @@ where
 {
     let mut excluded: Vec<String> = Vec::new();
     let mut last_transport: Option<String> = None;
+    let capability = MediaCapability::from_upstream_path(url);
     // Bound tries by currently routable accounts so we do not re-pick cooled-down ones.
     let initial_store = load_auth()?;
-    let max_tries = routable_account_count(&initial_store)
+    let max_tries = routable_account_count_cap(&initial_store, capability)
         .min(MAX_ACCOUNT_TRIES)
         .max(1);
 
@@ -847,7 +849,13 @@ where
             load_auth()?
         };
 
-        let decision = match pick_account_decision(config, &store, &excluded, session_key) {
+        let decision = match pick_account_decision_cap(
+            config,
+            &store,
+            &excluded,
+            session_key,
+            capability,
+        ) {
             Ok(d) => d,
             Err(err) => {
                 if let Some(detail) = last_transport.take() {
@@ -930,9 +938,15 @@ where
                     let more = load_auth()
                         .ok()
                         .and_then(|s| {
-                            pick_account_decision(config, &s, &excluded, session_key)
-                                .ok()
-                                .map(|_| ())
+                            pick_account_decision_cap(
+                                config,
+                                &s,
+                                &excluded,
+                                session_key,
+                                capability,
+                            )
+                            .ok()
+                            .map(|_| ())
                         })
                         .is_some();
                     if more {

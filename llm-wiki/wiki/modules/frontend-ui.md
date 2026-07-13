@@ -9,7 +9,7 @@
 | 路由 | 页面 | 职责 |
 |---|---|---|
 | `/` | Overview | 运行状态、Base URL、token、今日用量 |
-| `/accounts` | Accounts | 多账号 OAuth、权重、cooldown |
+| `/accounts` | Accounts | 多账号 OAuth、批量导入（CPA/sub2api/SSO）、多选批量改删、图/视能力开关、权重、cooldown |
 | `/mapping` | Mapping | 模型映射表 |
 | `/integrations` | Integrations | Codex / MCP / CC Switch / Grok Build |
 | `/usage` | Usage | 汇总 + 热力图 |

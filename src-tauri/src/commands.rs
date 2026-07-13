@@ -5,13 +5,21 @@ use crate::auth::{OAuthManager, OAuthStart};
 use crate::config::{
     load_auth, load_config, save_config, Account, AppConfig, AppIconStyle, random_token,
 };
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::gateway::server::{start_gateway, GatewayState};
 use crate::integrations::{
     import_cc_switch_provider, inject_codex_agents_guide, integration_status, set_codex_mcp_inject,
     set_grok_build_inject as set_grok_build_inject_impl, IntegrationStatus,
 };
-use crate::router::{list_accounts, remove_account, save_accounts, update_account};
+use crate::account_import::{
+    credential_to_account, is_duplicate, parse_import_payload, ImportAccountsOptions,
+    ImportAccountsResult, ImportErrorItem,
+};
+use crate::auth::refresh_account;
+use crate::router::{
+    batch_update_accounts, list_accounts, remove_account, remove_accounts, save_accounts,
+    update_account, BatchAccountPatch,
+};
 use crate::usage::{HeatmapDay, RequestLog, UsageStore, UsageSummary};
 use local_ip_address::local_ip;
 
@@ -64,7 +72,11 @@ pub async fn get_status(gateway: State<'_, GatewayState>) -> AppResult<AppStatus
         base_url: format!("http://{}:{}/v1", host, config.actual_port),
         mcp_url: format!("http://{}:{}/mcp", host, config.actual_port),
         account_count: auth.accounts.len(),
-        healthy_accounts: auth.accounts.iter().filter(|a| a.enabled && a.access_token.is_some()).count(),
+        healthy_accounts: auth
+            .accounts
+            .iter()
+            .filter(|a| a.enabled && a.is_credentialed() && a.health != crate::config::AccountHealth::Disabled)
+            .count(),
         lan_address: if config.lan_enabled { Some(host) } else { None },
         today,
     })
@@ -93,6 +105,14 @@ pub fn update_config(
     // preserve token unless rotated explicitly by empty/new value handling from UI
     if config.local_token.trim().is_empty() {
         config.local_token = existing.local_token;
+    }
+    // Never persist an empty OAuth client id (would break Windows/macOS login).
+    if config.xai_client_id.trim().is_empty() {
+        config.xai_client_id = if existing.xai_client_id.trim().is_empty() {
+            crate::config::DEFAULT_XAI_CLIENT_ID.into()
+        } else {
+            existing.xai_client_id.clone()
+        };
     }
     if config.lan_enabled {
         if config.bind_host == "127.0.0.1" {
@@ -284,6 +304,267 @@ pub fn delete_account(account_id: String) -> AppResult<Vec<Account>> {
 #[tauri::command]
 pub fn replace_accounts(accounts: Vec<Account>) -> AppResult<Vec<Account>> {
     save_accounts(accounts)?;
+    list_accounts()
+}
+
+/// Batch-import accounts from CPA / sub2api / 卡网 SSO paste formats.
+///
+/// Card SSO lines are converted to OAuth via Device Flow (no grok.com reverse).
+/// Also accepts multi-line refresh tokens, CPA `xai-*.json`, sub2api credentials,
+/// GrokGo `auth.json`, NDJSON, or arrays of the above.
+#[tauri::command]
+pub async fn import_accounts(
+    payload: String,
+    options: Option<ImportAccountsOptions>,
+) -> AppResult<ImportAccountsResult> {
+    let opts = options.unwrap_or_default();
+    let parsed = parse_import_payload(&payload).map_err(AppError::msg)?;
+    if parsed.is_empty() {
+        return Err(AppError::msg("no credentials found in import payload"));
+    }
+
+    let config = load_config()?;
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut errors = Vec::new();
+    let mut new_accounts = Vec::new();
+
+    for (index, cred) in parsed.into_iter().enumerate() {
+        let mut account = credential_to_account(&cred, &opts);
+        // Check duplicates against live store + this batch (not a long-lived snapshot).
+        if opts.skip_duplicates {
+            let existing = load_auth()?.accounts;
+            if is_duplicate(&existing, &account) || is_duplicate(&new_accounts, &account) {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        // Card / web SSO → OAuth device flow (pure Rust, no Python).
+        let sso_cookie = crate::sso_convert::account_sso_cookie(&account).or_else(|| {
+            cred.sso_token
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        let has_oauth_rt = account
+            .refresh_token
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let should_convert = sso_cookie.is_some()
+            && (account.auth_kind == crate::config::AccountAuthKind::Sso || !has_oauth_rt);
+
+        if should_convert {
+            let sso = sso_cookie.unwrap();
+            let label = account
+                .email
+                .clone()
+                .unwrap_or_else(|| account.name.clone());
+            match crate::sso_convert::convert_sso_cookie(&sso, account.email.as_deref()).await {
+                Ok(converted) => {
+                    crate::sso_convert::apply_oauth_to_account(
+                        &mut account,
+                        &converted,
+                        Some(&sso),
+                    );
+                    tracing::info!(account = %label, "SSO→OAuth convert ok");
+                }
+                Err(err) => {
+                    failed += 1;
+                    errors.push(ImportErrorItem {
+                        index: index + 1,
+                        detail: format!("{label}: SSO→OAuth failed: {err}"),
+                    });
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+            }
+            // Pace conversions to reduce auth.x.ai rate limits
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } else if opts.validate_refresh {
+            if account.refresh_token.is_some() {
+                match refresh_account(&config, &mut account).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        // Keep RT-only account if it has a refresh token — user can re-login later.
+                        if account.access_token.is_none() {
+                            failed += 1;
+                            errors.push(ImportErrorItem {
+                                index: index + 1,
+                                detail: format!(
+                                    "{}: {err}",
+                                    account.email.as_deref().unwrap_or(account.name.as_str())
+                                ),
+                            });
+                            continue;
+                        }
+                        tracing::warn!(
+                            account = %account.name,
+                            "import refresh failed but access_token present: {err}"
+                        );
+                    }
+                }
+            } else if account.access_token.is_none() {
+                failed += 1;
+                errors.push(ImportErrorItem {
+                    index: index + 1,
+                    detail: "missing both access_token and refresh_token".into(),
+                });
+                continue;
+            }
+        }
+
+        if !account.is_credentialed() {
+            failed += 1;
+            errors.push(ImportErrorItem {
+                index: index + 1,
+                detail: format!(
+                    "{}: not credentialed after import",
+                    account.email.as_deref().unwrap_or(account.name.as_str())
+                ),
+            });
+            continue;
+        }
+
+        new_accounts.push(account);
+        added += 1;
+    }
+
+    // Append to the *live* store so concurrent deletes are not overwritten.
+    let new_ids: Vec<String> = new_accounts.iter().map(|a| a.id.clone()).collect();
+    let mut accounts = if !new_accounts.is_empty() {
+        crate::config::append_accounts(new_accounts)?
+    } else {
+        load_auth()?.accounts
+    };
+
+    // Auto-refresh SuperGrok quota for successfully added accounts.
+    if !new_ids.is_empty() {
+        for id in &new_ids {
+            match crate::quota::refresh_account_quota(id).await {
+                Ok(_) => tracing::info!(account_id = %id, "post-import quota refresh ok"),
+                Err(err) => tracing::warn!(
+                    account_id = %id,
+                    "post-import quota refresh failed (non-fatal): {err}"
+                ),
+            }
+        }
+        accounts = load_auth()?.accounts;
+    }
+
+    Ok(ImportAccountsResult {
+        added,
+        skipped,
+        failed,
+        accounts,
+        errors,
+    })
+}
+
+/// Re-convert legacy `auth_kind=sso` accounts (or any row with `sso_token` but no OAuth tokens).
+#[tauri::command]
+pub async fn convert_sso_accounts() -> AppResult<ImportAccountsResult> {
+    let mut added = 0usize; // converted count
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut errors = Vec::new();
+
+    let store = load_auth()?;
+    let targets: Vec<(String, Option<String>, String)> = store
+        .accounts
+        .iter()
+        .filter_map(|a| {
+            let sso = crate::sso_convert::account_sso_cookie(a)?;
+            // Skip already-OAuth credentialed accounts with refresh token.
+            if a.is_credentialed()
+                && a
+                    .refresh_token
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            {
+                return None;
+            }
+            Some((a.id.clone(), a.email.clone(), sso))
+        })
+        .collect();
+
+    if targets.is_empty() {
+        return Ok(ImportAccountsResult {
+            added: 0,
+            skipped: store.accounts.len(),
+            failed: 0,
+            accounts: store.accounts,
+            errors: vec![ImportErrorItem {
+                index: 0,
+                detail: "no SSO accounts needing conversion".into(),
+            }],
+        });
+    }
+
+    for (index, (id, email, sso)) in targets.into_iter().enumerate() {
+        let label = email.clone().unwrap_or_else(|| id.clone());
+        // Work on a single-account clone; merge back by id so deletes win.
+        let mut account = match load_auth()?.accounts.into_iter().find(|a| a.id == id) {
+            Some(a) => a,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+        match crate::sso_convert::convert_sso_cookie(&sso, email.as_deref()).await {
+            Ok(converted) => {
+                crate::sso_convert::apply_oauth_to_account(&mut account, &converted, Some(&sso));
+                if crate::config::apply_account_update(&account)? {
+                    added += 1;
+                    tracing::info!(account = %label, "SSO→OAuth re-convert ok");
+                } else {
+                    skipped += 1;
+                }
+            }
+            Err(err) => {
+                failed += 1;
+                errors.push(ImportErrorItem {
+                    index: index + 1,
+                    detail: format!("{label}: {err}"),
+                });
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    Ok(ImportAccountsResult {
+        added,
+        skipped,
+        failed,
+        accounts: load_auth()?.accounts,
+        errors,
+    })
+}
+
+/// Delete many accounts at once. Returns the updated account list.
+#[tauri::command]
+pub fn batch_delete_accounts(account_ids: Vec<String>) -> AppResult<Vec<Account>> {
+    let n = remove_accounts(&account_ids)?;
+    if n == 0 && !account_ids.is_empty() {
+        // Still return current list, but surface a clear error so UI is not silent.
+        return Err(AppError::msg(format!(
+            "批量删除未匹配到任何账号（请求 {} 个 id，可能已过期，请刷新后重试）",
+            account_ids.len()
+        )));
+    }
+    list_accounts()
+}
+
+/// Batch-update enabled / weight / media flags / clear cooldown.
+#[tauri::command]
+pub fn batch_patch_accounts(
+    account_ids: Vec<String>,
+    patch: BatchAccountPatch,
+) -> AppResult<Vec<Account>> {
+    batch_update_accounts(&account_ids, patch)?;
     list_accounts()
 }
 

@@ -3,11 +3,55 @@ use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::concurrency;
-use crate::config::{Account, AccountHealth, AppConfig, AuthStore, RoutingStrategy, load_auth, save_auth};
+use crate::config::{
+    apply_account_update, delete_accounts_persistent, load_auth, save_auth, Account, AccountHealth,
+    AppConfig, AuthStore, RoutingStrategy,
+};
 use crate::error::{AppError, AppResult};
 use crate::session_affinity;
 
 static RR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Media capability required when selecting an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MediaCapability {
+    /// Text / general API — any logged-in account.
+    #[default]
+    Any,
+    /// Image generation / edit — only accounts with `supports_image`.
+    Image,
+    /// Video generation / edit — only accounts with `supports_video`.
+    Video,
+}
+
+impl MediaCapability {
+    pub fn from_upstream_path(path: &str) -> Self {
+        let p = path.to_ascii_lowercase();
+        if p.contains("/images/") {
+            Self::Image
+        } else if p.contains("/videos/") {
+            Self::Video
+        } else {
+            Self::Any
+        }
+    }
+
+    fn matches(self, account: &Account) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Image => account.supports_image,
+            Self::Video => account.supports_video,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Any => "text",
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+}
 
 /// Result of account selection (for logs / diagnostics).
 #[derive(Debug, Clone)]
@@ -32,7 +76,15 @@ pub fn save_accounts(accounts: Vec<Account>) -> AppResult<()> {
 }
 
 pub fn pick_account(config: &AppConfig, store: &AuthStore) -> AppResult<Account> {
-    Ok(pick_account_decision(config, store, &[], None)?.account)
+    Ok(pick_account_decision_cap(config, store, &[], None, MediaCapability::Any)?.account)
+}
+
+pub fn pick_account_for(
+    config: &AppConfig,
+    store: &AuthStore,
+    capability: MediaCapability,
+) -> AppResult<Account> {
+    Ok(pick_account_decision_cap(config, store, &[], None, capability)?.account)
 }
 
 /// Pick a routable account, skipping any id in `exclude` (same-request failover).
@@ -41,7 +93,7 @@ pub fn pick_account_excluding(
     store: &AuthStore,
     exclude: &[String],
 ) -> AppResult<Account> {
-    Ok(pick_account_decision(config, store, exclude, None)?.account)
+    Ok(pick_account_decision_cap(config, store, exclude, None, MediaCapability::Any)?.account)
 }
 
 /// Full pick with optional session key for sticky routing.
@@ -51,11 +103,28 @@ pub fn pick_account_decision(
     exclude: &[String],
     session_key: Option<&str>,
 ) -> AppResult<PickDecision> {
-    // Expire local cooldowns so routing/UI don't stick on stale "cooldown".
-    let mut store_owned = store.clone();
-    if crate::auth::clear_expired_cooldowns_in_store(&mut store_owned) {
-        let _ = save_auth(&store_owned);
-    }
+    pick_account_decision_cap(config, store, exclude, session_key, MediaCapability::Any)
+}
+
+/// Full pick with media capability filter (image/video only pick supporting accounts).
+pub fn pick_account_decision_cap(
+    config: &AppConfig,
+    store: &AuthStore,
+    exclude: &[String],
+    session_key: Option<&str>,
+    capability: MediaCapability,
+) -> AppResult<PickDecision> {
+    // Expire cooldowns on the *live* store — never save the caller's snapshot
+    // (that snapshot can resurrect accounts deleted concurrently).
+    let store_owned = {
+        let mut live = load_auth()?;
+        if crate::auth::clear_expired_cooldowns_in_store(&mut live) {
+            let _ = save_auth(&live);
+        }
+        // Prefer live list for routing so concurrent deletes are visible.
+        let _caller_snapshot = store;
+        live
+    };
     let store = &store_owned;
 
     let now = Utc::now();
@@ -63,7 +132,8 @@ pub fn pick_account_decision(
         .accounts
         .iter()
         .filter(|a| a.enabled)
-        .filter(|a| a.access_token.is_some() || a.refresh_token.is_some())
+        .filter(|a| a.is_credentialed())
+        .filter(|a| capability.matches(a))
         .filter(|a| !exclude.iter().any(|id| id == &a.id))
         .collect();
 
@@ -87,12 +157,23 @@ pub fn pick_account_decision(
             .accounts
             .iter()
             .filter(|a| a.enabled)
-            .filter(|a| a.access_token.is_some() || a.refresh_token.is_some())
+            .filter(|a| a.is_credentialed())
             .collect();
         if all_logged_in.is_empty() {
             return Err(AppError::msg(
-                "no logged-in accounts available; open Accounts and complete xAI OAuth",
+                "no logged-in accounts available; open Accounts for OAuth or import SSO tokens",
             ));
+        }
+        // Capability mismatch: accounts exist but none support this media type.
+        let capable = all_logged_in
+            .iter()
+            .filter(|a| capability.matches(a))
+            .count();
+        if capability != MediaCapability::Any && capable == 0 {
+            return Err(AppError::msg(format!(
+                "no accounts with {} generation enabled; toggle 图/视 on Accounts or import with media flags",
+                capability.label()
+            )));
         }
         let until = all_logged_in
             .iter()
@@ -306,12 +387,17 @@ fn prefer_soonest_reset<'a>(mut candidates: Vec<&'a Account>) -> Vec<&'a Account
 
 /// How many enabled+logged-in accounts are currently routable (not cooldown).
 pub fn routable_account_count(store: &AuthStore) -> usize {
+    routable_account_count_cap(store, MediaCapability::Any)
+}
+
+pub fn routable_account_count_cap(store: &AuthStore, capability: MediaCapability) -> usize {
     let now = Utc::now();
     store
         .accounts
         .iter()
         .filter(|a| a.enabled)
-        .filter(|a| a.access_token.is_some() || a.refresh_token.is_some())
+        .filter(|a| a.is_credentialed())
+        .filter(|a| capability.matches(a))
         .filter(|a| match a.health {
             AccountHealth::Disabled => false,
             AccountHealth::Cooldown => a.cooldown_until.map(|t| t <= now).unwrap_or(true),
@@ -328,6 +414,12 @@ pub fn update_account(mut account: Account) -> AppResult<()> {
         }
         if account.refresh_token.is_none() {
             account.refresh_token = slot.refresh_token.clone();
+        }
+        if account.sso_token.is_none() {
+            account.sso_token = slot.sso_token.clone();
+        }
+        if account.password_hint.is_none() {
+            account.password_hint = slot.password_hint.clone();
         }
         if account.email.is_none() {
             account.email = slot.email.clone();
@@ -356,18 +448,88 @@ pub fn update_account(mut account: Account) -> AppResult<()> {
 }
 
 pub fn remove_account(account_id: &str) -> AppResult<()> {
-    let mut store = load_auth()?;
-    store.accounts.retain(|a| a.id != account_id);
-    session_affinity::invalidate_account(account_id);
-    save_auth(&store)
+    let n = delete_accounts_persistent(&[account_id.to_string()])?;
+    if n > 0 {
+        session_affinity::invalidate_account(account_id);
+    }
+    Ok(())
 }
 
-/// Persist account tokens/health to disk (and refresh cache).
-pub fn replace_account_tokens(account: &Account) -> AppResult<()> {
+/// Delete many accounts in one verified auth.json write.
+///
+/// Returns the number of accounts actually removed (and confirmed absent on disk).
+pub fn remove_accounts(account_ids: &[String]) -> AppResult<usize> {
+    let removed = delete_accounts_persistent(account_ids)?;
+    for id in account_ids {
+        session_affinity::invalidate_account(id);
+    }
+    if removed == 0 && !account_ids.is_empty() {
+        tracing::warn!(
+            requested = account_ids.len(),
+            "batch delete matched 0 accounts (ids may be stale)"
+        );
+    }
+    Ok(removed)
+}
+
+/// Patch applied to every selected account in a batch update.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAccountPatch {
+    pub enabled: Option<bool>,
+    pub weight: Option<u32>,
+    pub supports_image: Option<bool>,
+    pub supports_video: Option<bool>,
+    /// When true, clear cooldown/failures on selected accounts.
+    pub clear_cooldown: Option<bool>,
+}
+
+/// Apply the same patch to many accounts (one disk write).
+pub fn batch_update_accounts(account_ids: &[String], patch: BatchAccountPatch) -> AppResult<usize> {
+    if account_ids.is_empty() {
+        return Ok(0);
+    }
     let mut store = load_auth()?;
-    if let Some(slot) = store.accounts.iter_mut().find(|a| a.id == account.id) {
-        *slot = account.clone();
-        save_auth(&store)?;
+    let mut n = 0usize;
+    for account in store.accounts.iter_mut() {
+        if !account_ids.iter().any(|id| id == &account.id) {
+            continue;
+        }
+        if let Some(v) = patch.enabled {
+            account.enabled = v;
+            if !v {
+                account.health = AccountHealth::Disabled;
+            } else if account.health == AccountHealth::Disabled {
+                account.health = AccountHealth::Healthy;
+            }
+        }
+        if let Some(w) = patch.weight {
+            account.weight = w.max(1);
+        }
+        if let Some(v) = patch.supports_image {
+            account.supports_image = v;
+        }
+        if let Some(v) = patch.supports_video {
+            account.supports_video = v;
+        }
+        if patch.clear_cooldown.unwrap_or(false) {
+            account.cooldown_until = None;
+            account.consecutive_failures = 0;
+            account.last_upstream_error = None;
+            if account.health == AccountHealth::Cooldown || account.health == AccountHealth::Degraded
+            {
+                account.health = AccountHealth::Healthy;
+            }
+        }
+        n += 1;
+    }
+    save_auth(&store)?;
+    Ok(n)
+}
+
+/// Persist account tokens/health into the **current** store (never re-adds deleted ids).
+pub fn replace_account_tokens(account: &Account) -> AppResult<()> {
+    if apply_account_update(account)? {
         Ok(())
     } else {
         Err(AppError::msg("account not found"))

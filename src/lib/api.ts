@@ -114,8 +114,15 @@ export type Account = {
   email?: string | null;
   enabled: boolean;
   weight: number;
+  /** oauth (default) or legacy sso (must convert to OAuth before routing). */
+  authKind?: "oauth" | "sso";
   accessToken?: string | null;
   refreshToken?: string | null;
+  /** Original card SSO JWT (kept after convert; not used for API). */
+  ssoToken?: string | null;
+  passwordHint?: string | null;
+  /** Legacy field (unused). */
+  ssoPool?: "basic" | "super" | "heavy";
   tokenType?: string | null;
   expiresAt?: string | null;
   lastRefresh?: string | null;
@@ -134,6 +141,34 @@ export type Account = {
   lastUpstreamError?: string | null;
   /** SuperGrok weekly credit quota (remaining + reset). */
   quota?: AccountQuota | null;
+  /** Whether this account can handle image generation. Default true. */
+  supportsImage?: boolean;
+  /** Whether this account can handle video generation. Default true. */
+  supportsVideo?: boolean;
+};
+
+export type ImportAccountsOptions = {
+  weight?: number;
+  supportsImage?: boolean;
+  supportsVideo?: boolean;
+  skipDuplicates?: boolean;
+  validateRefresh?: boolean;
+};
+
+export type ImportAccountsResult = {
+  added: number;
+  skipped: number;
+  failed: number;
+  accounts: Account[];
+  errors: { index: number; detail: string }[];
+};
+
+export type BatchAccountPatch = {
+  enabled?: boolean | null;
+  weight?: number | null;
+  supportsImage?: boolean | null;
+  supportsVideo?: boolean | null;
+  clearCooldown?: boolean | null;
 };
 
 export type RequestLog = {
@@ -197,6 +232,14 @@ export const api = {
   upsertAccount: (account: Account) => invoke<Account[]>("upsert_account", { account }),
   deleteAccount: (accountId: string) => invoke<Account[]>("delete_account", { accountId }),
   replaceAccounts: (accounts: Account[]) => invoke<Account[]>("replace_accounts", { accounts }),
+  importAccounts: (payload: string, options?: ImportAccountsOptions) =>
+    invoke<ImportAccountsResult>("import_accounts", { payload, options }),
+  /** Convert legacy SSO-only accounts → OAuth via Device Flow. */
+  convertSsoAccounts: () => invoke<ImportAccountsResult>("convert_sso_accounts"),
+  batchDeleteAccounts: (accountIds: string[]) =>
+    invoke<Account[]>("batch_delete_accounts", { accountIds }),
+  batchPatchAccounts: (accountIds: string[], patch: BatchAccountPatch) =>
+    invoke<Account[]>("batch_patch_accounts", { accountIds, patch }),
   clearAccountCooldown: (accountId: string) =>
     invoke<Account[]>("clear_account_cooldown", { accountId }),
   refreshAccountQuota: (accountId: string) =>

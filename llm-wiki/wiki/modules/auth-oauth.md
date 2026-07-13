@@ -31,18 +31,42 @@
 - `cooldown_until`、`consecutive_failures`
 - 上游 rate limit 头镜像字段
 - `last_upstream_error` 供 UI 诊断
+- `supports_image` / `supports_video`（默认 true）：普通文本号可关掉，媒体路由会跳过
+
+## 批量导入（CPA / sub2api / 卡网 SSO）
+
+解析实现：`account_import.rs`；命令：`import_accounts`。
+
+| 格式 | 说明 |
+|---|---|
+| 纯 refresh_token 列表 | 每行一个（sub2api 批量 RT / 卡网 SSO 粘贴） |
+| CPA `xai-*.json` | `type=xai` + access/refresh token 等 |
+| JSON 数组 / NDJSON | 多个 CPA 文件合并 |
+| sub2api credentials | `platform=grok` + 嵌套 `credentials` |
+| GrokGo `auth.json` | `{ accounts: [...] }` |
+| SSO 包装对象 | 递归抽取含 `refresh_token`/`access_token` 的字段 |
+
+导入选项：`weight`、`supportsImage`/`supportsVideo`、`skipDuplicates`、`validateRefresh`（默认 true，会调 token endpoint 校验 RT 并补全 email）。
+
+批量管理命令：
+
+- `batch_delete_accounts(ids)`
+- `batch_patch_accounts(ids, { enabled, weight, supportsImage, supportsVideo, clearCooldown })`
 
 ## 相关页面
 
 - [[routing]]
 - [[config-runtime]]
+- [[frontend-ui]]
 - [[../playbooks/debug-checklist]]
 
 ## 来源
 
 - `src-tauri/src/auth.rs`
+- `src-tauri/src/account_import.rs`
 - `src-tauri/src/config.rs`（Account / AuthStore）
-- `src-tauri/src/commands.rs`（start_oauth_login）
+- `src-tauri/src/commands.rs`（start_oauth_login / import_accounts / batch_*）
+- `src-tauri/src/router.rs`（batch_update_accounts）
 
 ## SuperGrok 周配额
 

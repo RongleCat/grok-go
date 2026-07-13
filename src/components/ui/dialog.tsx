@@ -76,7 +76,7 @@ export function ConfirmDialog({
             {secondaryLabel}
           </Button>
         ) : null}
-        <Button type="button" disabled={busy} onClick={onConfirm}>
+        <Button type="button" variant="destructive" disabled={busy} onClick={onConfirm}>
           {confirmLabel}
         </Button>
       </div>

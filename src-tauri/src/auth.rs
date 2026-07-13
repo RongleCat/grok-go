@@ -147,7 +147,7 @@ impl OAuthManager {
         {
             let mut qp = authorize.query_pairs_mut();
             qp.append_pair("response_type", "code");
-            qp.append_pair("client_id", &config.xai_client_id);
+            qp.append_pair("client_id", config.effective_xai_client_id());
             qp.append_pair("redirect_uri", &redirect_uri);
             // Match official Grok Build OAuth consent scopes (verified from
             // ~/.grok/auth.json access-token JWT `scope` claim):
@@ -248,7 +248,7 @@ impl OAuthManager {
             .post(&discovery.token_endpoint)
             .form(&[
                 ("grant_type", "authorization_code"),
-                ("client_id", config.xai_client_id.as_str()),
+                ("client_id", config.effective_xai_client_id()),
                 ("code", code),
                 ("redirect_uri", pending.redirect_uri.as_str()),
                 ("code_verifier", pending.code_verifier.as_str()),
@@ -487,7 +487,7 @@ pub async fn refresh_account(config: &AppConfig, account: &mut Account) -> AppRe
         .post(&discovery.token_endpoint)
         .form(&[
             ("grant_type", "refresh_token"),
-            ("client_id", config.xai_client_id.as_str()),
+            ("client_id", config.effective_xai_client_id()),
             ("refresh_token", refresh.as_str()),
         ])
         .send()
@@ -510,6 +510,21 @@ pub async fn refresh_account(config: &AppConfig, account: &mut Account) -> AppRe
     account.health = AccountHealth::Healthy;
     account.consecutive_failures = 0;
     account.cooldown_until = None;
+
+    // Best-effort email enrichment for RT-only imports.
+    if account.email.is_none() {
+        let email = fetch_userinfo(&discovery, &token.access_token)
+            .await
+            .and_then(|p| p.email)
+            .filter(|e| !e.is_empty())
+            .or_else(|| token.id_token.as_deref().and_then(email_from_jwt))
+            .or_else(|| email_from_jwt(&token.access_token));
+        if let Some(email) = email {
+            account.name = email.clone();
+            account.email = Some(email);
+        }
+    }
+
     Ok(token.access_token)
 }
 

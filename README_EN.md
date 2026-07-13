@@ -4,7 +4,7 @@
 
 <h1 align="center">GrokGo</h1>
 
-<p align="center"><strong>Local Grok gateway, ready out of the box</strong></p>
+<p align="center"><strong>Local Grok / xAI gateway desktop app</strong></p>
 <p align="center"><em>Grok, ready to go for Codex</em></p>
 
 <p align="center">
@@ -21,30 +21,59 @@
 
 <p align="center">
   Follow the author on X
-  <a href="https://x.com/cgnot996"><strong>@cgnot996</strong></a>
+  <a href="https://x.com/cgnot996"><strong>铁柱AGI@cgnot996</strong></a>
   · Repo
   <a href="https://github.com/RongleCat/grok-go">RongleCat/grok-go</a>
 </p>
 
 ---
 
-## Why GrokGo?
+## Contents
 
-Connecting **Grok / xAI** to **Codex** or other AI tools usually means wiring OAuth, a local proxy, MCP, multi-account routing, and usage yourself.  
-**GrokGo** packages that into a desktop gateway: launch, sign in, paste the endpoint, and go.
+1. [Overview](#overview)
+2. [Features](#features)
+3. [Screenshots](#screenshots)
+4. [Install & first run](#install--first-run)
+5. [Connect Codex / clients](#connect-codex--clients)
+6. [API endpoints](#api-endpoints)
+7. [Config paths](#config-paths)
+8. [macOS “damaged” / Gatekeeper](#macos-damaged--gatekeeper)
+9. [Develop & build](#develop--build)
+10. [Docs & contributing](#docs--contributing)
+
+---
+
+## Overview
+
+Wiring **Grok / xAI** into **Codex**, OpenAI-compatible clients, or other agents usually means handling OAuth, a local proxy, MCP, multi-account routing, and usage yourself.
+
+**GrokGo** packages that into a local desktop gateway:
+
+1. Install and launch  
+2. Sign in or import accounts  
+3. Copy Base URL + token  
+4. Paste into your client  
+
+---
 
 ## Features
 
-- **Responses + OpenAI-compatible APIs**: `/v1/responses`, `/v1/chat/completions`, `/v1/models`
-- **MCP tools**: `x_search`, image generate/edit, video generate/edit
-- **Multi-account OAuth**: host multiple accounts with weighted load balancing and auto refresh
-- **Batch import**: CPA `xai-*.json` / sub2api RTs / card SSO→OAuth (Device Flow) / GrokGo `auth.json`
-- **Native media endpoints**: images/videos through the same authenticated gateway; artifacts under `~/.grok-go/artifacts/`
-- **Usage visibility**: request logs (routed account), tokens, SuperGrok weekly + API rate limits, GitHub-style heatmap
-- **Codex / CC Switch ready**: one-click inject for `mcp_servers.grok-go` and provider import
-- **Optional LAN access** protected by a local bearer token
+| Area | What you get |
+|------|----------------|
+| **API compatibility** | `/v1/responses`, `/v1/chat/completions`, `/v1/models` |
+| **MCP tools** | `x_search`, image generate/edit, video generate/edit |
+| **Multi-account** | OAuth hosting, weighted load balancing, auto refresh |
+| **Batch import** | CPA `xai-*.json` / sub2api RTs / card SSO→OAuth / GrokGo `auth.json` |
+| **Media** | Images/videos through the same authenticated gateway; artifacts under `~/.grok-go/artifacts/` |
+| **Usage** | Request logs (routed account), tokens, SuperGrok weekly + API limits, heatmap |
+| **Integrations** | One-click Codex MCP inject, `mcp_servers.grok-go`, CC Switch provider import |
+| **Access control** | Local bearer token; optional LAN access |
+
+---
 
 ## Screenshots
+
+> Captured from the current development build (account emails redacted).
 
 | Overview | Accounts |
 |:---:|:---:|
@@ -54,9 +83,11 @@ Connecting **Grok / xAI** to **Codex** or other AI tools usually means wiring OA
 |:---:|:---:|
 | ![Integrations](assets/screenshots/integrations.png) | ![Usage](assets/screenshots/usage.png) |
 
-## Quick start
+---
 
-### Download
+## Install & first run
+
+### 1. Download
 
 Get installers from [Releases](https://github.com/RongleCat/grok-go/releases):
 
@@ -66,75 +97,32 @@ Get installers from [Releases](https://github.com/RongleCat/grok-go/releases):
 | macOS Intel | `GrokGo_*_x64.dmg` |
 | Windows x64 | `.msi` / `.exe` |
 
-### Develop
+### 2. First run
 
-```bash
-pnpm install
-pnpm tauri dev
-```
+1. Start GrokGo and confirm the gateway is **Running** on **Overview**  
+2. Sign in or batch-import accounts on **Accounts**  
+3. Copy from **Overview**:  
+   - Base URL: `http://127.0.0.1:<port>/v1`  
+   - Local Token  
+4. (Optional) Inject Codex MCP / import CC Switch on **Integrations**  
 
-Frontend only:
+Preferred port is **8787** (auto-increments on conflict).
 
-```bash
-pnpm dev:ui
-```
+---
 
-### Build
+## Connect Codex / clients
 
-```bash
-pnpm tauri build
-```
+### Manual setup
 
-See [docs/BUILD.md](./docs/BUILD.md) for cross-compile and release details.
+1. Start GrokGo and copy Base URL + Local Token from **Overview**  
+2. Point your client at the **Responses API** (or OpenAI Chat Completions-compatible mode)  
+3. Use:  
+   - Base URL: `http://127.0.0.1:<port>/v1`  
+   - Authorization: `Bearer <localToken>`  
 
-## macOS: “damaged”, “unidentified developer”, or “cannot be opened”
+### One-click MCP (Codex)
 
-Release builds are **not Apple-notarized** (requires a paid Developer ID). Gatekeeper often blocks the app after download — that is expected. Fixes:
-
-### Option 1: Clear quarantine (recommended)
-
-1. Drag `GrokGo.app` into Applications
-2. Run in Terminal:
-
-```bash
-xattr -cr /Applications/GrokGo.app
-# or wherever you put it:
-# xattr -cr ~/Downloads/GrokGo.app
-```
-
-3. Open the app again
-
-### Option 2: Right-click → Open
-
-1. In Finder, **right-click** (or Control-click) `GrokGo.app`
-2. Choose **Open**
-3. Confirm **Open** in the dialog
-
-> A normal double-click may still be blocked; use the context-menu Open once.
-
-### Option 3: System Settings
-
-1. **System Settings → Privacy & Security**
-2. If you see a block message for GrokGo, click **Open Anyway**
-3. Confirm with your password
-
-### Still stuck?
-
-```bash
-xattr -l /Applications/GrokGo.app   # quarantine attribute should be gone
-xattr -cr /Applications/GrokGo.app
-open /Applications/GrokGo.app
-```
-
-Only download from this repo’s official [Releases](https://github.com/RongleCat/grok-go/releases). Once Apple signing + notarization are configured, these steps will no longer be needed.
-
-## Connect Codex
-
-1. Start GrokGo and copy from **Overview**:
-   - Base URL: `http://127.0.0.1:<port>/v1`
-   - Local Token
-2. Point Codex at the Responses API with that base URL + bearer token
-3. Optionally inject MCP from the **Integrations** page:
+After enabling MCP inject on **Integrations**:
 
 ```toml
 [mcp_servers.grok-go]
@@ -144,9 +132,9 @@ url = "http://127.0.0.1:<port>/mcp"
 Authorization = "Bearer <localToken>"
 ```
 
-Preferred port is **8787** (auto-increments on conflict).
+---
 
-## Default endpoints
+## API endpoints
 
 | Purpose | URL |
 |---------|-----|
@@ -156,40 +144,75 @@ Preferred port is **8787** (auto-increments on conflict).
 | Images | `POST /v1/images/generations`, `POST /v1/images/edits` |
 | MCP | `http://127.0.0.1:<port>/mcp` |
 
+---
+
 ## Config paths
 
 ```text
 ~/.grok-go/
-  config.json
-  auth.json
-  data.db
-  artifacts/
+  config.json      # gateway / port / integrations
+  auth.json        # accounts & tokens (do not commit)
+  data.db          # usage & logs
+  artifacts/       # media outputs
   backups/
+  agents-guide.md  # runtime MCP tool guide (enabled tools only)
 ```
 
-## Stack
+---
 
-- Tauri 2 + Rust
-- React + TypeScript + Vite
-- Tailwind CSS
+## macOS “damaged” / Gatekeeper
 
-## Contributing
+Release builds are **not Apple-notarized** (paid Developer ID required). Gatekeeper may block downloads — that is expected.
 
-Issues and PRs are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md).  
-Code of conduct: [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)  
-Security: [SECURITY.md](./SECURITY.md)
+**Recommended:**
+
+```bash
+xattr -cr /Applications/GrokGo.app
+open /Applications/GrokGo.app
+```
+
+**Also works:**
+
+- Finder: **right-click** → **Open** → confirm  
+- **System Settings → Privacy & Security** → **Open Anyway**  
+
+Only download from this repo’s official [Releases](https://github.com/RongleCat/grok-go/releases). Signing + notarization will remove these steps.
+
+---
+
+## Develop & build
+
+```bash
+pnpm install
+pnpm tauri dev      # full app
+pnpm dev:ui         # frontend only
+pnpm tauri build    # production
+```
+
+Cross-compile and release notes: [docs/BUILD.md](./docs/BUILD.md).
+
+**Stack:** Tauri 2 + Rust · React + TypeScript + Vite · Tailwind CSS
+
+---
+
+## Docs & contributing
+
+| Audience | Link |
+|----------|------|
+| AI agents / codebase map | [`llm-wiki/README.md`](./llm-wiki/README.md) |
+| Contributing | [CONTRIBUTING.md](./CONTRIBUTING.md) |
+| Code of conduct | [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) |
+| Security | [SECURITY.md](./SECURITY.md) |
+
+Issues and PRs are welcome.
 
 ## License
 
 [MIT](./LICENSE) © RongleCat
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=RongleCat/grok-go&type=Date)](https://star-history.com/#RongleCat/grok-go&Date)
-
 ---
 
 <p align="center">
   If GrokGo helps you, star the repo and follow
-  <a href="https://x.com/cgnot996">@cgnot996</a> on X
+  <a href="https://x.com/cgnot996">铁柱AGI@cgnot996</a> on X
 </p>

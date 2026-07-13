@@ -1,5 +1,23 @@
 # Wiki 日志
 
+## 2026-07-14（UI 空状态 / 滚动 / 概览 Token）
+
+- 统一 `EmptyState`（icon + 文案居中）；`PageShell`/`PageBody` 容器内滚动。
+- Select 打开前同步定位，消除页面滚动条闪动。
+- 概览「今日 Token」独立卡片：合计 + 入/出/缓存三栏。
+
+## 2026-07-14（托盘 / SSO 导入）
+
+- Windows 托盘：黑底白 logo 实心 PNG；设置页隐藏图标切换。
+- 卡密导入：按 `eyJ…` JWT 形态匹配 SSO，支持 `邮箱|密码|SSO` 与带说明文字的卡商粘贴。
+
+## 2026-07-13（token 异常 / 强制停止）
+
+- 分支 `fix/token-consumption-and-force-stop`。
+- 根因：Codex 多轮整包重放大文件/base64 图 → input token 与 body 线性膨胀；xAI 有图时不宜 store 历史。
+- 方案对照 CPA / sub2api / xAI Files：`payload_optimize` 去重折叠截断；大文本 `POST /v1/files` → `file_id`；代理 `/v1/files`。
+- 文档：[[concepts/payload-optimize]]；更新 [[modules/gateway]]。
+
 ## 2026-07-13（v0.1.4 发布准备）
 
 - 批量导入 + SSO→OAuth Device Flow（`sso_convert.rs`）定稿；**移除** grok.com SSO 逆向（anti-bot）。

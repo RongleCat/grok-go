@@ -18,6 +18,11 @@ const LABEL_COL = 22;
 const MONTH_ROW = 16;
 const MIN_CELL = 9;
 const MAX_CELL = 13;
+/** Tooltip panel width — keep in sync with `w-56` (14rem ≈ 224px). */
+const TIP_WIDTH = 224;
+const TIP_HALF = TIP_WIDTH / 2;
+const TIP_EDGE_PAD = 8;
+const ARROW_HALF = 5;
 
 const LEVEL_COLORS = [
   "#ebedf0",
@@ -152,6 +157,27 @@ export function Heatmap({
     return () => ro.disconnect();
   }, []);
 
+  // Close tooltip on outside / blank clicks, but do NOT swallow clicks on other
+  // heatmap cells — those should switch the tip in one press (no full-screen
+  // overlay that eats the first click).
+  useEffect(() => {
+    if (!selected?.cell.date) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      // Clicking another enabled day cell: leave it for the button's onClick.
+      const cellBtn = target.closest("button[role='gridcell']") as HTMLButtonElement | null;
+      if (cellBtn && !cellBtn.disabled && containerRef.current?.contains(cellBtn)) {
+        return;
+      }
+      // Keep tip when interacting with the tip itself.
+      if (target.closest("[data-heatmap-tip]")) return;
+      setSelected(null);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [selected?.cell.date]);
+
   // Stretch cells to fill available width (no large empty right margin).
   const cell = useMemo(() => {
     if (weeks.length === 0 || containerWidth <= 0) return MIN_CELL;
@@ -188,9 +214,31 @@ export function Heatmap({
   const graphWidth = weeks.length * (cell + GAP) - GAP;
   const graphHeight = 7 * (cell + GAP) - GAP;
 
+  // Tooltip placement: clamp panel in container, keep arrow aimed at cell center.
+  let tipLeft = 0;
+  let tipTop = 0;
+  let arrowLeft = TIP_HALF;
+  if (selected?.cell.date) {
+    const containerW = containerRef.current?.clientWidth ?? 300;
+    const idealCenter = selected.x;
+    const minCenter = TIP_HALF + TIP_EDGE_PAD;
+    const maxCenter = Math.max(minCenter, containerW - TIP_HALF - TIP_EDGE_PAD);
+    const tipCenter = Math.min(maxCenter, Math.max(minCenter, idealCenter));
+    tipLeft = tipCenter - TIP_HALF;
+    tipTop = Math.max(8, selected.y - 8);
+    // Nudge 1px left — optical alignment with the small heatmap cell.
+    arrowLeft = Math.min(
+      TIP_WIDTH - ARROW_HALF - 6,
+      Math.max(ARROW_HALF + 6, idealCenter - tipLeft - 1)
+    );
+  }
+
+  const blockWidth = LABEL_COL + graphWidth;
+
   return (
     <div ref={containerRef} className="relative w-full select-none">
-      <div className="w-full">
+      <div className="flex w-full flex-col items-center">
+        <div style={{ width: blockWidth }}>
         <div className="relative" style={{ height: MONTH_ROW, marginLeft: LABEL_COL }}>
           {monthLabels.map(({ week, label }) => (
             <span
@@ -274,8 +322,9 @@ export function Heatmap({
             )}
           </div>
         </div>
+        </div>
 
-        <div className="mt-2 flex items-center justify-end gap-1 text-[10px] text-neutral-500">
+        <div className="mt-2 flex items-center justify-center gap-1 text-[10px] text-neutral-500">
           <span className="mr-1">{t.heatmap.less}</span>
           {LEVEL_COLORS.map((color, level) => (
             <span
@@ -289,14 +338,14 @@ export function Heatmap({
       </div>
 
       {selected?.cell.date ? (
-        <>
-          <div className="fixed inset-0 z-20" onClick={() => setSelected(null)} aria-hidden />
           <div
-            className="absolute z-30 w-56 rounded-md border border-neutral-200 bg-neutral-900 px-3 py-2 text-xs text-white shadow-lg"
+            data-heatmap-tip
+            className="absolute z-30 rounded-md border border-neutral-200 bg-neutral-900 px-3 py-2 text-xs text-white shadow-lg"
             style={{
-              left: Math.max(112, Math.min(selected.x, (containerRef.current?.clientWidth ?? 300) - 112)),
-              top: Math.max(8, selected.y - 8),
-              transform: "translate(-50%, -100%)",
+              left: tipLeft,
+              top: tipTop,
+              width: TIP_WIDTH,
+              transform: "translateY(-100%)",
             }}
             role="dialog"
           >
@@ -316,11 +365,14 @@ export function Heatmap({
               </div>
             </div>
             <div
-              className="absolute left-1/2 top-full h-0 w-0 -translate-x-1/2 border-x-[5px] border-t-[5px] border-x-transparent border-t-neutral-900"
+              className="absolute top-full h-0 w-0 border-x-[5px] border-t-[5px] border-x-transparent border-t-neutral-900"
+              style={{
+                left: arrowLeft,
+                transform: "translateX(-50%)",
+              }}
               aria-hidden
             />
           </div>
-        </>
       ) : null}
     </div>
   );

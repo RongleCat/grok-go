@@ -18,6 +18,8 @@
 | POST | `/v1/videos/generations` | 文/图生视频 |
 | POST | `/v1/videos/edits` | 视频编辑 |
 | GET | `/v1/videos/{request_id}` | 视频 job 状态（账号亲和） |
+| POST/GET | `/v1/files` | xAI Files 上传/列表（多轮大文件用 file_id） |
+| GET/DELETE | `/v1/files/{file_id}` | 文件元数据 / 删除 |
 | ANY | `/mcp` `/mcp/` | MCP JSON-RPC |
 
 ## 启动
@@ -38,6 +40,8 @@
 - 上游发送：`proxy::send_with_account_failover`（最多 3 账号尝试）
 - 模型解析：`config::resolve_model`
 - Responses 清洗：`sanitize::sanitize_responses_request`
+- 多轮体积极膨胀抑制：`payload_optimize`（去重/折叠/截断 + `store:false`）
+- 大文本 Files 分流：`files_api` + `offload_large_text_blobs`（`input_file.file_id`）
 - image tool 服务端闭环：`proxy::run_image_gen_tool_loop` + `image_bridge`
 - 视频 job 记住账号：`job_affinity`
 
@@ -47,9 +51,12 @@
 - [[mcp-tools]]
 - [[routing]]
 - [[../concepts/request-sanitize]]
+- [[../concepts/payload-optimize]]
 - [[media-artifacts]]
 
 ## 来源
 
 - `src-tauri/src/gateway/server.rs`
 - `src-tauri/src/gateway/proxy.rs`
+- `src-tauri/src/gateway/payload_optimize.rs`
+- `src-tauri/src/gateway/files_api.rs`

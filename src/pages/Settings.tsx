@@ -30,6 +30,7 @@ import type { LocalePreference } from "@/i18n";
 import iconDark from "@/assets/app-icons/dark.png";
 import iconLight from "@/assets/app-icons/light.png";
 import { useBrand } from "@/components/brand-context";
+import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { PageLoading } from "@/components/page-loading";
 
 type SettingsTab = "general" | "network" | "proxy" | "models" | "backup";
@@ -395,17 +396,21 @@ export function SettingsPage() {
   }
 
   return (
-    <div className="space-y-4">
-      <div className="space-y-1">
-        <h1 className="text-xl font-semibold tracking-tight">{t.settings.title}</h1>
-        {t.settings.subtitle ? (
-          <p className="text-sm text-neutral-500">{t.settings.subtitle}</p>
-        ) : null}
+    <PageShell>
+      <PageHeader className="flex-col items-stretch">
+        <div className="space-y-1">
+          <h1 className="text-xl font-semibold tracking-tight">{t.settings.title}</h1>
+          {t.settings.subtitle ? (
+            <p className="text-sm text-neutral-500">{t.settings.subtitle}</p>
+          ) : null}
+        </div>
+      </PageHeader>
+
+      <div className="shrink-0">
+        <Tabs items={tabs} value={tab} onChange={setTab} />
       </div>
 
-      <Tabs items={tabs} value={tab} onChange={setTab} />
-
-      <div className="space-y-4 pb-2">
+      <PageBody className="space-y-4 pb-2">
         {tab === "general" && (
           <>
             <Card>
@@ -434,43 +439,49 @@ export function SettingsPage() {
               </CardContent>
             </Card>
 
-            <Card>
-              <CardHeader className="py-3">
-                <CardTitle className="text-base">{t.settings.appIcon}</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                {t.settings.appIconDesc ? (
-                  <p className="text-sm text-neutral-500">{t.settings.appIconDesc}</p>
-                ) : null}
-                <div className="grid gap-3 sm:grid-cols-2">
-                  {iconOptions.map((opt) => {
-                    const selected = (config.appIcon ?? "dark") === opt.value;
-                    return (
-                      <button
-                        key={opt.value}
-                        type="button"
-                        onClick={() => applyIcon(opt.value)}
-                        className={`flex items-center gap-3 rounded-xl border p-3 text-left transition ${
-                          selected
-                            ? "border-neutral-900 bg-neutral-50 ring-2 ring-neutral-900"
-                            : "border-neutral-200 hover:border-neutral-400"
-                        }`}
-                      >
-                        <img
-                          src={opt.src}
-                          alt={opt.label}
-                          className="h-14 w-14 shrink-0 rounded-xl border border-neutral-200 object-cover shadow-sm"
-                        />
-                        <div className="min-w-0">
-                          <div className="text-sm font-medium">{opt.label}</div>
-                          <div className="text-xs text-neutral-500">{opt.desc}</div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </CardContent>
-            </Card>
+            {/* Windows tray uses a fixed black-bg white-logo asset; hide style switch there. */}
+            {!(
+              typeof navigator !== "undefined" &&
+              /windows/i.test(navigator.userAgent || navigator.platform || "")
+            ) && (
+              <Card>
+                <CardHeader className="py-3">
+                  <CardTitle className="text-base">{t.settings.appIcon}</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {t.settings.appIconDesc ? (
+                    <p className="text-sm text-neutral-500">{t.settings.appIconDesc}</p>
+                  ) : null}
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    {iconOptions.map((opt) => {
+                      const selected = (config.appIcon ?? "dark") === opt.value;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => applyIcon(opt.value)}
+                          className={`flex items-center gap-3 rounded-xl border p-3 text-left transition ${
+                            selected
+                              ? "border-neutral-900 bg-neutral-50 ring-2 ring-neutral-900"
+                              : "border-neutral-200 hover:border-neutral-400"
+                          }`}
+                        >
+                          <img
+                            src={opt.src}
+                            alt={opt.label}
+                            className="h-14 w-14 shrink-0 rounded-xl border border-neutral-200 object-cover shadow-sm"
+                          />
+                          <div className="min-w-0">
+                            <div className="text-sm font-medium">{opt.label}</div>
+                            <div className="text-xs text-neutral-500">{opt.desc}</div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
             <Card>
               <CardHeader className="py-3">
@@ -836,7 +847,6 @@ export function SettingsPage() {
             ) : null}
           </div>
         )}
-      </div>
 
       <ConfirmDialog
         open={restartOpen}
@@ -862,7 +872,8 @@ export function SettingsPage() {
         }}
         onConfirm={() => void confirmImport()}
       />
-    </div>
+      </PageBody>
+    </PageShell>
   );
 }
 

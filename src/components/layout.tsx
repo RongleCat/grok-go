@@ -58,8 +58,9 @@ export function AppLayout() {
           })}
         </nav>
       </aside>
-      <main className="min-h-0 min-w-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-5xl p-4">
+      {/* Page scrolls inside PageBody / list panels — not the whole shell. */}
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <div className="mx-auto flex h-full min-h-0 w-full max-w-5xl flex-col p-4">
           <Outlet />
         </div>
       </main>

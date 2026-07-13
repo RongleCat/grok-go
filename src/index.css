@@ -6,7 +6,11 @@
 }
 
 * { box-sizing: border-box; }
-html, body, #root { height: 100%; }
+html, body, #root { height: 100%; overflow: hidden; }
+html {
+  /* Avoid layout jump when a transient overflow scrollbar would appear. */
+  scrollbar-gutter: stable;
+}
 body {
   margin: 0;
   background: #fff;

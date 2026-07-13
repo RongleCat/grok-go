@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
+import { Shuffle } from "lucide-react";
 import { api, type AppConfig, type ModelOptions } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { useI18n } from "@/i18n/context";
+import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { PageLoading } from "@/components/page-loading";
 import { useToast } from "@/components/ui/toast";
 
@@ -77,10 +80,15 @@ export function MappingPage() {
     }
   }
 
-  return (
-    <div className="space-y-4 overflow-y-auto">
-      <h1 className="text-xl font-semibold tracking-tight">{t.mapping.title}</h1>
+  const mappingEntries = Object.entries(config.modelMappings);
 
+  return (
+    <PageShell>
+      <PageHeader>
+        <h1 className="text-xl font-semibold tracking-tight">{t.mapping.title}</h1>
+      </PageHeader>
+
+      <PageBody className="space-y-4">
       <Card>
         <CardHeader className="py-3">
           <CardTitle className="text-base">{t.mapping.defaultText}</CardTitle>
@@ -152,34 +160,45 @@ export function MappingPage() {
           </div>
 
           <div className="space-y-2">
-            {Object.entries(config.modelMappings).map(([k, v]) => (
-              <div
-                key={k}
-                className="flex items-center justify-between rounded-md border border-neutral-200 px-3 py-2 text-sm"
-              >
-                <div>
-                  <span className="font-medium">{k}</span>
-                  <span className="mx-2 text-neutral-400">→</span>
-                  <span>{v}</span>
-                </div>
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    const modelMappings = { ...config.modelMappings };
-                    delete modelMappings[k];
-                    save({ ...config, modelMappings });
-                  }}
+            {mappingEntries.length === 0 ? (
+              <EmptyState
+                icon={Shuffle}
+                title={t.mapping.mappingsEmpty}
+                description={t.mapping.mappingsEmptyHint}
+                size="sm"
+                fill={false}
+                className="rounded-lg border border-dashed border-neutral-200 bg-neutral-50/50"
+              />
+            ) : (
+              mappingEntries.map(([k, v]) => (
+                <div
+                  key={k}
+                  className="flex items-center justify-between rounded-md border border-neutral-200 px-3 py-2 text-sm"
                 >
-                  {t.common.remove}
-                </Button>
-              </div>
-            ))}
-
+                  <div className="min-w-0 truncate">
+                    <span className="font-medium">{k}</span>
+                    <span className="mx-2 text-neutral-400">→</span>
+                    <span>{v}</span>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      const modelMappings = { ...config.modelMappings };
+                      delete modelMappings[k];
+                      save({ ...config, modelMappings });
+                    }}
+                  >
+                    {t.common.remove}
+                  </Button>
+                </div>
+              ))
+            )}
           </div>
         </CardContent>
       </Card>
       {error ? <div className="text-sm text-red-600">{error}</div> : null}
-    </div>
+      </PageBody>
+    </PageShell>
   );
 }
 

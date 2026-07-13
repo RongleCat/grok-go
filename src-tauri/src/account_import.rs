@@ -1,7 +1,10 @@
 //! Multi-format account credential import (CPA / sub2api / 卡网 SSO paste).
 //!
 //! Supported payloads:
-//! - Card-seller lines: `email----password----SSO` (web SSO JWT → converted to OAuth at import)
+//! - Card-seller lines with any common separator, e.g.
+//!   `email----password----SSO`, `email|password|SSO`, or free text that embeds a
+//!   web SSO JWT (`eyJ…` with `session_id` claim). JWT is matched by shape, not by
+//!   a fixed delimiter layout.
 //! - Pure SSO JWT list (session_id payload) or `sso=<jwt>` (same conversion)
 //! - Plain OAuth refresh tokens: one per line (sub2api Grok RT batch)
 //! - CPA xAI auth file JSON: `{"type":"xai","access_token","refresh_token",...}`
@@ -129,7 +132,8 @@ pub fn parse_import_payload(raw: &str) -> Result<Vec<ParsedCredential>, String> 
         }
     }
 
-    // Card format / mixed plain lines (email----password----SSO or SSO JWT / RT).
+    // Card / free-form lines: SSO JWT may be embedded with any separator
+    // (----, |, whitespace, …). Also bare SSO JWT / RT lists.
     let lines = parse_plain_lines(trimmed);
     if lines.is_empty() {
         return Err("no refresh tokens, SSO tokens, or credential JSON found".into());
@@ -145,12 +149,10 @@ fn parse_plain_lines(raw: &str) -> Vec<ParsedCredential> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Card format: email----password----sso  (or email----sso)
-        if line.contains("----") {
-            if let Some(cred) = parse_card_line(line) {
-                out.push(cred);
-                continue;
-            }
+        // Prefer lines that embed a JWT (any separator layout).
+        if let Some(cred) = parse_line_with_sso_jwt(line) {
+            out.push(cred);
+            continue;
         }
         let token = line
             .strip_prefix("sso=")
@@ -175,7 +177,7 @@ fn parse_plain_lines(raw: &str) -> Vec<ParsedCredential> {
                 notes: None,
                 source_format: "sso-jwt-list",
             });
-        } else if token.contains('.') || token.len() >= 32 {
+        } else if looks_like_refresh_token(token) {
             out.push(ParsedCredential {
                 name: None,
                 email: None,
@@ -194,58 +196,157 @@ fn parse_plain_lines(raw: &str) -> Vec<ParsedCredential> {
     out
 }
 
-fn parse_card_line(line: &str) -> Option<ParsedCredential> {
-    let parts: Vec<&str> = line.split("----").map(str::trim).filter(|s| !s.is_empty()).collect();
-    if parts.len() < 2 {
+/// Scan a free-form card line for an embedded web SSO JWT, plus optional email/password.
+///
+/// Accepts layouts such as:
+/// - `email----password----eyJ…`
+/// - `email|password|eyJ…`
+/// - `email password eyJ…`
+/// - bare `eyJ…` (handled by caller as list)
+/// - noisy seller pastes with instruction text on other lines
+fn parse_line_with_sso_jwt(line: &str) -> Option<ParsedCredential> {
+    let sso = find_jwt_in_text(line)?;
+    // Prefer true web-SSO (session_id). Still accept long eyJ tokens as SSO candidates
+    // when sellers ship non-standard claims.
+    if !is_web_sso_jwt(sso) && !(sso.starts_with("eyJ") && sso.len() >= 40) {
         return None;
     }
-    // email----password----sso
-    if parts.len() >= 3 {
-        let email = parts[0];
-        let password = parts[1];
-        let sso = parts[2].strip_prefix("sso=").unwrap_or(parts[2]);
-        if !email.contains('@') {
-            return None;
-        }
-        if !is_web_sso_jwt(sso) && !sso.starts_with("eyJ") {
-            // Still accept as SSO if third field is long JWT-like
-            if sso.len() < 40 {
-                return None;
-            }
-        }
-        return Some(ParsedCredential {
-            name: Some(email.to_string()),
-            email: Some(email.to_string()),
-            access_token: None,
-            refresh_token: None,
-            sso_token: Some(sso.to_string()),
-            password: Some(password.to_string()),
-            auth_kind: AccountAuthKind::Sso,
-            token_type: None,
-            expires_at: None,
-            notes: Some(format!("card-sso import ({})", Utc::now().format("%Y-%m-%d"))),
-            source_format: "card-email-password-sso",
-        });
+
+    // Everything before the JWT is email/password (and optional labels).
+    let before = line.get(..line.find(sso)?)?.trim();
+    let before = before
+        .trim_end_matches(['|', '-', ':', '=', ',', ';', ' ', '\t'])
+        .trim();
+    let before = before
+        .strip_suffix("sso")
+        .or_else(|| before.strip_suffix("SSO"))
+        .unwrap_or(before)
+        .trim_end_matches(['|', '-', ':', '=', ',', ';', ' ', '\t'])
+        .trim();
+
+    let (email, password) = split_email_password_prefix(before);
+    let email = email.filter(|e| e.contains('@'));
+
+    let source = if email.is_some() && password.is_some() {
+        "card-email-password-sso"
+    } else if email.is_some() {
+        "card-email-sso"
+    } else {
+        "sso-jwt-embedded"
+    };
+
+    Some(ParsedCredential {
+        name: email.clone(),
+        email,
+        access_token: None,
+        refresh_token: None,
+        sso_token: Some(sso.to_string()),
+        password,
+        auth_kind: AccountAuthKind::Sso,
+        token_type: None,
+        expires_at: None,
+        notes: Some(format!("card-sso import ({})", Utc::now().format("%Y-%m-%d"))),
+        source_format: source,
+    })
+}
+
+/// Split `email|password`, `email----password`, or lone email from the prefix before JWT.
+fn split_email_password_prefix(prefix: &str) -> (Option<String>, Option<String>) {
+    let p = prefix.trim();
+    if p.is_empty() {
+        return (None, None);
     }
-    // email----sso
-    let email = parts[0];
-    let sso = parts[1].strip_prefix("sso=").unwrap_or(parts[1]);
-    if email.contains('@') && (is_web_sso_jwt(sso) || sso.starts_with("eyJ")) {
-        return Some(ParsedCredential {
-            name: Some(email.to_string()),
-            email: Some(email.to_string()),
-            access_token: None,
-            refresh_token: None,
-            sso_token: Some(sso.to_string()),
-            password: None,
-            auth_kind: AccountAuthKind::Sso,
-            token_type: None,
-            expires_at: None,
-            notes: Some(format!("card-sso import ({})", Utc::now().format("%Y-%m-%d"))),
-            source_format: "card-email-sso",
-        });
+
+    // Prefer multi-char then single-char delimiters.
+    let parts: Vec<&str> = if p.contains("----") {
+        p.split("----").map(str::trim).filter(|s| !s.is_empty()).collect()
+    } else if p.contains('|') {
+        p.split('|').map(str::trim).filter(|s| !s.is_empty()).collect()
+    } else if p.contains('\t') {
+        p.split('\t').map(str::trim).filter(|s| !s.is_empty()).collect()
+    } else if p.contains(" - ") {
+        p.split(" - ").map(str::trim).filter(|s| !s.is_empty()).collect()
+    } else {
+        // whitespace-separated email password
+        p.split_whitespace().filter(|s| !s.is_empty()).collect()
+    };
+
+    if parts.is_empty() {
+        return (None, None);
+    }
+    if parts.len() == 1 {
+        return (Some(parts[0].to_string()), None);
+    }
+    // First field with @ is email; next non-empty is password.
+    let email_idx = parts.iter().position(|s| s.contains('@')).unwrap_or(0);
+    let email = parts[email_idx].to_string();
+    let password = parts
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| *i != email_idx && !s.is_empty() && !s.starts_with("eyJ"))
+        .map(|(_, s)| (*s).to_string())
+        .next();
+    (Some(email), password)
+}
+
+/// Locate the first JWT-shaped token (`header.payload.signature`, base64url) in text.
+/// Does not require a fixed delimiter — works for `|`, `----`, spaces, or glue.
+fn find_jwt_in_text(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 20 < bytes.len() {
+        // JWT headers typically start with base64url("{"...) → "eyJ"
+        if bytes[i] == b'e'
+            && bytes.get(i + 1) == Some(&b'y')
+            && bytes.get(i + 2) == Some(&b'J')
+        {
+            let start = i;
+            let mut dots = 0u8;
+            let mut j = i;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c == b'.' {
+                    dots = dots.saturating_add(1);
+                    j += 1;
+                    continue;
+                }
+                if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            // Standard compact JWT: exactly 2 dots, reasonable length.
+            if dots == 2 && j.saturating_sub(start) >= 40 {
+                return Some(&s[start..j]);
+            }
+            i = j.max(i + 1);
+            continue;
+        }
+        i += 1;
     }
     None
+}
+
+/// Refresh tokens are single-token lines — not free prose or emails.
+fn looks_like_refresh_token(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() < 24 {
+        return false;
+    }
+    if s.starts_with("rt_") {
+        return s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    }
+    // Avoid absorbing instruction text / Chinese seller notes / URLs.
+    if s.contains('@')
+        || s.contains(' ')
+        || s.contains("http")
+        || s.chars().any(|c| !c.is_ascii())
+    {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+'))
 }
 
 /// Detect grok.com web SSO JWT (payload has session_id, not OAuth refresh).
@@ -699,6 +800,43 @@ rt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         assert_eq!(acc.sso_token.as_deref(), Some(sso));
         // Not routable until import runs SSO→OAuth device flow.
         assert!(!acc.is_credentialed());
+    }
+
+    #[test]
+    fn parse_card_pipe_separated_sso() {
+        let sso = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzZXNzaW9uX2lkIjoiZjlkMWZhN2QtZWU2Ny00MWQ1LWJkZGMtYTYzODNkMWRmOWMxIn0.32YTdvxVYScciAjzNFpWU4L0GohvAWoC5sgz1mL38-Y";
+        let raw = format!("uzq4tn@chilloliandfii.space|Grok123123@|{sso}");
+        let list = parse_import_payload(&raw).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].email.as_deref(), Some("uzq4tn@chilloliandfii.space"));
+        assert_eq!(list[0].password.as_deref(), Some("Grok123123@"));
+        assert_eq!(list[0].sso_token.as_deref(), Some(sso));
+        assert_eq!(list[0].source_format, "card-email-password-sso");
+    }
+
+    #[test]
+    fn parse_seller_paste_with_instructions_and_pipe_cards() {
+        let sso1 = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzZXNzaW9uX2lkIjoiZjlkMWZhN2QtZWU2Ny00MWQ1LWJkZGMtYTYzODNkMWRmOWMxIn0.32YTdvxVYScciAjzNFpWU4L0GohvAWoC5sgz1mL38-Y";
+        let sso2 = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzZXNzaW9uX2lkIjoiNjM3ZGMyZjctMmY4Ni00MWU1LWI1ZDktYzBlYmYwY2E0M2I3In0.b8-L8qdem3BJF5E_KcBU_rbEo-Vmv_wYsG7Z9xVTrco";
+        let raw = format!(
+            "=== 使用说明 ===\n\
+             Super Grok 7天会员 账号格式：邮箱|密码 查看 https://grokcheck.site/\n\
+             === 卡密内容 ===\n\
+             a@chilloliandfii.space|Grok123123@|{sso1}\n\
+             b@tuyenchau.click|Grok123123@|{sso2}\n"
+        );
+        let list = parse_import_payload(&raw).unwrap();
+        assert_eq!(list.len(), 2, "should skip instruction lines, keep 2 cards");
+        assert_eq!(list[0].email.as_deref(), Some("a@chilloliandfii.space"));
+        assert_eq!(list[1].email.as_deref(), Some("b@tuyenchau.click"));
+        assert!(list.iter().all(|c| c.sso_token.is_some()));
+    }
+
+    #[test]
+    fn find_jwt_ignores_prose() {
+        assert!(find_jwt_in_text("no token here email|password only").is_none());
+        let sso = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzZXNzaW9uX2lkIjoiZjlkMWZhN2QtZWU2Ny00MWQ1LWJkZGMtYTYzODNkMWRmOWMxIn0.32YTdvxVYScciAjzNFpWU4L0GohvAWoC5sgz1mL38-Y";
+        assert_eq!(find_jwt_in_text(&format!("prefix {sso} suffix")), Some(sso));
     }
 
     #[test]

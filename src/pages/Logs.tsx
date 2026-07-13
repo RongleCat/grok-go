@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Inbox } from "lucide-react";
 import { api, type Account, type RequestLog } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageHeader, PageShell } from "@/components/page-shell";
 import {
   formatCacheHitRate,
   formatNumber,
@@ -90,6 +93,11 @@ export function LogsPage() {
     return m;
   }, [accounts]);
 
+  const resetScroll = useCallback(() => {
+    setScrollTop(0);
+    if (listRef.current) listRef.current.scrollTop = 0;
+  }, []);
+
   const loadPage = useCallback(async (offset: number, replace: boolean) => {
     if (loadingMore.current) return;
     loadingMore.current = true;
@@ -99,6 +107,14 @@ export function LogsPage() {
       setLogs((prev) => (replace ? page : [...prev, ...page]));
       setHasMore(page.length >= PAGE_SIZE);
       setError("");
+      // Replacing the list invalidates previous scroll offset used by virtualization.
+      if (replace) {
+        setScrollTop(0);
+        // DOM scroll position after paint (content height may change this frame).
+        requestAnimationFrame(() => {
+          if (listRef.current) listRef.current.scrollTop = 0;
+        });
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -109,6 +125,7 @@ export function LogsPage() {
 
   async function refresh() {
     setHasMore(true);
+    resetScroll();
     try {
       const list = await api.getAccounts();
       setAccounts(list);
@@ -143,20 +160,24 @@ export function LogsPage() {
   }
 
   const total = logs.length;
-  const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
-  const visibleCount = Math.ceil(viewportH / ROW_HEIGHT) + OVERSCAN * 2;
+  // Clamp so a stale scrollTop after refresh cannot invent a huge padTop
+  // (which previously left the list blank with a broken scrollbar).
+  const rawStart = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+  const start = total === 0 ? 0 : Math.min(rawStart, total - 1);
+  const visibleCount = Math.ceil(Math.max(viewportH, 1) / ROW_HEIGHT) + OVERSCAN * 2;
   const end = Math.min(total, start + visibleCount);
   const visible = logs.slice(start, end);
-  const padTop = start * ROW_HEIGHT;
+  const padTop = Math.min(start * ROW_HEIGHT, Math.max(0, total * ROW_HEIGHT));
   const padBottom = Math.max(0, (total - end) * ROW_HEIGHT);
+  const contentHeight = total * ROW_HEIGHT + (hasMore || loading ? 36 : 0);
 
-  // Account/time(+status) | Source+Endpoint | Model | Latency | Token (wide) | Cost
+  // Account/time(+status) | Source/Endpoint | Model | Latency | Token (wide) | Cost
   const gridCols =
-    "grid-cols-[minmax(196px,1.35fr)_minmax(100px,1fr)_minmax(88px,0.85fr)_52px_minmax(200px,1.7fr)_60px]";
+    "grid-cols-[minmax(196px,1.35fr)_minmax(120px,1.1fr)_minmax(88px,0.85fr)_72px_minmax(200px,1.7fr)_60px]";
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3">
-      <div className="flex shrink-0 items-center justify-between gap-3">
+    <PageShell className="gap-3">
+      <PageHeader>
         <h1 className="text-xl font-semibold tracking-tight">{t.logs.title}</h1>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={() => void refresh()}>
@@ -167,25 +188,23 @@ export function LogsPage() {
             size="sm"
             onClick={async () => {
               await api.clearLogs();
+              resetScroll();
               await refresh();
             }}
           >
             {t.logs.clear}
           </Button>
         </div>
-      </div>
+      </PageHeader>
 
       <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <CardHeader className="shrink-0 py-3">
-          <CardTitle className="text-base">{t.logs.recent}</CardTitle>
-        </CardHeader>
         <CardContent className="flex min-h-0 flex-1 flex-col p-0">
           <div className="shrink-0 border-b border-neutral-200 px-4">
             <div className={`grid ${gridCols} gap-2 py-2 text-xs font-medium text-neutral-500`}>
               <div>{t.logs.accountTime}</div>
               <div>
-                <div>{t.logs.source}</div>
-                <div className="font-normal text-neutral-400">{t.logs.endpoint}</div>
+                {t.logs.source}
+                <span className="font-normal text-neutral-400"> / {t.logs.endpoint}</span>
               </div>
               <div>{t.logs.model}</div>
               <div>{t.logs.latency}</div>
@@ -202,10 +221,14 @@ export function LogsPage() {
             onScroll={onScroll}
           >
             {total === 0 && !loading ? (
-              <div className="py-10 text-center text-sm text-neutral-500">{t.logs.empty}</div>
+              <EmptyState
+                icon={Inbox}
+                title={t.logs.empty}
+                description={t.logs.emptyHint}
+              />
             ) : (
-              <div style={{ height: total * ROW_HEIGHT + (hasMore || loading ? 36 : 0) }}>
-                <div style={{ height: padTop }} />
+              <div style={{ height: contentHeight, position: "relative" }}>
+                <div style={{ height: padTop, flexShrink: 0 }} aria-hidden />
                 {visible.map((log) => {
                   const hitAccount = accountLabel(log.accountId, accountById);
                   const ok = log.statusCode >= 200 && log.statusCode < 400;
@@ -258,19 +281,15 @@ export function LogsPage() {
                           </span>
                         </div>
                       </div>
-                      <div className="min-w-0 leading-tight">
-                        <div
-                          className="truncate text-[11px] text-neutral-700"
-                          title={log.clientSource || undefined}
-                        >
-                          {log.clientSource || "—"}
-                        </div>
-                        <div
-                          className="truncate font-mono text-[10px] text-neutral-500"
-                          title={log.endpoint}
-                        >
+                      <div
+                        className="min-w-0 truncate text-[11px] leading-tight"
+                        title={[log.clientSource || "—", log.endpoint].filter(Boolean).join(" / ")}
+                      >
+                        <span className="text-neutral-700">{log.clientSource || "—"}</span>
+                        <span className="text-neutral-300"> / </span>
+                        <span className="font-mono text-[10px] text-neutral-500">
                           {log.endpoint}
-                        </div>
+                        </span>
                       </div>
                       <div className="min-w-0 truncate text-xs">
                         <div className="truncate" title={log.resolvedModel || undefined}>
@@ -314,6 +333,6 @@ export function LogsPage() {
       </Card>
 
       {error ? <div className="shrink-0 text-sm text-red-600">{error}</div> : null}
-    </div>
+    </PageShell>
   );
 }

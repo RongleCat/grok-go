@@ -5,10 +5,12 @@ import {
   Image as ImageIcon,
   KeyRound,
   RefreshCw,
+  SearchX,
   Square,
   TimerOff,
   Trash2,
   Upload,
+  Users,
   Video,
 } from "lucide-react";
 import {
@@ -21,7 +23,9 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ConfirmDialog, Dialog } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
+import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
@@ -962,8 +966,8 @@ export function AccountsPage() {
   };
 
   return (
-    <div className="space-y-4 overflow-y-auto">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <PageShell>
+      <PageHeader>
         <div className="min-w-0 space-y-1">
           <h1 className="text-xl font-semibold tracking-tight">{t.accounts.title}</h1>
           {t.accounts.subtitle ? (
@@ -1008,10 +1012,10 @@ export function AccountsPage() {
             {busy ? t.accounts.loggingIn : t.accounts.addAccount}
           </Button>
         </div>
-      </div>
+      </PageHeader>
 
       {/* Search / filter */}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex shrink-0 flex-wrap items-center gap-2">
         <Input
           className="h-8 w-full max-w-xs text-sm"
           placeholder={t.accounts.searchPlaceholder}
@@ -1045,7 +1049,7 @@ export function AccountsPage() {
 
       {/* Bulk actions */}
       {selected.size > 0 ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2">
           <span className="text-xs font-medium text-neutral-700">
             {t.accounts.bulkSelected.replace("{count}", String(selected.size))}
           </span>
@@ -1134,12 +1138,12 @@ export function AccountsPage() {
       ) : null}
 
       {error ? (
-        <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 whitespace-pre-wrap">
+        <div className="shrink-0 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 whitespace-pre-wrap">
           {error}
         </div>
       ) : null}
       {authUrl ? (
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
           <Button size="sm" onClick={openAuthLink}>
             {t.accounts.openAuthLink}
           </Button>
@@ -1149,30 +1153,57 @@ export function AccountsPage() {
         </div>
       ) : null}
 
-      <div className="space-y-2">
-        {filtered.map((account) => (
-          <AccountCard
-            key={account.id}
-            account={account}
-            locale={dateLocale}
-            busy={busy}
-            quotaBusy={quotaBusyAll || quotaBusyId === account.id}
-            selected={selected.has(account.id)}
-            labels={cardLabels}
-            onToggleSelect={toggleSelect}
-            onSave={(a) => void save(a)}
-            onRemove={(id) => void remove(id)}
-            onClearCooldown={(id) => void clearCooldown(id)}
-            onRelogin={(id) => void login({ accountId: id })}
-            onRefreshQuota={(id) => void refreshQuota(id)}
-          />
-        ))}
+      <PageBody className="flex flex-col">
         {accounts.length === 0 ? (
-          <div className="text-sm text-neutral-500">{t.accounts.empty}</div>
+          <EmptyState
+            icon={Users}
+            title={t.accounts.empty}
+            description={t.accounts.emptyHint}
+            action={
+              <div className="flex flex-wrap justify-center gap-2">
+                <Button size="sm" disabled={busy} onClick={() => login()}>
+                  {busy ? t.accounts.loggingIn : t.accounts.addAccount}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy || importBusy}
+                  onClick={() => setImportOpen(true)}
+                >
+                  <Upload className="h-3.5 w-3.5" />
+                  {t.accounts.importAccounts}
+                </Button>
+              </div>
+            }
+          />
         ) : filtered.length === 0 ? (
-          <div className="text-sm text-neutral-500">{t.accounts.noMatch}</div>
-        ) : null}
-      </div>
+          <EmptyState
+            icon={SearchX}
+            title={t.accounts.noMatch}
+            description={t.accounts.noMatchHint}
+          />
+        ) : (
+          <div className="space-y-2 pb-1">
+            {filtered.map((account) => (
+              <AccountCard
+                key={account.id}
+                account={account}
+                locale={dateLocale}
+                busy={busy}
+                quotaBusy={quotaBusyAll || quotaBusyId === account.id}
+                selected={selected.has(account.id)}
+                labels={cardLabels}
+                onToggleSelect={toggleSelect}
+                onSave={(a) => void save(a)}
+                onRemove={(id) => void remove(id)}
+                onClearCooldown={(id) => void clearCooldown(id)}
+                onRelogin={(id) => void login({ accountId: id })}
+                onRefreshQuota={(id) => void refreshQuota(id)}
+              />
+            ))}
+          </div>
+        )}
+      </PageBody>
 
       <ConfirmDialog
         open={deleteConfirmOpen}
@@ -1300,6 +1331,6 @@ export function AccountsPage() {
           </div>
         </div>
       </Dialog>
-    </div>
+    </PageShell>
   );
 }

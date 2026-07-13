@@ -88,9 +88,17 @@ def main() -> int:
         + "\n"
         + INSTALL_NOTES
     )
-    sys.stdout.write(out)
     if not out.endswith("\n"):
-        sys.stdout.write("\n")
+        out += "\n"
+    # Windows CI defaults to cp1252; bilingual CHANGELOG needs UTF-8.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        sys.stdout.write(out)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write(out.encode("utf-8"))
     return 0
 
 

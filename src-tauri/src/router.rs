@@ -114,14 +114,22 @@ pub fn pick_account_decision_cap(
     session_key: Option<&str>,
     capability: MediaCapability,
 ) -> AppResult<PickDecision> {
-    // Expire cooldowns on the *live* store — never save the caller's snapshot
-    // (that snapshot can resurrect accounts deleted concurrently).
+    // Production: expire cooldowns on the *live* store — never save the caller's
+    // snapshot (that snapshot can resurrect accounts deleted concurrently).
+    // Unit tests: use the in-memory `store` argument so CI/local disk auth does
+    // not pollute routing assertions.
+    #[cfg(test)]
+    let store_owned = {
+        let mut s = store.clone();
+        let _ = crate::auth::clear_expired_cooldowns_in_store(&mut s);
+        s
+    };
+    #[cfg(not(test))]
     let store_owned = {
         let mut live = load_auth()?;
         if crate::auth::clear_expired_cooldowns_in_store(&mut live) {
             let _ = save_auth(&live);
         }
-        // Prefer live list for routing so concurrent deletes are visible.
         let _caller_snapshot = store;
         live
     };

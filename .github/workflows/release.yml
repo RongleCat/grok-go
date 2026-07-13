@@ -82,6 +82,10 @@ jobs:
       - name: Prepare release notes from CHANGELOG
         id: changelog
         shell: bash
+        env:
+          # Windows runners default to cp1252; bilingual CHANGELOG needs UTF-8 stdout.
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: |
           set -euo pipefail
           if [[ "${{ github.ref_type }}" == "tag" ]]; then

@@ -28,19 +28,28 @@ use tauri::{AppHandle, Manager, WindowEvent};
 const TRAY_DARK_BYTES: &[u8] = include_bytes!("../icons/variants/dark/tray-icon-36.png");
 #[cfg(target_os = "macos")]
 const TRAY_LIGHT_BYTES: &[u8] = include_bytes!("../icons/variants/light/tray-icon-36.png");
-// Windows / Linux tray: dark brand = white glyph; light brand = black glyph.
+// Windows / Linux tray: solid black square + white logo (opaque). Transparent
+// white-glyph assets render as an all-white blob in the Windows notification area.
 #[cfg(not(target_os = "macos"))]
-const TRAY_DARK_BYTES: &[u8] = include_bytes!("../icons/variants/dark/tray-icon-win.png");
-#[cfg(not(target_os = "macos"))]
-const TRAY_LIGHT_BYTES: &[u8] = include_bytes!("../icons/variants/light/tray-icon-win.png");
+const TRAY_WIN_BYTES: &[u8] = include_bytes!("../icons/variants/dark/tray-icon-win.png");
 
 const APP_ICON_DARK_BYTES: &[u8] = include_bytes!("../icons/variants/dark/icon.png");
 const APP_ICON_LIGHT_BYTES: &[u8] = include_bytes!("../icons/variants/light/icon.png");
 
 fn tray_bytes(style: AppIconStyle) -> &'static [u8] {
-    match style {
-        AppIconStyle::Dark => TRAY_DARK_BYTES,
-        AppIconStyle::Light => TRAY_LIGHT_BYTES,
+    #[cfg(target_os = "macos")]
+    {
+        match style {
+            AppIconStyle::Dark => TRAY_DARK_BYTES,
+            AppIconStyle::Light => TRAY_LIGHT_BYTES,
+        }
+    }
+    // Windows / Linux: always black-bg white logo — readable on light & dark trays.
+    // Icon style switch is hidden on Windows; keep tray consistent regardless.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = style;
+        TRAY_WIN_BYTES
     }
 }
 

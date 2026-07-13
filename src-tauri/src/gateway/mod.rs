@@ -1,6 +1,8 @@
+pub mod files_api;
 pub mod image_bridge;
 pub mod job_affinity;
 pub mod media_artifacts;
+pub mod payload_optimize;
 pub mod proxy;
 pub mod sanitize;
 pub mod server;

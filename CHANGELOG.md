@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-14
+
+> 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
+
+### Fixed
+
+- **Token blow-up / forced stop on multi-file Codex turns**: gateway optimizes Responses/chat payloads before upstream (image dedupe & historical collapse, large tool-output truncation, `store:false` when images are present) and offloads ≥32KB text blobs to the xAI Files API as `file_id` references. Also proxies `/v1/files` for explicit upload-by-id flows.
+- **Windows tray all-white**: solid black-background white-logo 32px tray asset (not transparent white glyph).
+- **SSO card import**: detect `eyJ…` JWT by shape (not fixed `----` layout); supports `email|password|SSO` and noisy seller pastes.
+- **Select dropdown scrollbar flash**: measure panel position before mount; list scroll stays inside the menu.
+- **Logs virtual list after refresh**: reset scroll offset so rows/scrollbar stay correct.
+- **Heatmap tooltip**: arrow aligns with the clicked cell; switch cells in one click; blank click still closes.
+
+### Changed
+
+- **Windows settings**: hide app icon dark/light switch (tray fixed to black-bg brand).
+- **UI empty states**: centered icon + copy (`EmptyState`) for accounts / logs / mapping.
+- **Page scroll**: lists scroll inside containers (`PageShell` / `PageBody`), not the whole app shell.
+- **Overview layout**: metrics row flex `1 1 1 3`; endpoints put API + MCP on one row, token full-width; token card shows total + in/out/cache.
+- **Logs table**: drop “recent requests” title; source/endpoint inline; wider latency column.
+- **Heatmap**: graph + legend horizontally centered.
+
+**中文 · 修复**
+
+- **读多文件/多图后 token 暴涨、任务被强制停止**：上行 payload 优化 + Files `file_id` 分流 + `/v1/files` 代理。
+- **Windows 托盘全白**：黑底白 logo 实心小图标。
+- **卡密 SSO 导入**：按 JWT 形态识别，支持 `|` 等任意分隔。
+- **下拉框打开闪滚动条**：打开前同步定位。
+- **日志刷新后虚拟列表错乱**：重置滚动位置。
+- **热力图提示框**：箭头对齐格子、可直接点另一格切换、空白关闭。
+
+**中文 · 变更**
+
+- **Windows 设置**：隐藏图标明暗切换。
+- **空状态**：统一居中 icon + 文案。
+- **页面滚动**：列表在容器内滚动。
+- **概览 / 日志 / 热力图** 布局与表格细节调整（见上）。
+
 ## [0.1.4] - 2026-07-13
 
 > 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.

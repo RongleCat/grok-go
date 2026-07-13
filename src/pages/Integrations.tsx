@@ -16,6 +16,7 @@ import { Tabs } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/toast";
 import { useI18n } from "@/i18n/context";
+import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { PageLoading } from "@/components/page-loading";
 import { cn } from "@/lib/utils";
 
@@ -230,8 +231,8 @@ export function IntegrationsPage() {
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-start justify-between gap-3">
+    <PageShell>
+      <PageHeader>
         <div className="min-w-0 space-y-1">
           <h1 className="text-xl font-semibold tracking-tight">{t.integrations.title}</h1>
           {t.integrations.subtitle ? (
@@ -251,11 +252,13 @@ export function IntegrationsPage() {
           <RefreshCw className="h-3.5 w-3.5" />
           {t.common.refresh}
         </Button>
+      </PageHeader>
+
+      <div className="shrink-0">
+        <Tabs items={tabs} value={tab} onChange={setTab} />
       </div>
 
-      <Tabs items={tabs} value={tab} onChange={setTab} />
-
-      <div className="space-y-4 pb-2">
+      <PageBody className="space-y-4 pb-2">
         {tab === "codex" && (
           <>
             <Card>
@@ -567,7 +570,6 @@ export function IntegrationsPage() {
             </CardContent>
           </Card>
         )}
-      </div>
 
       <Dialog
         open={!!preview}
@@ -599,7 +601,8 @@ export function IntegrationsPage() {
           </div>
         ) : null}
       </Dialog>
-    </div>
+      </PageBody>
+    </PageShell>
   );
 }
 

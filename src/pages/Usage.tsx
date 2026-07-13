@@ -5,6 +5,7 @@ import { Heatmap } from "@/components/heatmap";
 import { formatCacheHitRate, formatNumber, formatUsd } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/i18n/context";
+import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { PageLoading } from "@/components/page-loading";
 
 export function UsagePage() {
@@ -57,14 +58,15 @@ export function UsagePage() {
   }
 
   return (
-    <div className="space-y-4 overflow-y-auto">
-      <div className="flex items-center justify-between gap-4">
+    <PageShell>
+      <PageHeader>
         <h1 className="text-xl font-semibold tracking-tight">{t.usage.title}</h1>
         <Button variant="outline" size="sm" onClick={refresh}>
           {t.common.refresh}
         </Button>
-      </div>
+      </PageHeader>
 
+      <PageBody className="space-y-4">
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <Card>
           <CardHeader className="pb-2">
@@ -121,6 +123,7 @@ export function UsagePage() {
       </Card>
 
       {error ? <div className="text-sm text-amber-600">{error}</div> : null}
-    </div>
+      </PageBody>
+    </PageShell>
   );
 }

@@ -26,6 +26,7 @@ Codex 发出的 Responses payload 含 xAI 不支持的字段与 tool 类型。`s
 ## 相关页面
 
 - [[../modules/gateway]]
+- [[payload-optimize]]
 - [[../modules/mcp-tools]]
 - [[../playbooks/debug-checklist]]
 

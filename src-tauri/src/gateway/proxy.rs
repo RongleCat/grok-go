@@ -22,6 +22,9 @@ use crate::gateway::image_bridge::{
     collect_image_gen_calls, fulfill_image_gen_call, inject_image_generation_calls,
     MAX_IMAGE_TOOL_ROUNDS,
 };
+use crate::gateway::payload_optimize::{
+    offload_large_text_blobs, optimize_responses_payload, OFFLOAD_TEXT_MIN,
+};
 use crate::gateway::sanitize::{
     is_compaction_blob_error, is_model_input_error, rewrite_responses_payload,
     rewrite_sse_data_line, sanitize_responses_request, strip_opaque_context,
@@ -184,6 +187,7 @@ async fn proxy_json_inner(
             let is_responses = path == "/responses"
                 || path.ends_with("/responses")
                 || path.ends_with("/responses/compact");
+            let is_chat = path.contains("/chat/completions");
             if is_responses {
                 let sanitized = sanitize_responses_request(&mut value);
                 custom_tool_names = sanitized.custom_tool_names;
@@ -196,6 +200,16 @@ async fn proxy_json_inner(
                 {
                     value["stream"] = Value::Bool(false);
                     body_changed = true;
+                }
+            }
+            // Multi-turn agent loops re-send full history (incl. base64 images /
+            // huge tool outputs). Shrink before upstream to cut token burn and
+            // avoid forced stops once the body/context balloons.
+            if is_responses || is_chat {
+                let opt = optimize_responses_payload(&mut value);
+                if opt.modified {
+                    body_changed = true;
+                    opt.log_summary(path);
                 }
             }
 
@@ -268,6 +282,8 @@ async fn proxy_json_inner(
     // Single-account happy path is unchanged (one pick + one send).
     // On account-scoped failures (401/403/429/5xx/transport), try other accounts
     // inside this request so the client does not see several hard failures in a row.
+    let allow_files_offload =
+        path.contains("/responses") || path.contains("/chat/completions");
     let (mut account, token, upstream) = send_with_account_failover(
         &config,
         &http,
@@ -275,6 +291,7 @@ async fn proxy_json_inner(
         &build_upstream,
         outbound_body.clone(),
         session_key.as_deref(),
+        allow_files_offload,
     )
     .await?;
 
@@ -822,6 +839,10 @@ const MAX_ACCOUNT_TRIES: usize = 3;
 /// Pick account → refresh token → upstream send, with same-request failover.
 ///
 /// Happy path (first account OK): one pick + one send — same cost as before.
+///
+/// When `allow_files_offload` is true and the body is large, huge text blobs
+/// are uploaded to the xAI Files API on the **selected** account and replaced
+/// with `file_id` references before the upstream call.
 async fn send_with_account_failover<F>(
     config: &AppConfig,
     http: &reqwest::Client,
@@ -829,6 +850,7 @@ async fn send_with_account_failover<F>(
     build_upstream: F,
     body: Bytes,
     session_key: Option<&str>,
+    allow_files_offload: bool,
 ) -> AppResult<(crate::config::Account, String, reqwest::Response)>
 where
     F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
@@ -903,7 +925,49 @@ where
             replace_account_tokens(&account)?;
         }
 
-        let mut upstream = build_upstream(http, &token, body.clone()).send().await;
+        // Per-account Files offload: only when body is heavy enough to matter.
+        // Failures fall back to already-truncated sync optimize (never block the turn).
+        // Only attempt Files API offload when body is large enough that a 32k+
+        // text blob could exist (cheap gate before JSON parse + uploads).
+        let send_body = if allow_files_offload && body.len() >= OFFLOAD_TEXT_MIN {
+
+            match serde_json::from_slice::<Value>(&body) {
+                Ok(mut value) => {
+                    match offload_large_text_blobs(
+                        &mut value,
+                        http,
+                        &config.xai_base_url,
+                        &token,
+                        &account.id,
+                    )
+                    .await
+                    {
+                        Ok(stats) => {
+                            if stats.modified {
+                                stats.log_summary("files-offload");
+                                Bytes::from(
+                                    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()),
+                                )
+                            } else {
+                                body.clone()
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                account = %account.id,
+                                "files offload skipped: {err}"
+                            );
+                            body.clone()
+                        }
+                    }
+                }
+                Err(_) => body.clone(),
+            }
+        } else {
+            body.clone()
+        };
+
+        let mut upstream = build_upstream(http, &token, send_body.clone()).send().await;
         if let Ok(resp) = &upstream {
             if resp.status() == StatusCode::UNAUTHORIZED {
                 // Same-account refresh once, then re-send (not a full failover yet).
@@ -914,7 +978,7 @@ where
                         if account.access_token != before {
                             let _ = replace_account_tokens(&account);
                         }
-                        upstream = build_upstream(http, &token, body.clone()).send().await;
+                        upstream = build_upstream(http, &token, send_body.clone()).send().await;
                     }
                     Err(err) => {
                         tracing::warn!(account = %account.id, "401 refresh failed: {err}");

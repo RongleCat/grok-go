@@ -103,6 +103,9 @@ fn build_router(state: GatewayState) -> Router {
         .route("/v1/videos/edits", post(video_edits))
         // Deferred video job poll (account-sticky via job_affinity).
         .route("/v1/videos/{request_id}", get(video_job_status))
+        // xAI Files API proxy — upload once, reference by file_id in Responses.
+        .route("/v1/files", any(files_collection))
+        .route("/v1/files/{file_id}", any(files_item))
         .route("/mcp", any(mcp_endpoint))
         .route("/mcp/", any(mcp_endpoint))
         .with_state(state)
@@ -180,6 +183,145 @@ async fn video_generations(State(state): State<GatewayState>, headers: HeaderMap
 
 async fn video_edits(State(state): State<GatewayState>, headers: HeaderMap, body: Bytes) -> Response {
     proxy_json(&state.proxy, Method::POST, "/videos/edits", headers, body, "videos").await
+}
+
+/// `POST /v1/files` (multipart upload) or `GET /v1/files` (list).
+async fn files_collection(
+    State(state): State<GatewayState>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    files_proxy(&state, method, "/files", headers, body, None).await
+}
+
+/// `GET|DELETE /v1/files/{file_id}`.
+async fn files_item(
+    State(state): State<GatewayState>,
+    method: Method,
+    Path(file_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path = format!("/files/{file_id}");
+    files_proxy(&state, method, &path, headers, body, Some(file_id)).await
+}
+
+async fn files_proxy(
+    state: &GatewayState,
+    method: Method,
+    path: &str,
+    headers: HeaderMap,
+    body: Bytes,
+    _file_id: Option<String>,
+) -> Response {
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    if let Err(resp) = authorize_request(&headers, &config).await {
+        return resp;
+    }
+
+    // Sticky account from session headers so multi-turn file_id refs stay valid.
+    let session_key = crate::session_affinity::extract_session_key(&headers, None);
+    let store = match load_auth() {
+        Ok(s) => s,
+        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    let decision = match crate::router::pick_account_decision_cap(
+        &config,
+        &store,
+        &[],
+        session_key.as_deref(),
+        MediaCapability::Any,
+    ) {
+        Ok(d) => d,
+        Err(err) => return error_response(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    };
+    let mut account = decision.account;
+    let token = match ensure_fresh_token(&config, &mut account).await {
+        Ok(t) => t,
+        Err(err) => return error_response(StatusCode::UNAUTHORIZED, err.to_string()),
+    };
+    let _ = replace_account_tokens(&account);
+
+    let http = state.proxy.client();
+    let base = config.xai_base_url.trim_end_matches('/');
+
+    // Multipart upload: forward raw body + content-type (do not re-encode as JSON).
+    if method == Method::POST && path == "/files" {
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("multipart/form-data")
+            .to_string();
+        let url = format!("{base}/files");
+        let resp = match http
+            .post(&url)
+            .bearer_auth(&token)
+            .header(axum::http::header::CONTENT_TYPE, ct)
+            .body(body.to_vec())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("files upload upstream: {err}"),
+                );
+            }
+        };
+        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let bytes = resp.bytes().await.unwrap_or_default();
+        // Bind session → account so later /responses with this file_id stay sticky.
+        // (Do not content-hash the raw multipart envelope — boundaries make it useless.)
+        if status.is_success() {
+            if let Some(key) = session_key.as_ref() {
+                if config.session_affinity {
+                    crate::session_affinity::bind(
+                        key,
+                        &account.id,
+                        config.session_affinity_ttl_secs,
+                    );
+                }
+            }
+        }
+        return Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+
+    let reqwest_method = match method {
+        Method::GET => reqwest::Method::GET,
+        Method::DELETE => reqwest::Method::DELETE,
+        Method::POST => reqwest::Method::POST,
+        other => {
+            return error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                format!("files proxy does not support {other}"),
+            );
+        }
+    };
+    match crate::gateway::files_api::proxy_files_json(
+        &http,
+        &config.xai_base_url,
+        &token,
+        reqwest_method,
+        path,
+        None,
+    )
+    .await
+    {
+        Ok((code, value)) => {
+            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+            (status, Json(value)).into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
+    }
 }
 
 /// Poll a deferred video job. Uses sticky account from submit when known;

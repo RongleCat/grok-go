@@ -44,6 +44,13 @@
 1. 怀疑 sanitize 覆盖不全 → 看 `sanitize.rs` 与相关单测
 2. 抓一份最小复现请求体（脱敏）再改转换逻辑
 
+## Codex 读多文件/多图后 token 暴涨或任务强制停止
+
+1. 现象：跑一段时间停、重启同一会话又停，goal 也救不了 → 多半是会话 history 已塞满 base64/大 tool 输出
+2. 网关侧：`payload_optimize` 会去重/折叠历史图、截断大段 tool 输出、有图时 `store:false`；≥32KB 文本尝试 Files `file_id` 分流
+3. 日志里搜 `payload optimized` / `files offload` / `uploaded large blob`
+4. 客户端已毒化的线程：建议 **新开会话**；旧 transcript 本地仍大
+5. 细节见 [[../concepts/payload-optimize]]
 
 ## 概览/账号页：`expected value at line 1 column 1`
 
@@ -59,4 +66,5 @@
 - [[../modules/routing]]
 - [[../modules/mcp-tools]]
 - [[../concepts/request-sanitize]]
+- [[../concepts/payload-optimize]]
 - [[../queries/faq]]

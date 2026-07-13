@@ -43,3 +43,12 @@ cd src-tauri && cargo check
 
 - X: [@cgnot996](https://x.com/cgnot996)
 - GitHub Issues: https://github.com/RongleCat/grok-go/issues
+
+## Releases
+
+1. Write bilingual notes under `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`.
+2. Commit on a clean `main`.
+3. Run `./scripts/release-tag.sh X.Y.Z` (optionally `--push`).
+4. CI builds installers and sets the **GitHub Release body** from that CHANGELOG section via `scripts/changelog-for-release.py`.
+
+Do not tag without a matching CHANGELOG section — the release job will fail.

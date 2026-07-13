@@ -76,6 +76,27 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      # Release description = CHANGELOG.md section for this version (bilingual body).
+      # Fails the job if `## [X.Y.Z]` is missing — write changelog before tagging.
+      # (v0.1.4 and earlier used a static template; from next release this takes effect.)
+      - name: Prepare release notes from CHANGELOG
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VER="${{ github.ref_name }}"
+          else
+            VER="v$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          fi
+          python3 scripts/changelog-for-release.py "$VER" | tee release-notes.md
+          # Multiline body for tauri-action `releaseBody` (no releaseBodyFile input).
+          {
+            echo "RELEASE_BODY<<GROKGO_EOF"
+            cat release-notes.md
+            echo "GROKGO_EOF"
+          } >> "$GITHUB_ENV"
+
       # NOTE: Do NOT pass empty APPLE_* / TAURI_SIGNING_* secrets.
       # Empty APPLE_CERTIFICATE makes `tauri build` try codesign import and fail with:
       #   "failed to import keychain certificate"
@@ -90,20 +111,7 @@ jobs:
           # Prefer the pushed git tag; fallback replaces __VERSION__ from tauri.conf.json
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseName: "GrokGo v__VERSION__"
-          releaseBody: |
-            ## GrokGo desktop release
-
-            Download the installer for your platform from **Assets**.
-
-            | Platform | File (typical) |
-            |----------|----------------|
-            | macOS Apple Silicon | `*.dmg` |
-            | macOS Intel | `*.dmg` |
-            | Windows x64 | `*-setup.exe` / `*.msi` |
-
-            ### Notes
-            - **macOS** (unsigned / not notarized): if macOS says the app is damaged or cannot be verified, run `xattr -cr /Applications/GrokGo.app`, or right-click → Open. See README for details.
-            - **Windows** may show SmartScreen until code signing is configured.
+          releaseBody: ${{ env.RELEASE_BODY }}
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

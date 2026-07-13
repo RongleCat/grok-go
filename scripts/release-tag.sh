@@ -5,6 +5,12 @@
 #   ./scripts/release-tag.sh 0.1.1 --push
 #
 # Does NOT push by default. CI (.github/workflows/release.yml) runs on tag push v*.
+#
+# Release notes (GitHub Release body) are generated from CHANGELOG.md by CI:
+#   scripts/changelog-for-release.py → release-notes.md → tauri-action releaseBodyFile
+# Before tagging, ensure CHANGELOG has a section:
+#   ## [X.Y.Z] - YYYY-MM-DD
+# with bilingual (EN + 中文) notes under Added/Fixed/Changed as needed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +44,13 @@ if git rev-parse "$TAG" >/dev/null 2>&1; then
   echo "error: tag already exists: $TAG" >&2
   exit 1
 fi
+
+# Fail early if CHANGELOG section is missing (CI would fail the same way).
+if ! python3 scripts/changelog-for-release.py "$VERSION" >/dev/null; then
+  echo "error: add bilingual release notes under ## [$VERSION] in CHANGELOG.md first." >&2
+  exit 1
+fi
+echo "==> CHANGELOG section for $VERSION OK (will become GitHub Release body)"
 
 echo "==> Bumping version to $VERSION"
 

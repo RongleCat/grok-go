@@ -441,21 +441,27 @@ export function IntegrationsPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <p className="text-sm text-neutral-600 dark:text-neutral-400">
-                  {t.integrations.claudeCodeDesc}
-                </p>
+                {t.integrations.claudeCodeDesc ? (
+                  <p className="text-sm text-neutral-600 dark:text-neutral-400">
+                    {t.integrations.claudeCodeDesc}
+                  </p>
+                ) : null}
                 <div className="space-y-1 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2.5 dark:border-neutral-800 dark:bg-neutral-900/40">
                   <div className="text-xs font-medium text-neutral-500">
                     {t.integrations.claudeCodeBaseUrl}
                   </div>
                   <div className="truncate font-mono text-sm">{claudeBaseUrl}</div>
-                  <p className="text-[11px] text-neutral-400">
-                    {t.integrations.claudeCodeBaseUrlHint}
-                  </p>
+                  {t.integrations.claudeCodeBaseUrlHint ? (
+                    <p className="text-[11px] text-neutral-400">
+                      {t.integrations.claudeCodeBaseUrlHint}
+                    </p>
+                  ) : null}
                 </div>
-                <p className="text-xs text-amber-600/90 dark:text-amber-400/90">
-                  {t.integrations.claudeCodeRestartHint}
-                </p>
+                {t.integrations.claudeCodeRestartHint ? (
+                  <p className="text-xs text-amber-600/90 dark:text-amber-400/90">
+                    {t.integrations.claudeCodeRestartHint}
+                  </p>
+                ) : null}
               </CardContent>
             </Card>
 
@@ -465,11 +471,6 @@ export function IntegrationsPage() {
               </CardHeader>
               <CardContent className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0 space-y-1">
-                  <p className="text-sm text-neutral-500">
-                    {t.integrations.importClaudeCcSwitch}
-                    {" · "}
-                    app_type=claude
-                  </p>
                   <p className="truncate font-mono text-[11px] text-neutral-400">
                     {status.ccSwitchDbPath}
                   </p>
@@ -513,9 +514,11 @@ export function IntegrationsPage() {
                     <CardTitle className="text-base">
                       {t.integrations.claudeCodeSnippet}
                     </CardTitle>
-                    <p className="text-sm text-neutral-500">
-                      {t.integrations.claudeCodeSnippetDesc}
-                    </p>
+                    {t.integrations.claudeCodeSnippetDesc ? (
+                      <p className="text-sm text-neutral-500">
+                        {t.integrations.claudeCodeSnippetDesc}
+                      </p>
+                    ) : null}
                   </div>
                   <Button
                     size="sm"
@@ -621,7 +624,7 @@ export function IntegrationsPage() {
                           {title}
                         </Badge>
                       </div>
-                      <p className="mt-0.5 text-xs text-neutral-500">{desc}</p>
+                      {desc ? <p className="mt-0.5 text-xs text-neutral-500">{desc}</p> : null}
                     </div>
                   </label>
                 );
@@ -666,12 +669,16 @@ export function IntegrationsPage() {
               <CardContent className="space-y-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div className="min-w-0 space-y-1.5">
-                    <p className="text-sm text-neutral-600 dark:text-neutral-400">
-                      {t.integrations.grokBuildDesc}
-                    </p>
-                    <p className="text-xs text-amber-600/90 dark:text-amber-400/90">
-                      {t.integrations.grokBuildRestartHint}
-                    </p>
+                    {t.integrations.grokBuildDesc ? (
+                      <p className="text-sm text-neutral-600 dark:text-neutral-400">
+                        {t.integrations.grokBuildDesc}
+                      </p>
+                    ) : null}
+                    {t.integrations.grokBuildRestartHint ? (
+                      <p className="text-xs text-amber-600/90 dark:text-amber-400/90">
+                        {t.integrations.grokBuildRestartHint}
+                      </p>
+                    ) : null}
                   </div>
                   <div className="flex shrink-0 flex-col items-end gap-2">
                     <Switch
@@ -714,9 +721,11 @@ export function IntegrationsPage() {
                     <div className="mt-0.5 text-sm font-medium text-neutral-800 dark:text-neutral-100">
                       {status.grokBuildAccountCount ?? 0}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-neutral-500">
-                      {t.integrations.grokBuildAccountsHint}
-                    </div>
+                    {t.integrations.grokBuildAccountsHint ? (
+                      <div className="mt-0.5 text-[11px] text-neutral-500">
+                        {t.integrations.grokBuildAccountsHint}
+                      </div>
+                    ) : null}
                   </div>
                   <div className="rounded-lg border border-neutral-200/80 bg-neutral-50/80 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900/40">
                     <div className="text-[11px] uppercase tracking-wide text-neutral-400">
@@ -743,9 +752,11 @@ export function IntegrationsPage() {
                         ? t.integrations.grokBuildInjected
                         : t.integrations.grokBuildRestoreUnavailable}
                     </div>
-                    <div className="mt-0.5 text-[11px] text-neutral-500">
-                      {t.integrations.grokBuildBackupHint}
-                    </div>
+                    {t.integrations.grokBuildBackupHint ? (
+                      <div className="mt-0.5 text-[11px] text-neutral-500">
+                        {t.integrations.grokBuildBackupHint}
+                      </div>
+                    ) : null}
                   </div>
                 </div>
 

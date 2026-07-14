@@ -1,5 +1,39 @@
 # Wiki 日志
 
+## 2026-07-14（关窗：托盘隐藏 / 二次确认退出）
+
+- **关闭时最小化到托盘 = 开**：关窗 `hide` + `skip_taskbar` + macOS `ActivationPolicy::Accessory`（去掉程序坞/任务栏图标，保留托盘）；托盘/菜单可 `Regular` 后再打开。
+- **关闭时最小化到托盘 = 关**：关窗二次确认，确认后 `exit(0)` 停止进程与本地代理。
+- 托盘左键切换显示/隐藏时同样走 hide/show 辅助函数。
+
+## 2026-07-14（Grok Build auth.json 定时校验同步）
+
+- 后台 maintainer（启动约 45s 后首跑，之后每 **15 分钟**）：仅在 `cli_chat_proxy` 已指向本机网关时执行。
+- 流程：选池内最优 OAuth 账号 → `refresh_account` → **`GET userinfo` 探针**（auth.x.ai）→ 仅 `Valid` 才写入 `~/.grok/auth.json`；失败则不动现有文件。
+- 开启集成时同一条路径（`require_success`）；最多试 3 个候选账号；写锁避免与定时任务竞态。
+
+## 2026-07-14（Grok Build 开启后跳网页授权）
+
+- 根因：`sync_grok_build_session_auth` 无条件用账号池覆盖 `~/.grok/auth.json`，且刷新失败时仍写入可能已过期的 access token；Grok 启动 silent refresh 失败就打开浏览器。
+- 修复：强制 `refresh_account` + 近过期拒绝写入；`expires_at` 优先用 JWT exp；合并保留 profile 字段。
+- 后续改为 userinfo 探针 + 定时 maintainer（见上条）。
+
+## 2026-07-14（UI 文案精简）
+
+- 全站中英文案去啰嗦与技术细节：概览导入弹窗、账号导入说明、集成 Claude/Grok Build、设置分流、备份分区说明等。
+- 空字符串说明在页面侧条件渲染，避免空白行。
+
+## 2026-07-14（概览页 CC Switch 导入二选一）
+
+- 概览「同步到 CC Switch」改为「导入到 CC Switch」。
+- 点击后弹窗选择 **Codex** 或 **Claude Code**，分别调用 `import_to_cc_switch` / `import_claude_to_cc_switch`。
+
+## 2026-07-14（CC Switch Claude 导入误匹配 DeepSeek）
+
+- 根因：`find_existing_grokgo_provider_for_app` 对 Claude 使用 `settings_config LIKE '%ANTHROPIC_BASE_URL%'`，几乎所有第三方 Claude provider（DeepSeek/Kimi/…）都会命中，导致 UPDATE 改名/改 notes 却留下对方 `website_url`/`icon`/env。
+- 修复：严格身份（`name=GrokGo` / 我方 notes / Codex fingerprints / Claude 仅匹配本机网关 base）；UPDATE 时完整重写 `settings_config` + `website_url` 并清空 `icon`/`icon_color`；INSERT 写入本地 website_url。
+- 回归测：`find_claude_provider_ignores_third_party_anthropic_env`。
+
 ## 2026-07-14（集成页 Claude Code + CC Switch）
 
 - 集成页新增 **Claude Code** 选项卡：说明 `ANTHROPIC_BASE_URL`、可复制 env 片段。

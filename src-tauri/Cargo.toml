@@ -41,6 +41,7 @@ parking_lot = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 open = "5"
+rfd = "0.15"
 bytes = "1"
 http-body-util = "0.1"
 hyper = "1"

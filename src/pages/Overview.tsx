@@ -3,6 +3,7 @@ import { api, type AppStatus, type HeatmapDay } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Dialog } from "@/components/ui/dialog";
 import { Heatmap } from "@/components/heatmap";
 import { formatNumber, formatUsd } from "@/lib/utils";
 import { useI18n } from "@/i18n/context";
@@ -10,6 +11,8 @@ import { PageLoading } from "@/components/page-loading";
 import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { useToast } from "@/components/ui/toast";
 import { Copy, Download, Eye, EyeOff, RefreshCw } from "lucide-react";
+
+type CcSwitchTarget = "codex" | "claude";
 
 const HEATMAP_DAYS = 371;
 
@@ -54,6 +57,7 @@ export function OverviewPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [importing, setImporting] = useState(false);
+  const [ccSwitchOpen, setCcSwitchOpen] = useState(false);
   const [showToken, setShowToken] = useState(false);
 
   async function refresh() {
@@ -93,12 +97,16 @@ export function OverviewPage() {
     }
   }
 
-  async function importCcSwitch() {
+  async function importCcSwitch(target: CcSwitchTarget) {
     setImporting(true);
     try {
-      const msg = await api.importToCcSwitch();
+      const msg =
+        target === "claude"
+          ? await api.importClaudeToCcSwitch()
+          : await api.importToCcSwitch();
       // Prefer backend humanized message (update vs create, MCP notes, etc.).
       toast(msg?.trim() || t.overview.importCcSwitchSuccess, "success");
+      setCcSwitchOpen(false);
     } catch (e) {
       const raw = String(e);
       // Tauri often wraps as `... error message`; surface the useful part.
@@ -229,9 +237,13 @@ export function OverviewPage() {
         <Card>
           <CardHeader className="flex flex-row items-center justify-between gap-4 space-y-0 py-3">
             <CardTitle className="text-base">{t.overview.endpoints}</CardTitle>
-            <Button size="sm" onClick={importCcSwitch} disabled={importing}>
+            <Button
+              size="sm"
+              onClick={() => setCcSwitchOpen(true)}
+              disabled={importing}
+            >
               <Download className="h-4 w-4" />
-              {importing ? t.common.loading : t.overview.importCcSwitch}
+              {importing ? t.overview.importCcSwitchImporting : t.overview.importCcSwitch}
             </Button>
           </CardHeader>
           <CardContent className="space-y-2">
@@ -310,6 +322,57 @@ export function OverviewPage() {
 
         {error ? <div className="text-sm text-amber-600">{error}</div> : null}
       </PageBody>
+
+      <Dialog
+        open={ccSwitchOpen}
+        title={t.overview.importCcSwitchChooseTitle}
+        description={t.overview.importCcSwitchChooseDesc || undefined}
+        onClose={importing ? undefined : () => setCcSwitchOpen(false)}
+      >
+        <div className="space-y-2">
+          <button
+            type="button"
+            disabled={importing}
+            onClick={() => importCcSwitch("codex")}
+            className="flex w-full flex-col items-start gap-0.5 rounded-lg border border-neutral-200 px-3 py-3 text-left transition-colors hover:border-neutral-300 hover:bg-neutral-50 disabled:pointer-events-none disabled:opacity-60"
+          >
+            <span className="text-sm font-medium text-neutral-900">
+              {t.overview.importCcSwitchCodex}
+            </span>
+            {t.overview.importCcSwitchCodexDesc ? (
+              <span className="text-xs text-neutral-500">
+                {t.overview.importCcSwitchCodexDesc}
+              </span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            disabled={importing}
+            onClick={() => importCcSwitch("claude")}
+            className="flex w-full flex-col items-start gap-0.5 rounded-lg border border-neutral-200 px-3 py-3 text-left transition-colors hover:border-neutral-300 hover:bg-neutral-50 disabled:pointer-events-none disabled:opacity-60"
+          >
+            <span className="text-sm font-medium text-neutral-900">
+              {t.overview.importCcSwitchClaude}
+            </span>
+            {t.overview.importCcSwitchClaudeDesc ? (
+              <span className="text-xs text-neutral-500">
+                {t.overview.importCcSwitchClaudeDesc}
+              </span>
+            ) : null}
+          </button>
+          <div className="flex justify-end pt-1">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={importing}
+              onClick={() => setCcSwitchOpen(false)}
+            >
+              {t.common.cancel}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
     </PageShell>
   );
 }

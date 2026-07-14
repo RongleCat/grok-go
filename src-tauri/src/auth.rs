@@ -337,7 +337,7 @@ struct TokenResponse {
     id_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct UserInfo {
     email: Option<String>,
     preferred_username: Option<String>,
@@ -351,33 +351,115 @@ async fn fetch_userinfo(discovery: &Discovery, access_token: &str) -> Option<Use
         .userinfo_endpoint
         .clone()
         .unwrap_or_else(|| "https://auth.x.ai/oauth2/userinfo".into());
-    let client = oauth_http();
-    let resp = match client.get(&url).bearer_auth(access_token).send().await {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::warn!("userinfo request failed: {err}");
-            return None;
+    match userinfo_request(&url, access_token).await {
+        TokenProbe::Valid { profile, .. } => profile,
+        TokenProbe::Invalid { status, detail } => {
+            tracing::warn!(status, %detail, "userinfo rejected token");
+            None
         }
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        tracing::warn!("userinfo fetch failed: {status} {body}");
-        return None;
-    }
-    match resp.json::<UserInfo>().await {
-        Ok(mut info) => {
-            // Some providers put preferred_username under alternate keys only.
-            if info.preferred_username.is_none() {
-                info.preferred_username = info.preferred_username_alt.take();
-            }
-            Some(info)
-        }
-        Err(err) => {
-            tracing::warn!("userinfo json parse failed: {err}");
+        TokenProbe::Unreachable { detail } => {
+            tracing::warn!(%detail, "userinfo unreachable");
             None
         }
     }
+}
+
+/// Result of probing an access token against the OIDC userinfo endpoint.
+#[derive(Debug, Clone)]
+pub enum TokenProbe {
+    /// HTTP 2xx — token is accepted by auth.x.ai.
+    Valid {
+        email: Option<String>,
+        /// Full profile when JSON parsed (login path uses this).
+        profile: Option<UserInfo>,
+    },
+    /// HTTP 401/403 — token rejected / revoked.
+    Invalid { status: u16, detail: String },
+    /// Network / timeout / 5xx — do not treat as "bad token".
+    Unreachable { detail: String },
+}
+
+impl TokenProbe {
+    pub fn is_valid(&self) -> bool {
+        matches!(self, TokenProbe::Valid { .. })
+    }
+}
+
+async fn userinfo_request(url: &str, access_token: &str) -> TokenProbe {
+    let client = oauth_http();
+    let send = client.get(url).bearer_auth(access_token).send();
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(20), send).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(err)) => {
+            return TokenProbe::Unreachable {
+                detail: format!("userinfo request failed: {err}"),
+            };
+        }
+        Err(_) => {
+            return TokenProbe::Unreachable {
+                detail: "userinfo request timed out (20s)".into(),
+            };
+        }
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return match resp.json::<UserInfo>().await {
+            Ok(mut info) => {
+                if info.preferred_username.is_none() {
+                    info.preferred_username = info.preferred_username_alt.take();
+                }
+                let email = info
+                    .email
+                    .clone()
+                    .or_else(|| info.preferred_username.clone())
+                    .filter(|s| !s.is_empty());
+                TokenProbe::Valid {
+                    email,
+                    profile: Some(info),
+                }
+            }
+            Err(err) => {
+                // 2xx but unparseable — still proves the token is accepted by IdP.
+                tracing::warn!("userinfo json parse failed: {err}");
+                TokenProbe::Valid {
+                    email: None,
+                    profile: None,
+                }
+            }
+        };
+    }
+    let body = resp.text().await.unwrap_or_default();
+    let detail = body.chars().take(200).collect::<String>();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return TokenProbe::Invalid {
+            status: status.as_u16(),
+            detail,
+        };
+    }
+    TokenProbe::Unreachable {
+        detail: format!("userinfo HTTP {status}: {detail}"),
+    }
+}
+
+/// Live-check an access token via `GET {issuer}/oauth2/userinfo`.
+///
+/// Used before writing credentials into `~/.grok/auth.json` so we never push a
+/// dead token that forces Grok CLI into browser login.
+pub async fn probe_access_token_userinfo(access_token: &str) -> AppResult<TokenProbe> {
+    let token = access_token.trim();
+    if token.is_empty() {
+        return Ok(TokenProbe::Invalid {
+            status: 0,
+            detail: "empty access token".into(),
+        });
+    }
+    let _ = rebuild_oauth_http_client(&crate::config::load_config().unwrap_or_default());
+    let discovery = fetch_discovery().await?;
+    let url = discovery
+        .userinfo_endpoint
+        .clone()
+        .unwrap_or_else(|| "https://auth.x.ai/oauth2/userinfo".into());
+    Ok(userinfo_request(&url, token).await)
 }
 
 /// Decode JWT payload (no verify) and pull `email` / `preferred_username` claims.

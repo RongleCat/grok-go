@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-14
+
+> 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
+>
+> **Highlight:** Claude Code via local Anthropic Messages compatibility.
+
+### Added
+
+- **Claude Code / Anthropic Messages**: `POST /v1/messages` and `POST /v1/messages/count_tokens` convert to xAI Chat Completions (tools, streaming, model aliases). Set `ANTHROPIC_BASE_URL` to the local gateway root (**without** `/v1`).
+- **Integrations → Claude Code**: base URL snippet, CC Switch Claude provider import (`app_type=claude`), MCP `enabled_claude` upsert.
+- **Overview → Import to CC Switch**: choose **Codex** or **Claude Code** before writing the provider.
+- **Grok Build session maintainer**: while routing is injected, periodically refresh a pool OAuth account, validate via OIDC **userinfo**, then write `~/.grok/auth.json` only if the IdP accepts the token (every ~15 minutes; first tick after ~45s).
+
+### Fixed
+
+- **CC Switch Claude import hijacking DeepSeek**: matching no longer uses bare `ANTHROPIC_BASE_URL`; UPDATE rewrites `website_url` / clears third-party icons so GrokGo is not a renamed DeepSeek row.
+- **Grok Build open → browser login**: avoid overwriting `~/.grok/auth.json` with expired pool tokens; require refresh + userinfo success before write.
+- **Window close UX**: with minimize-to-tray on, hide Dock/taskbar entry while keeping the tray icon; with it off, confirm quit (exiting stops the local gateway).
+
+### Changed
+
+- UI copy trimmed (less technical noise on Integrations / Settings / import dialogs).
+- Account batch-import hint lists CPA and sub2api support.
+
+**中文 · 新增**
+
+- **Claude Code / Anthropic Messages 兼容**：本机 `ANTHROPIC_BASE_URL`（不要带 `/v1`）即可走账号池；流式与工具调用可用。
+- **集成页 Claude Code**：片段复制、CC Switch Claude 应用导入。
+- **概览一键导入 CC Switch**：可选 Codex 或 Claude Code。
+- **Grok Build 会话定时维护**：注入路由后定期刷新 + userinfo 校验，确认有效再写 `auth.json`。
+
+**中文 · 修复**
+
+- **CC Switch 误改 DeepSeek**：严格匹配 GrokGo，完整重写配置字段。
+- **开启 Grok Build 后跳网页授权**：禁止写入未校验/过期 token。
+- **关窗行为**：托盘模式隐藏程序坞/任务栏图标；非托盘二次确认退出（代理随进程停止）。
+
+**中文 · 变更**
+
+- 文案精简；批量导入说明补充 CPA / sub2api。
+
 ## [0.1.6] - 2026-07-14
 
 > 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.

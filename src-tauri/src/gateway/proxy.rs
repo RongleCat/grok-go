@@ -18,6 +18,11 @@ use crate::auth::{
 };
 use crate::config::{load_auth, load_config, resolve_model, AppConfig};
 use crate::error::{AppError, AppResult};
+use crate::gateway::empty_completion::{
+    build_empty_completion_retry_request, extract_completed_response_from_sse, is_responses_path,
+    recovery_quality_score, should_retry_premature_agent_stop, synthesize_forced_tool_response,
+    SSE_BUFFER_LIMIT,
+};
 use crate::gateway::image_bridge::{
     collect_image_gen_calls, fulfill_image_gen_call, inject_image_generation_calls,
     MAX_IMAGE_TOOL_ROUNDS,
@@ -321,6 +326,69 @@ async fn proxy_json_inner(
             apply_status_failure(&mut account, status, &upstream_headers);
             let _ = replace_account_tokens(&account);
         }
+
+        // Responses streams: buffer → detect reasoning-only empty completion → retry once
+        // before the client sees `response.completed` (Codex ends the turn otherwise).
+        let guard_empty = config.empty_completion_retry
+            && is_responses_path(path)
+            && status.is_success()
+            && parsed_request.is_some();
+        if guard_empty {
+            let recovered = buffer_sse_and_recover_empty_completion(
+                upstream,
+                &http,
+                &token,
+                &build_upstream,
+                parsed_request.as_ref().unwrap(),
+                custom_tool_names.as_ref(),
+            )
+            .await?;
+            let (i, o, c) = extract_usage_tokens(&recovered.usage_source);
+            if let Some(rid) = recovered.usage_source.get("id").and_then(|v| v.as_str()) {
+                session_affinity::bind_response_chain(
+                    rid,
+                    &account.id,
+                    config.session_affinity_ttl_secs,
+                );
+            }
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let reason = recovered
+                .retried
+                .then_some("empty-completion-retry".to_string())
+                .or(mapping_reason.clone());
+            log_request(
+                &request_id,
+                Some(account.id.clone()),
+                path,
+                requested_model,
+                resolved_model,
+                status.as_u16(),
+                latency_ms,
+                None,
+                i,
+                o,
+                c,
+                None,
+                client_source,
+                reason,
+            );
+            let mut response = Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .body(Body::from(recovered.sse))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+            for (k, v) in upstream_headers.iter() {
+                let key = k.as_str().to_ascii_lowercase();
+                if matches!(key.as_str(), "x-request-id" | "cache-control") {
+                    if let Ok(name) = HeaderName::from_bytes(k.as_ref()) {
+                        response.headers_mut().insert(name, v.clone());
+                    }
+                }
+            }
+            return Ok(response);
+        }
+
         let custom_names = custom_tool_names.clone();
         // Scan SSE for usage (xAI puts cached_tokens under input_tokens_details).
         // Log on stream drop so streaming traffic is not silently recorded as 0 tokens.
@@ -431,6 +499,41 @@ async fn proxy_json_inner(
                     }
                     Err(err) => {
                         tracing::warn!("image_gen bridge failed: {err}");
+                    }
+                }
+            }
+        }
+
+        // Reasoning-only / narration-only premature stop → silent retry so Codex keeps going.
+        if status.is_success()
+            && config.empty_completion_retry
+            && is_responses_path(path)
+            && should_retry_premature_agent_stop(&value, parsed_request.as_ref())
+        {
+            if let Some(req_template) = parsed_request.as_ref() {
+                match retry_empty_completion_once(
+                    &http,
+                    &token,
+                    &build_upstream,
+                    req_template,
+                    &value,
+                )
+                .await
+                {
+                    Ok(Some(retried)) => {
+                        value = retried;
+                        mapping_reason = Some("empty-completion-retry".into());
+                        tracing::warn!(
+                            "recovered premature agent stop (empty/narration) via non-stream retry"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "premature agent stop retry still empty/narration; passing through"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "empty-completion retry failed");
                     }
                 }
             }
@@ -627,6 +730,205 @@ fn push_sse(out: &mut String, event: &str, data: &Value) {
     out.push_str("data: ");
     out.push_str(&data.to_string());
     out.push_str("\n\n");
+}
+
+struct EmptyCompletionStreamResult {
+    sse: String,
+    /// Best-effort JSON used for usage / session-id extraction.
+    usage_source: Value,
+    retried: bool,
+}
+
+/// Buffer an upstream Responses SSE, rewrite custom tools, and if the completed
+/// payload is reasoning-only, retry once (non-stream) with a recovery nudge.
+async fn buffer_sse_and_recover_empty_completion<F>(
+    upstream: reqwest::Response,
+    http: &reqwest::Client,
+    token: &str,
+    build_upstream: &F,
+    original_request: &Value,
+    custom_names: &HashSet<String>,
+) -> AppResult<EmptyCompletionStreamResult>
+where
+    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
+{
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut stream = upstream.bytes_stream();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AppError::msg(format!("sse buffer read: {e}")))?;
+        if buf.len() + chunk.len() > SSE_BUFFER_LIMIT {
+            truncated = true;
+            // Keep a prefix so we can still return something useful.
+            let room = SSE_BUFFER_LIMIT.saturating_sub(buf.len());
+            if room > 0 {
+                buf.extend_from_slice(&chunk[..room.min(chunk.len())]);
+            }
+            break;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    let rewritten = rewrite_sse_chunk(&Bytes::from(buf), custom_names);
+    let mut sse = String::from_utf8_lossy(&rewritten).into_owned();
+    let mut usage_source = extract_completed_response_from_sse(&sse).unwrap_or(json!({}));
+    let mut retried = false;
+
+    if truncated {
+        tracing::warn!(
+            limit = SSE_BUFFER_LIMIT,
+            "SSE exceeded empty-completion buffer limit; skipping recovery"
+        );
+        return Ok(EmptyCompletionStreamResult {
+            sse,
+            usage_source,
+            retried,
+        });
+    }
+
+    // Only retry when we successfully parsed a completed premature-stop response.
+    // Missing `response.completed` must not be treated as empty (would spuriously retry).
+    if let Some(completed) = extract_completed_response_from_sse(&sse) {
+        usage_source = completed;
+        if should_retry_premature_agent_stop(&usage_source, Some(original_request)) {
+            match retry_empty_completion_once(
+                http,
+                token,
+                build_upstream,
+                original_request,
+                &usage_source,
+            )
+            .await
+            {
+                Ok(Some(mut value)) => {
+                    if !custom_names.is_empty() {
+                        let _ = rewrite_responses_payload(&mut value, custom_names);
+                    }
+                    sse = responses_json_to_sse(&value);
+                    usage_source = value;
+                    retried = true;
+                    tracing::warn!(
+                        "recovered premature agent stop (empty/narration) via buffered stream retry"
+                    );
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "premature agent stop stream retry still empty/narration; \
+                         passing original SSE"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "empty-completion stream retry failed; passing original SSE"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(EmptyCompletionStreamResult {
+        sse,
+        usage_source,
+        retried,
+    })
+}
+
+/// Up to two silent non-stream recovery attempts for premature agent stops.
+///
+/// One attempt is not always enough: empty → narration-only still ends Codex.
+/// Returns `Ok(Some(value))` when a non-premature payload is obtained, or when
+/// a partial recovery is *better* than the original empty (e.g. message > pure
+/// reasoning). `Ok(None)` only when nothing improved.
+async fn retry_empty_completion_once<F>(
+    http: &reqwest::Client,
+    token: &str,
+    build_upstream: &F,
+    original_request: &Value,
+    empty_response: &Value,
+) -> AppResult<Option<Value>>
+where
+    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
+{
+    // One soft retry (pinned tool_choice); if still narration, inject a synthetic call.
+    // Two soft retries burned ~5s without producing tools (see session 019f5eaf).
+    const MAX_ATTEMPTS: u32 = 1;
+    let mut seed = empty_response.clone();
+    let mut best = empty_response.clone();
+    let mut best_score = recovery_quality_score(&best);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let retry_req = build_empty_completion_retry_request(original_request, &seed);
+        let retry_body = Bytes::from(serde_json::to_vec(&retry_req)?);
+        let resp = build_upstream(http, token, retry_body)
+            .send()
+            .await
+            .map_err(|e| AppError::msg(format!("empty-completion retry send: {e}")))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                attempt,
+                %status,
+                body = %body.chars().take(240).collect::<String>(),
+                "empty-completion retry upstream non-success"
+            );
+            // Keep best partial if we already improved over pure empty.
+            break;
+        }
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = resp.bytes().await?;
+        let value = if content_type.contains("text/event-stream") || content_type.contains("stream")
+        {
+            let text = String::from_utf8_lossy(&bytes);
+            extract_completed_response_from_sse(&text).ok_or_else(|| {
+                AppError::msg("empty-completion retry stream missing response.completed")
+            })?
+        } else {
+            serde_json::from_slice::<Value>(&bytes)?
+        };
+        let score = recovery_quality_score(&value);
+        if score > best_score {
+            best = value.clone();
+            best_score = score;
+        }
+        if !should_retry_premature_agent_stop(&value, Some(original_request)) {
+            if attempt > 1 {
+                tracing::warn!(attempt, "premature agent stop cleared after multi-retry");
+            }
+            return Ok(Some(value));
+        }
+        tracing::warn!(
+            attempt,
+            max = MAX_ATTEMPTS,
+            score,
+            "recovery attempt still empty/narration; retrying if budget remains"
+        );
+        seed = value;
+    }
+    // Soft retries (even with tool_choice pin) often still return narration.
+    // Hard guarantee: inject a real function_call so Codex keeps the turn alive.
+    if let Some(forced) = synthesize_forced_tool_response(original_request, &best) {
+        tracing::warn!(
+            best_score,
+            "recovery exhausted; injecting synthetic tool call to keep Codex loop alive"
+        );
+        return Ok(Some(forced));
+    }
+    let original_score = recovery_quality_score(empty_response);
+    if best_score > original_score {
+        tracing::warn!(
+            best_score,
+            original_score,
+            "recovery exhausted; returning best partial instead of pure empty"
+        );
+        return Ok(Some(best));
+    }
+    Ok(None)
 }
 
 /// Last-resort request: only plain user/assistant text messages.
@@ -1433,13 +1735,27 @@ pub async fn fetch_upstream_models(config: &AppConfig) -> AppResult<Value> {
 }
 
 fn curated_models(config: &AppConfig) -> Value {
-    json!({
-        "object": "list",
-        "data": [
-            {"id": config.default_model, "object": "model", "owned_by": "xai", "modality": "text"},
-            {"id": "grok-4.20-reasoning", "object": "model", "owned_by": "xai", "modality": "text"},
-            {"id": config.default_image_model, "object": "model", "owned_by": "xai", "modality": "image"},
-            {"id": config.default_video_model, "object": "model", "owned_by": "xai", "modality": "video"}
-        ]
-    })
+    use crate::config::known_xai_text_models;
+    let mut data = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut push = |id: &str, modality: &str| {
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            return;
+        }
+        data.push(json!({
+            "id": id,
+            "object": "model",
+            "owned_by": "xai",
+            "modality": modality,
+        }));
+    };
+    push(&config.default_model, "text");
+    for id in known_xai_text_models() {
+        push(id, "text");
+    }
+    push(&config.default_image_model, "image");
+    push("grok-imagine-image", "image");
+    push(&config.default_video_model, "video");
+    push("grok-imagine-video-1.5", "video");
+    json!({ "object": "list", "data": data })
 }

@@ -50,6 +50,11 @@ export type AppConfig = {
   preferSoonestReset?: boolean;
   /** Soft per-account in-flight preference cap; 0 = unlimited (default 6). */
   accountMaxConcurrency?: number;
+  /**
+   * Silently retry once when /v1/responses returns reasoning-only empty
+   * completion (no message/tool call). Prevents Codex mid-task stop. Default true.
+   */
+  emptyCompletionRetry?: boolean;
   autoInjectCodexMcp: boolean;
   launchOnStartup: boolean;
   minimizeToTray: boolean;

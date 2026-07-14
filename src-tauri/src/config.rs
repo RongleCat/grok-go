@@ -48,6 +48,11 @@ pub struct AppConfig {
     /// Soft per-account in-flight cap used as a pick preference. 0 = unlimited. Default 6.
     #[serde(default = "default_account_max_concurrency")]
     pub account_max_concurrency: u32,
+    /// When true, `/v1/responses` silently retries once if upstream returns a
+    /// reasoning-only empty completion (no message / tool call). Prevents Codex
+    /// from ending the turn mid-task. Default true.
+    #[serde(default = "default_true")]
+    pub empty_completion_retry: bool,
     pub auto_inject_codex_mcp: bool,
     pub launch_on_startup: bool,
     pub minimize_to_tray: bool,
@@ -192,6 +197,7 @@ impl Default for AppConfig {
             quota_aware_routing: true,
             prefer_soonest_reset: false,
             account_max_concurrency: 6,
+            empty_completion_retry: true,
             auto_inject_codex_mcp: false,
             launch_on_startup: false,
             minimize_to_tray: true,
@@ -744,15 +750,113 @@ pub fn random_token() -> String {
         .collect()
 }
 
+/// Known xAI **text** model ids (from `GET /v1/models`). Media models are separate.
+/// Kept in sync with public xAI catalog; curated `/v1/models` list uses this.
+pub fn known_xai_text_models() -> &'static [&'static str] {
+    &[
+        "grok-4.5",
+        "grok-4.3",
+        "grok-4.20-0309-reasoning",
+        "grok-4.20-0309-non-reasoning",
+        "grok-4.20-multi-agent-0309",
+        "grok-build-0.1",
+    ]
+}
+
+/// Models written into the CC Switch / Codex provider import catalog.
+///
+/// Only ids that are usable day-to-day with GrokGo + Codex (picker + depth).
+/// Other xAI text ids may still pass through the gateway, but are not offered
+/// in the imported provider model list.
+pub fn cc_switch_import_models() -> &'static [&'static str] {
+    &["grok-4.5", "grok-4.3"]
+}
+
+/// Default model id for CC Switch import when the app default is not in
+/// [`cc_switch_import_models`].
+pub fn cc_switch_import_default_model(app_default: &str) -> &'static str {
+    let trimmed = app_default.trim();
+    cc_switch_import_models()
+        .iter()
+        .find(|id| id.eq_ignore_ascii_case(trimmed))
+        .copied()
+        .unwrap_or("grok-4.5")
+}
+
+/// Effort levels accepted by xAI `reasoning.effort` for a text model (live-probed).
+///
+/// - `grok-4.5` / multi-agent: `low` | `medium` | `high` (no `none`, no `xhigh`)
+/// - `grok-4.3`: also accepts `none`
+/// - `grok-4.20-*-reasoning/non-reasoning` and `grok-build-0.1`: reject effort
+///
+/// Used by CC Switch import (`model_reasoning_effort` + catalog
+/// `supported_reasoning_levels`) so Codex can show depth controls only where
+/// the upstream API actually accepts them.
+pub fn xai_model_reasoning_efforts(model_id: &str) -> Option<&'static [&'static str]> {
+    let id = model_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    // Exact first, then case-insensitive match against known catalog.
+    let canon = known_xai_text_models()
+        .iter()
+        .find(|m| m.eq_ignore_ascii_case(id))
+        .copied()
+        .unwrap_or(id);
+    match canon {
+        "grok-4.5" | "grok-4.20-multi-agent-0309" => Some(&["low", "medium", "high"]),
+        "grok-4.3" => Some(&["none", "low", "medium", "high"]),
+        _ => None,
+    }
+}
+
+/// Default Codex `model_reasoning_effort` when the model supports depth control.
+pub fn xai_model_default_reasoning_effort(model_id: &str) -> Option<&'static str> {
+    xai_model_reasoning_efforts(model_id).map(|_| "medium")
+}
+
+/// True for image/video Imagine model ids (not used as Codex primary chat model).
+pub fn is_xai_media_model_id(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    lower.contains("imagine")
+        || lower.contains("image")
+        || lower.contains("video")
+        || lower.contains("tts")
+        || lower.contains("voice")
+}
+
 pub fn resolve_model(config: &AppConfig, requested: &str) -> (String, String) {
-    if let Some(mapped) = config.model_mappings.get(requested) {
+    let trimmed = requested.trim();
+    if trimmed.is_empty() {
+        return (config.default_model.clone(), "default-fallback".into());
+    }
+    if let Some(mapped) = config.model_mappings.get(trimmed) {
         return (mapped.clone(), "mapped".into());
     }
-    let lower = requested.to_lowercase();
-    let is_media = lower.contains("image") || lower.contains("video") || lower.contains("imagine");
+    // Case-insensitive map lookup.
+    let lower = trimmed.to_lowercase();
+    for (k, v) in &config.model_mappings {
+        if k.to_lowercase() == lower {
+            return (v.clone(), "mapped".into());
+        }
+    }
+    let is_media = is_xai_media_model_id(trimmed);
     let looks_like_grok = lower.starts_with("grok-") || lower.starts_with("grok");
+    // Known text catalog ids pass through as-is.
+    if known_xai_text_models()
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(trimmed))
+    {
+        // Preserve canonical casing from catalog when possible.
+        let canon = known_xai_text_models()
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(trimmed))
+            .copied()
+            .unwrap_or(trimmed);
+        return (canon.to_string(), "passthrough".into());
+    }
     if looks_like_grok && !is_media {
-        return (requested.to_string(), "passthrough".into());
+        return (trimmed.to_string(), "passthrough".into());
     }
     (config.default_model.clone(), "default-fallback".into())
 }
@@ -778,6 +882,46 @@ mod tests {
     fn strip_bom_and_whitespace() {
         assert_eq!(strip_utf8_bom("\u{feff}{\"a\":1}"), "{\"a\":1}");
         assert_eq!(strip_utf8_bom("plain"), "plain");
+    }
+
+    #[test]
+    fn reasoning_efforts_only_for_probed_models() {
+        assert_eq!(
+            xai_model_reasoning_efforts("grok-4.5"),
+            Some(&["low", "medium", "high"][..])
+        );
+        assert_eq!(
+            xai_model_reasoning_efforts("GROK-4.3"),
+            Some(&["none", "low", "medium", "high"][..])
+        );
+        assert_eq!(
+            xai_model_reasoning_efforts("grok-4.20-multi-agent-0309"),
+            Some(&["low", "medium", "high"][..])
+        );
+        assert!(xai_model_reasoning_efforts("grok-4.20-0309-reasoning").is_none());
+        assert!(xai_model_reasoning_efforts("grok-4.20-0309-non-reasoning").is_none());
+        assert!(xai_model_reasoning_efforts("grok-build-0.1").is_none());
+        assert_eq!(xai_model_default_reasoning_effort("grok-4.5"), Some("medium"));
+        assert!(xai_model_default_reasoning_effort("grok-build-0.1").is_none());
+    }
+
+    #[test]
+    fn resolve_passes_known_text_models_and_maps_gpt() {
+        let cfg = AppConfig::default();
+        let (m, reason) = resolve_model(&cfg, "grok-4.3");
+        assert_eq!(m, "grok-4.3");
+        assert_eq!(reason, "passthrough");
+        let (m2, r2) = resolve_model(&cfg, "grok-4.20-0309-reasoning");
+        assert_eq!(m2, "grok-4.20-0309-reasoning");
+        assert_eq!(r2, "passthrough");
+        // Unknown Cursor-style names fall back to default Grok (not a real xAI id).
+        let (m3, r3) = resolve_model(&cfg, "Composer 2.5");
+        assert_eq!(m3, "grok-4.5");
+        assert_eq!(r3, "default-fallback");
+        // Explicit gpt → grok aliases still map.
+        let (m4, r4) = resolve_model(&cfg, "gpt-5.5");
+        assert_eq!(m4, "grok-4.5");
+        assert_eq!(r4, "mapped");
     }
 
     #[test]

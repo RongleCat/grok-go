@@ -52,6 +52,15 @@
 4. 客户端已毒化的线程：建议 **新开会话**；旧 transcript 本地仍大
 5. 细节见 [[../concepts/payload-optimize]]
 
+## Codex 刚开始探索就自己停了（无报错）
+
+1. 现象 A：`task_complete`、无 assistant 正文，最后一轮只有 `reasoning`
+2. 现象 B：有一句「先对照… / Let me…」状态话，但没有 tool call 就结束
+3. 根因：上游 premature stop；Codex 不会自动续跑
+4. 网关侧：`empty_completion_retry`（默认 true）对 empty + narration 静默重试一次；日志搜 `recovered premature agent stop` / `empty-completion-retry`
+5. 若仍停：确认 `emptyCompletionRetry` 未关；可手动发「继续」
+6. 细节见 [[../concepts/empty-completion-retry]]
+
 ## 概览/账号页：`expected value at line 1 column 1`
 
 1. 这是 `config.json` / `auth.json` JSON 解析失败（常见：空文件、写一半崩溃、Windows 记事本 BOM）
@@ -67,4 +76,5 @@
 - [[../modules/mcp-tools]]
 - [[../concepts/request-sanitize]]
 - [[../concepts/payload-optimize]]
+- [[../concepts/empty-completion-retry]]
 - [[../queries/faq]]

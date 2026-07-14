@@ -30,9 +30,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   const toast = useCallback((message: string, kind: ToastKind = "success") => {
     const id = nextId++;
     setItems((prev) => [...prev, { id, message, kind }]);
+    // Longer for multi-line / error detail so users can read gateway paths etc.
+    const ms = message.includes("\n") || kind === "error" ? 5200 : 3200;
     window.setTimeout(() => {
       setItems((prev) => prev.filter((t) => t.id !== id));
-    }, 3200);
+    }, ms);
   }, []);
 
   const value = useMemo(() => ({ toast }), [toast]);
@@ -45,7 +47,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           <div
             key={item.id}
             className={cn(
-              "pointer-events-auto rounded-lg border px-3 py-2 text-sm shadow-lg backdrop-blur",
+              "pointer-events-auto rounded-lg border px-3 py-2 text-sm shadow-lg backdrop-blur whitespace-pre-wrap break-words",
               item.kind === "success" && "border-emerald-200 bg-emerald-50 text-emerald-900",
               item.kind === "info" && "border-neutral-200 bg-white text-neutral-800",
               item.kind === "warning" && "border-amber-200 bg-amber-50 text-amber-950",

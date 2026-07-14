@@ -50,6 +50,11 @@ Authorization = "Bearer <localToken>"
 - 若 `auto_inject_codex_mcp` 为 true，或本机 `~/.codex/config.toml` 已注入 grok-go MCP：
   - provider 的 `config` TOML 会附带 `[mcp_servers.grok-go]`
   - 同时 upsert `mcp_servers` 表（`enabled_codex=1`）
+- `modelCatalog` **仅**挂实测可用模型：`grok-4.5`、`grok-4.3`（含思考深度字段）
+  - `grok-4.5`：`low|medium|high`
+  - `grok-4.3`：额外含 `none`
+  - 其余 xAI 文本 id（4.20 固定变体 / multi-agent / build）不进导入列表
+- provider `config` TOML：`model` 钳制到上述列表，并含 `model_reasoning_effort = "medium"`
 
 ## UI 入口
 

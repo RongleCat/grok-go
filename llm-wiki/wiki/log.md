@@ -1,5 +1,51 @@
 # Wiki 日志
 
+## 2026-07-14（CC 导入思考深度）
+
+- 实测 xAI 接受 `reasoning.effort` 的模型：`grok-4.5`、`grok-4.3`、`grok-4.20-multi-agent-0309`。
+- CC Switch 导入：上述模型写入 `supported_reasoning_levels` / `default_reasoning_level`；默认模型另写 `model_reasoning_effort`。
+- 固定深度变体（4.20 reasoning/non-reasoning、build）不挂深度字段，避免 Codex 发无效 effort。
+
+## 2026-07-14（CC 导入仅保留 4.5 / 4.3）
+
+- 用户实测 multi-agent / 4.20 / build 等在 Codex 侧不可用；导入 catalog 仅 `grok-4.5` + `grok-4.3`。
+- 默认模型不在列表时钳制为 `grok-4.5`，仍带 `model_reasoning_effort`。
+
+## 2026-07-14（reasoning-only 空完成恢复）
+
+- 现象：Grok 返回仅 `reasoning` 的 `completed`，Codex `task_complete` 且无消息，任务中途停。
+- 产品侧：`empty_completion` 检测 + `/v1/responses` 静默重试一次（流式缓冲 / 非流式 JSON）；配置 `emptyCompletionRetry` 默认 true。
+- 文档：[[concepts/empty-completion-retry]]；更新 [[modules/gateway]]、[[modules/config-runtime]]。
+
+## 2026-07-14（narration-only 提前结束）
+
+- 现象：有一句「先对照…」类状态消息、无 tool call，Codex 仍 `task_complete`。
+- 扩展：`is_narration_only_premature_stop` + 统一 `should_retry_premature_agent_stop`；tools 请求下短过渡话静默重试。
+- 文档：更新 [[concepts/empty-completion-retry]]。
+
+## 2026-07-14（合成 tool call 硬续跑）
+
+- 实测：`tool_choice=required` / 软重试仍返回 narration（session `019f5eaf`），best-partial 无法推进循环。
+- 最终兜底：`synthesize_forced_tool_response` 注入 `exec_command` 探测命令；软重试降为 1 次 + 固定 function tool_choice。
+- 文档：更新 [[concepts/empty-completion-retry]]。
+
+## 2026-07-14（通用化 premature 检测）
+
+- 去掉中英「先/正在/let me」业务向词表；改为结构规则：tools + 无 tool_call + 非终态。
+- 合成命令固定 `echo grok-go-continue`，不再从 input 抽路径 `ls`。
+- 文档：更新 [[concepts/empty-completion-retry]]。
+
+## 2026-07-14（CC 导入模型 / 日志 token / image_gen 入账）
+
+- CC Switch 导入：`model_provider=grok-go`，modelCatalog 挂 xAI 全部文本模型（去掉 Composer / 图片模型）。
+- Codex `image_gen` 桥接调用写入 request_logs（`image-gen-bridge`）。
+- 日志来源/端点单元格上下排列；总量 token = input+output（input 已含 cache，不再加 cache）。
+
+## 2026-07-14（CC Switch 同步 upsert + 人性化提示）
+
+- 已有 GrokGo provider 时 UPDATE，并清理重复条目；首次才 INSERT。
+- 成功/失败中文提示（含网关地址、MCP 状态）；Toast 支持多行与更长展示。
+
 ## 2026-07-14（UI 空状态 / 滚动 / 概览 Token）
 
 - 统一 `EmptyState`（icon + 文案居中）；`PageShell`/`PageBody` 容器内滚动。

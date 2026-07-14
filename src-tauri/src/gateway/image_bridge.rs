@@ -2,15 +2,19 @@
 //! them with xAI Grok Imagine, so Codex sees "built-in" image generation behavior
 //! when using grok-go as the Responses backend.
 
+use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
+use uuid::Uuid;
 use crate::auth::ensure_fresh_token;
 use crate::config::{load_auth, AppConfig};
 use crate::error::AppResult;
 use crate::gateway::media_artifacts::{materialize_image_response, materialize_image_response_sync};
 use crate::paths::artifacts_dir;
 use crate::router::{pick_account_for, replace_account_tokens, MediaCapability};
+use crate::usage::{enqueue_request_log, estimate_cost, RequestLog};
 
 /// Names we treat as Codex / OpenAI image generation tools.
 pub fn is_image_gen_name(name: &str) -> bool {
@@ -116,7 +120,16 @@ pub async fn fulfill_image_gen_call(
     let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 4) as usize;
     let model = config.default_image_model.clone();
 
+    let mut account_id: Option<String> = None;
     let token = if let Some(t) = sticky_token.map(str::trim).filter(|s| !s.is_empty()) {
+        // Best-effort: resolve account id for usage logs when parent /responses stickied us.
+        if let Ok(store) = load_auth() {
+            account_id = store
+                .accounts
+                .iter()
+                .find(|a| a.access_token.as_deref() == Some(t))
+                .map(|a| a.id.clone());
+        }
         t.to_string()
     } else {
         let store = load_auth()?;
@@ -126,6 +139,7 @@ pub async fn fulfill_image_gen_call(
         if account.access_token != before {
             replace_account_tokens(&account)?;
         }
+        account_id = Some(account.id.clone());
         t
     };
 
@@ -151,6 +165,7 @@ pub async fn fulfill_image_gen_call(
     };
 
     let url = format!("{}{}", config.xai_base_url.trim_end_matches('/'), path);
+    let started = Instant::now();
     let resp = client
         .post(&url)
         .bearer_auth(&token)
@@ -160,6 +175,16 @@ pub async fn fulfill_image_gen_call(
         .await?;
     let status = resp.status();
     let value: Value = resp.json().await.unwrap_or(json!({}));
+    let latency_ms = started.elapsed().as_millis() as u64;
+    log_image_bridge_request(
+        account_id.as_deref(),
+        path,
+        &model,
+        status.as_u16(),
+        latency_ms,
+        &value,
+    );
+
     if !status.is_success() {
         return Ok(function_call_output(
             &call_id,
@@ -199,6 +224,57 @@ pub async fn fulfill_image_gen_call(
     });
 
     Ok(function_call_output(&call_id, output_payload.to_string()))
+}
+
+/// Record bridge-side `/images/*` calls (Codex tool loop bypasses `proxy_json`).
+fn log_image_bridge_request(
+    account_id: Option<&str>,
+    path: &str,
+    model: &str,
+    status_code: u16,
+    latency_ms: u64,
+    value: &Value,
+) {
+    let usage = value.get("usage").cloned().unwrap_or(json!({}));
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_tokens = usage
+        .get("cache_read_input_tokens")
+        .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    enqueue_request_log(RequestLog {
+        request_id: Uuid::new_v4().to_string(),
+        account_id: account_id.map(|s| s.to_string()),
+        endpoint: path.to_string(),
+        requested_model: Some(model.to_string()),
+        resolved_model: Some(model.to_string()),
+        status_code,
+        latency_ms,
+        first_token_ms: None,
+        input_tokens,
+        output_tokens,
+        cache_tokens,
+        estimated_cost_usd: estimate_cost(input_tokens, output_tokens, cache_tokens),
+        error_summary: if (200..400).contains(&status_code) {
+            None
+        } else {
+            Some(value.to_string().chars().take(500).collect())
+        },
+        // Distinct from direct `/v1/images/*` (`images`) and MCP (`mcp-image`).
+        client_source: "image-gen-bridge".into(),
+        created_at: Utc::now(),
+    });
 }
 
 /// Convert fulfilled image outputs into Codex-friendly `image_generation_call` items

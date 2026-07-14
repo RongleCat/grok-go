@@ -28,6 +28,7 @@
 - [[concepts/model-mapping]]：请求模型名如何解析到 xAI 模型
 - [[concepts/request-sanitize]]：Codex Responses payload 清洗与回写
 - [[concepts/payload-optimize]]：多轮大文件/图片 token 膨胀抑制与 Files `file_id` 分流
+- [[concepts/empty-completion-retry]]：reasoning-only 空完成检测与静默重试（防 Codex 中途停）
 - [[concepts/account-quota]]：SuperGrok 周配额 vs API rate-limit 头，如何取剩余用量与重置时间
 
 ## 操作手册

@@ -1,3 +1,4 @@
+pub mod empty_completion;
 pub mod files_api;
 pub mod image_bridge;
 pub mod job_affinity;

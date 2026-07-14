@@ -384,10 +384,20 @@ export function IntegrationsPage() {
                     setBusy("cc");
                     try {
                       const msg = await api.importToCcSwitch();
-                      toast(msg || t.integrations.importCcSwitch, "success");
+                      toast(msg?.trim() || t.overview.importCcSwitchSuccess, "success");
                       await load();
                     } catch (e) {
-                      toast(String(e), "error");
+                      const raw = String(e);
+                      const cleaned = raw
+                        .replace(/^Error:\s*/i, "")
+                        .replace(/^.*failed to.*?[:：]\s*/i, "")
+                        .trim();
+                      toast(
+                        cleaned
+                          ? `${t.overview.importCcSwitchFailed}\n${cleaned}`
+                          : t.overview.importCcSwitchFailed,
+                        "error"
+                      );
                     } finally {
                       setBusy(null);
                     }

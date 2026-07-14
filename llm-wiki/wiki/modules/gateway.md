@@ -43,6 +43,7 @@
 - 多轮体积极膨胀抑制：`payload_optimize`（去重/折叠/截断 + `store:false`）
 - 大文本 Files 分流：`files_api` + `offload_large_text_blobs`（`input_file.file_id`）
 - image tool 服务端闭环：`proxy::run_image_gen_tool_loop` + `image_bridge`
+- **reasoning-only 空完成恢复**：`empty_completion` + `proxy` 在返回客户端前静默重试一次（见 [[../concepts/empty-completion-retry]]）
 - 视频 job 记住账号：`job_affinity`
 
 ## 相关页面
@@ -52,11 +53,13 @@
 - [[routing]]
 - [[../concepts/request-sanitize]]
 - [[../concepts/payload-optimize]]
+- [[../concepts/empty-completion-retry]]
 - [[media-artifacts]]
 
 ## 来源
 
 - `src-tauri/src/gateway/server.rs`
 - `src-tauri/src/gateway/proxy.rs`
+- `src-tauri/src/gateway/empty_completion.rs`
 - `src-tauri/src/gateway/payload_optimize.rs`
 - `src-tauri/src/gateway/files_api.rs`

@@ -96,10 +96,22 @@ export function OverviewPage() {
   async function importCcSwitch() {
     setImporting(true);
     try {
-      await api.importToCcSwitch();
-      toast(t.overview.importCcSwitchSuccess, "success");
+      const msg = await api.importToCcSwitch();
+      // Prefer backend humanized message (update vs create, MCP notes, etc.).
+      toast(msg?.trim() || t.overview.importCcSwitchSuccess, "success");
     } catch (e) {
-      toast(`${t.overview.importCcSwitchFailed}：${e}`, "error");
+      const raw = String(e);
+      // Tauri often wraps as `... error message`; surface the useful part.
+      const cleaned = raw
+        .replace(/^Error:\s*/i, "")
+        .replace(/^.*failed to.*?[:：]\s*/i, "")
+        .trim();
+      toast(
+        cleaned
+          ? `${t.overview.importCcSwitchFailed}\n${cleaned}`
+          : t.overview.importCcSwitchFailed,
+        "error"
+      );
     } finally {
       setImporting(false);
     }
@@ -131,8 +143,8 @@ export function OverviewPage() {
     );
   }
 
-  const totalTokens =
-    status.today.inputTokens + status.today.outputTokens + status.today.cacheTokens;
+  // input already includes cache hits — do not add cacheTokens again.
+  const totalTokens = status.today.inputTokens + status.today.outputTokens;
 
   return (
     <PageShell>

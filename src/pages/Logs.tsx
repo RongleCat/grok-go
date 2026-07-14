@@ -17,7 +17,10 @@ const PAGE_SIZE = 50;
 const ROW_HEIGHT = 56;
 const OVERSCAN = 8;
 
-/** Dense token cell: total + in/out/cache + hit rate when cache > 0. */
+/**
+ * Dense token cell: total + in/out/cache + hit rate when cache > 0.
+ * `inputTokens` already includes cache hits — total is input+output only.
+ */
 function TokenCell({
   log,
   labels,
@@ -33,7 +36,8 @@ function TokenCell({
   const input = log.inputTokens || 0;
   const output = log.outputTokens || 0;
   const cache = log.cacheTokens || 0;
-  const total = input + output + cache;
+  // Actual request tokens (prompt already includes cache reads).
+  const total = input + output;
   const detail = `${labels.tokenIn} ${formatNumber(input)} · ${labels.tokenOut} ${formatNumber(output)} · ${labels.tokenCache} ${formatNumber(cache)}`;
   const hit = formatCacheHitRate(input, cache);
 
@@ -282,14 +286,21 @@ export function LogsPage() {
                         </div>
                       </div>
                       <div
-                        className="min-w-0 truncate text-[11px] leading-tight"
-                        title={[log.clientSource || "—", log.endpoint].filter(Boolean).join(" / ")}
+                        className="min-w-0 leading-tight"
+                        title={[log.clientSource || "—", log.endpoint].filter(Boolean).join("\n")}
                       >
-                        <span className="text-neutral-700">{log.clientSource || "—"}</span>
-                        <span className="text-neutral-300"> / </span>
-                        <span className="font-mono text-[10px] text-neutral-500">
+                        <div
+                          className="truncate text-[11px] font-medium text-neutral-800"
+                          title={log.clientSource || undefined}
+                        >
+                          {log.clientSource || "—"}
+                        </div>
+                        <div
+                          className="mt-0.5 truncate font-mono text-[10px] text-neutral-500"
+                          title={log.endpoint}
+                        >
                           {log.endpoint}
-                        </span>
+                        </div>
                       </div>
                       <div className="min-w-0 truncate text-xs">
                         <div className="truncate" title={log.resolvedModel || undefined}>

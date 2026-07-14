@@ -666,54 +666,164 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
         let export_path = crate::paths::app_home()?.join("cc-switch-provider-export.json");
         fs::write(&export_path, serde_json::to_string_pretty(&payload)?)?;
         return Ok(format!(
-            "CC Switch DB not found. Exported provider JSON to {}{}",
-            export_path.display(),
-            if include_mcp { " (includes MCP)" } else { "" }
+            "未检测到 CC Switch 数据库（{}）。已把配置导出到：\n{}\n请先安装并打开一次 CC Switch，或在 CC Switch 里手动导入该 JSON。",
+            db_path.display(),
+            export_path.display()
         ));
     }
 
-    let conn = Connection::open(&db_path)?;
-    let id = Uuid::new_v4().to_string();
+    let conn = Connection::open(&db_path).map_err(|e| {
+        AppError::msg(format!(
+            "无法打开 CC Switch 数据库（{}）：{e}\n请确认 CC Switch 已关闭占用或路径正确。",
+            db_path.display()
+        ))
+    })?;
+
     let name = "GrokGo";
     let settings = provider_settings_config(&config, include_mcp);
     let settings_text = serde_json::to_string(&settings)?;
     let now = Utc::now().timestamp_millis();
     let notes = if include_mcp {
-        "Imported from GrokGo (provider + MCP)"
+        "由 GrokGo 同步（含 MCP）"
     } else {
-        "Imported from GrokGo"
+        "由 GrokGo 同步"
     };
-    conn.execute(
-        r#"
-        INSERT INTO providers (
-          id, app_type, name, settings_config, website_url, category, created_at,
-          sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue,
-          cost_multiplier, limit_daily_usd, limit_monthly_usd, provider_type
-        ) VALUES (?1,'codex',?2,?3,NULL,'custom',?4,NULL,?5,NULL,NULL,'{}',0,0,'1.0',NULL,NULL,NULL)
-        "#,
-        params![id, name, settings_text, now, notes],
-    )?;
 
-    let mut mcp_note = String::new();
+    // Prefer updating an existing GrokGo Codex provider instead of inserting duplicates.
+    let existing = find_existing_grokgo_provider(&conn)?;
+    let (action_zh, provider_id) = if let Some((id, _created)) = existing {
+        conn.execute(
+            r#"
+            UPDATE providers
+            SET name = ?1,
+                settings_config = ?2,
+                notes = ?3,
+                category = 'custom'
+            WHERE id = ?4 AND app_type = 'codex'
+            "#,
+            params![name, settings_text, notes, id],
+        )
+        .map_err(|e| AppError::msg(format!("更新 CC Switch 中的 GrokGo 配置失败：{e}")))?;
+        // Clean accidental duplicate GrokGo rows from older versions that always INSERT.
+        let removed = remove_duplicate_grokgo_providers(&conn, &id).unwrap_or(0);
+        let mut action = "已更新".to_string();
+        if removed > 0 {
+            action = format!("已更新（并清理了 {removed} 条重复的 GrokGo 配置）");
+        }
+        (action, id)
+    } else {
+        let id = Uuid::new_v4().to_string();
+        conn.execute(
+            r#"
+            INSERT INTO providers (
+              id, app_type, name, settings_config, website_url, category, created_at,
+              sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue,
+              cost_multiplier, limit_daily_usd, limit_monthly_usd, provider_type
+            ) VALUES (?1,'codex',?2,?3,NULL,'custom',?4,NULL,?5,NULL,NULL,'{}',0,0,'1.0',NULL,NULL,NULL)
+            "#,
+            params![id, name, settings_text, now, notes],
+        )
+        .map_err(|e| AppError::msg(format!("写入 CC Switch 失败：{e}")))?;
+        ("已新增".to_string(), id)
+    };
+
+    let mut mcp_part = String::new();
     if include_mcp {
         match upsert_cc_switch_mcp_server(&conn, &config) {
-            Ok(msg) => mcp_note = format!("; {msg}"),
+            Ok(msg) => {
+                if msg.contains("updated") {
+                    mcp_part = " MCP 已同步更新。".into();
+                } else if msg.contains("inserted") {
+                    mcp_part = " MCP 已一并写入。".into();
+                } else if msg.contains("missing") {
+                    mcp_part = " （当前 CC Switch 版本无 MCP 表，已跳过 MCP）".into();
+                } else {
+                    mcp_part = format!(" MCP：{msg}");
+                }
+            }
             Err(err) => {
                 tracing::warn!("cc-switch mcp_servers upsert failed: {err}");
-                mcp_note = format!("; MCP table upsert skipped: {err}");
+                mcp_part = " Provider 已就绪，但 MCP 同步失败（可稍后在集成页重试）。".into();
             }
         }
     }
 
-    Ok(format!(
-        "Imported provider into CC Switch with id {id}{}{}",
-        if include_mcp {
-            " (MCP included in provider config)"
+    let import_model = crate::config::cc_switch_import_default_model(&config.default_model);
+    let reasoning_note =
+        if crate::config::xai_model_default_reasoning_effort(import_model).is_some() {
+            " 已启用思考深度（model_reasoning_effort）。"
         } else {
             ""
+        };
+    Ok(format!(
+        "{action_zh} CC Switch 中的 GrokGo 配置。\n已挂载可用模型：grok-4.5 / grok-4.3；默认：{}。{}\n网关：http://{}:{}/v1。{}",
+        import_model,
+        reasoning_note,
+        if config.lan_enabled {
+            local_lan_host()
+        } else {
+            "127.0.0.1".into()
         },
-        mcp_note
-    ))
+        config.actual_port,
+        mcp_part.trim_end(),
+    )
+    .trim()
+    .to_string()
+    + &format!("\n（配置 id：{provider_id}）"))
+}
+
+/// Find existing GrokGo Codex provider: prefer `is_current`, else newest `created_at`.
+fn find_existing_grokgo_provider(conn: &Connection) -> AppResult<Option<(String, i64)>> {
+    // Match by name (primary) or legacy notes from older imports.
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, COALESCE(created_at, 0), COALESCE(is_current, 0)
+            FROM providers
+            WHERE app_type = 'codex'
+              AND (
+                name = 'GrokGo'
+                OR notes LIKE '%GrokGo%'
+                OR settings_config LIKE '%model_providers.grok-go%'
+                OR settings_config LIKE '%"name": "grok-go"%'
+                OR settings_config LIKE '%name = "grok-go"%'
+                OR settings_config LIKE '%name = "GrokGo"%'
+              )
+            ORDER BY is_current DESC, created_at DESC
+            "#,
+        )
+        .map_err(|e| AppError::msg(format!("查询 CC Switch 配置失败：{e}")))?;
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| AppError::msg(format!("查询 CC Switch 配置失败：{e}")))?;
+    if let Some(row) = rows
+        .next()
+        .map_err(|e| AppError::msg(format!("读取 CC Switch 配置失败：{e}")))?
+    {
+        let id: String = row.get(0)?;
+        let created: i64 = row.get(1)?;
+        return Ok(Some((id, created)));
+    }
+    Ok(None)
+}
+
+/// Remove other GrokGo Codex providers after we kept `keep_id`.
+fn remove_duplicate_grokgo_providers(conn: &Connection, keep_id: &str) -> AppResult<usize> {
+    let n = conn.execute(
+        r#"
+        DELETE FROM providers
+        WHERE app_type = 'codex'
+          AND id != ?1
+          AND (
+            name = 'GrokGo'
+            OR notes LIKE '%GrokGo%'
+            OR notes LIKE '%Imported from GrokGo%'
+            OR notes LIKE '%由 GrokGo%'
+          )
+        "#,
+        params![keep_id],
+    )?;
+    Ok(n)
 }
 
 fn codex_mcp_currently_injected() -> bool {
@@ -793,25 +903,38 @@ fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResu
 }
 
 fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
+    use crate::config::{cc_switch_import_default_model, xai_model_default_reasoning_effort};
     let host = if config.lan_enabled {
         local_lan_host()
     } else {
         "127.0.0.1".into()
     };
     let base = format!("http://{}:{}/v1", host, config.actual_port);
+    // Only offer usable Codex models in the imported provider; clamp default
+    // if the app default is something not in the import list.
+    let import_model = cc_switch_import_default_model(&config.default_model);
+    // Use provider id `grok-go` (not anonymous "custom") so CC Switch / Codex UI
+    // can list concrete models instead of a blank custom slot.
     let mut toml = format!(
-        "model_provider = \"custom\"\n\
-         model = \"{}\"\n\
-         disable_response_storage = true\n\
+        "model_provider = \"grok-go\"\n\
+         model = \"{import_model}\"\n"
+    );
+    // Only emit when the default model accepts reasoning.effort (otherwise
+    // Codex may send an effort the upstream rejects).
+    if let Some(effort) = xai_model_default_reasoning_effort(import_model) {
+        toml.push_str(&format!("model_reasoning_effort = \"{effort}\"\n"));
+    }
+    toml.push_str(&format!(
+        "disable_response_storage = true\n\
          \n\
-         [model_providers.custom]\n\
-         name = \"grok-go\"\n\
+         [model_providers.grok-go]\n\
+         name = \"GrokGo\"\n\
          wire_api = \"responses\"\n\
          requires_openai_auth = true\n\
          base_url = \"{}\"\n\
          experimental_bearer_token = \"{}\"\n",
-        config.default_model, base, config.local_token
-    );
+        base, config.local_token
+    ));
     if include_mcp {
         let mcp_url = format!("http://{}:{}/mcp", host, config.actual_port);
         toml.push_str("\n[mcp_servers.grok-go]\n");
@@ -828,11 +951,83 @@ fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json
         "auth": {"OPENAI_API_KEY": config.local_token},
         "config": toml,
         "modelCatalog": {
-            "models": [
-                {"model": config.default_model, "displayName": config.default_model, "contextWindow": 500000}
-            ]
+            "models": codex_model_catalog_models(config)
         }
     })
+}
+
+/// Models shown in CC Switch / Codex picker after GrokGo import.
+///
+/// Only [`crate::config::cc_switch_import_models`] — empirically usable with
+/// Codex + depth UI. No 4.20 fixed variants, multi-agent, build, media, or
+/// Cursor-only names.
+///
+/// Each entry carries Codex catalog reasoning fields
+/// (`default_reasoning_level` / `supported_reasoning_levels`).
+fn codex_model_catalog_models(config: &AppConfig) -> Vec<serde_json::Value> {
+    use crate::config::{
+        cc_switch_import_default_model, cc_switch_import_models, xai_model_default_reasoning_effort,
+        xai_model_reasoning_efforts,
+    };
+    let preferred = cc_switch_import_default_model(&config.default_model);
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut push = |model: &str, display: &str| {
+        if model.is_empty() {
+            return;
+        }
+        if out
+            .iter()
+            .any(|m| m.get("model").and_then(|v| v.as_str()) == Some(model))
+        {
+            return;
+        }
+        let mut entry = json!({
+            "model": model,
+            "displayName": display,
+            "contextWindow": 500000
+        });
+        if let (Some(levels), Some(default_effort)) = (
+            xai_model_reasoning_efforts(model),
+            xai_model_default_reasoning_effort(model),
+        ) {
+            let level_objs: Vec<serde_json::Value> = levels
+                .iter()
+                .map(|effort| {
+                    json!({
+                        "effort": effort,
+                        "description": reasoning_effort_description(effort),
+                    })
+                })
+                .collect();
+            // snake_case matches Codex `cc-switch-model-catalog.json` / native
+            // catalog schema that CC Switch writes on apply.
+            entry["default_reasoning_level"] = json!(default_effort);
+            entry["supported_reasoning_levels"] = json!(level_objs);
+            entry["supports_reasoning_summaries"] = json!(true);
+            // camelCase mirrors (in case a CC Switch build reads these)
+            entry["defaultReasoningLevel"] = json!(default_effort);
+            entry["supportedReasoningLevels"] = json!(level_objs);
+            entry["supportsReasoningSummaries"] = json!(true);
+        }
+        out.push(entry);
+    };
+    // Preferred default first for nicer picker UX, then the rest of the allowlist.
+    push(preferred, preferred);
+    for id in cc_switch_import_models() {
+        push(id, id);
+    }
+    out
+}
+
+fn reasoning_effort_description(effort: &str) -> &'static str {
+    match effort {
+        "none" => "No extra reasoning — fastest replies",
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        _ => "Reasoning effort level",
+    }
 }
 
 fn provider_export_json(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
@@ -942,6 +1137,96 @@ mod tests {
         assert!(!body.contains("`video_generate`"));
         assert!(!body.contains("`video_edit`"));
         assert!(body.contains("与仓库开发用"));
+    }
+
+    #[test]
+    fn model_catalog_includes_only_usable_import_models() {
+        let cfg = AppConfig::default();
+        let models = codex_model_catalog_models(&cfg);
+        let ids: Vec<&str> = models
+            .iter()
+            .filter_map(|m| m.get("model").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(ids, vec!["grok-4.5", "grok-4.3"]);
+        // Unusable / unoffered in import.
+        for bad in [
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-0309-non-reasoning",
+            "grok-4.20-multi-agent-0309",
+            "grok-build-0.1",
+            "composer",
+            "imagine",
+        ] {
+            assert!(
+                !ids.iter().any(|id| id.to_ascii_lowercase().contains(bad)),
+                "unexpected model containing {bad}: {ids:?}"
+            );
+        }
+        let settings = provider_settings_config(&cfg, false);
+        let toml = settings.get("config").and_then(|c| c.as_str()).unwrap_or("");
+        assert!(toml.contains("model_provider = \"grok-go\""));
+        assert!(toml.contains("model = \"grok-4.5\""));
+        assert!(toml.contains("[model_providers.grok-go]"));
+        assert!(!toml.contains("model_provider = \"custom\""));
+    }
+
+    #[test]
+    fn model_catalog_marks_reasoning_depth_for_import_models() {
+        let cfg = AppConfig::default();
+        let models = codex_model_catalog_models(&cfg);
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|m| m.get("model").and_then(|v| v.as_str()) == Some(id))
+                .cloned()
+                .expect(id)
+        };
+
+        let g45 = by_id("grok-4.5");
+        assert_eq!(
+            g45.get("default_reasoning_level").and_then(|v| v.as_str()),
+            Some("medium")
+        );
+        let levels: Vec<&str> = g45["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l.get("effort").and_then(|e| e.as_str()))
+            .collect();
+        assert_eq!(levels, vec!["low", "medium", "high"]);
+        assert!(!levels.contains(&"none"));
+        assert!(!levels.contains(&"xhigh"));
+
+        let g43 = by_id("grok-4.3");
+        let levels43: Vec<&str> = g43["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l.get("effort").and_then(|e| e.as_str()))
+            .collect();
+        assert_eq!(levels43, vec!["none", "low", "medium", "high"]);
+
+        // Default is clamped into the import allowlist → always has effort.
+        let settings = provider_settings_config(&cfg, false);
+        let toml = settings["config"].as_str().unwrap();
+        assert!(toml.contains("model_reasoning_effort = \"medium\""));
+
+        // App default outside allowlist still imports as grok-4.5 + effort.
+        let mut cfg2 = AppConfig::default();
+        cfg2.default_model = "grok-build-0.1".into();
+        let models2 = codex_model_catalog_models(&cfg2);
+        let ids2: Vec<&str> = models2
+            .iter()
+            .filter_map(|m| m.get("model").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(ids2, vec!["grok-4.5", "grok-4.3"]);
+        let toml2 = provider_settings_config(&cfg2, false)["config"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(toml2.contains("model = \"grok-4.5\""));
+        assert!(toml2.contains("model_reasoning_effort = \"medium\""));
+        assert!(!toml2.contains("grok-build-0.1"));
     }
 
     #[test]

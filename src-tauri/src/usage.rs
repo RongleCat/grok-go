@@ -351,7 +351,7 @@ impl UsageStore {
             let day = DateTime::parse_from_rfc3339(&created_at)
                 .map(|d| d.with_timezone(&chrono::Local).date_naive().to_string())
                 .unwrap_or_else(|_| created_at.chars().take(10).collect());
-            let tokens = input_tokens + output_tokens + cache_tokens;
+            let tokens = total_tokens(input_tokens, output_tokens, cache_tokens);
             let entry = by_day.entry(day).or_insert((0, 0, 0.0));
             entry.0 += 1;
             entry.1 += tokens;
@@ -395,11 +395,21 @@ pub fn empty_summary() -> UsageSummary {
 }
 
 pub fn estimate_cost(input_tokens: u64, output_tokens: u64, cache_tokens: u64) -> f64 {
-    // rough placeholder pricing for UI until official rates are configured
-    let input = input_tokens as f64 / 1_000_000.0 * 3.0;
+    // rough placeholder pricing for UI until official rates are configured.
+    // `input_tokens` is total prompt (includes cache reads). Bill uncached at full
+    // rate and cached subset at the discounted rate — never charge full+cache.
+    let cache = cache_tokens.min(input_tokens);
+    let uncached = input_tokens.saturating_sub(cache);
+    let input = uncached as f64 / 1_000_000.0 * 3.0;
+    let cached = cache as f64 / 1_000_000.0 * 0.75;
     let output = output_tokens as f64 / 1_000_000.0 * 15.0;
-    let cache = cache_tokens as f64 / 1_000_000.0 * 0.75;
-    input + output + cache
+    input + cached + output
+}
+
+/// Total tokens for a single request for display/aggregation.
+/// Prompt `input` already includes cache hits — do not add `cache` again.
+pub fn total_tokens(input_tokens: u64, output_tokens: u64, _cache_tokens: u64) -> u64 {
+    input_tokens.saturating_add(output_tokens)
 }
 
 

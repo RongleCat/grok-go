@@ -28,15 +28,23 @@ export function formatTokenCompact(n: number): string {
 }
 
 /**
- * Prompt-cache hit rate when upstream reports cache_read separately.
- * Uses cache / max(input, cache) so a pure-cache edge case stays ≤100%.
+ * Prompt-cache hit rate when upstream reports cache_read as a subset of input.
+ * `inputTokens` is total prompt (includes cache); rate = cache / input.
  */
 export function cacheHitRatePercent(inputTokens: number, cacheTokens: number): number | null {
   const input = inputTokens || 0;
   const cache = cacheTokens || 0;
-  if (cache <= 0 && input <= 0) return null;
-  const denom = Math.max(input, cache, 1);
-  return Math.min(100, (cache / denom) * 100);
+  if (cache <= 0 || input <= 0) return cache > 0 ? 100 : null;
+  return Math.min(100, (cache / input) * 100);
+}
+
+/** Actual request tokens for display: prompt (incl. cache) + output. Never add cache twice. */
+export function totalRequestTokens(
+  inputTokens: number,
+  outputTokens: number,
+  _cacheTokens = 0
+): number {
+  return (inputTokens || 0) + (outputTokens || 0);
 }
 
 export function formatCacheHitRate(inputTokens: number, cacheTokens: number): string {

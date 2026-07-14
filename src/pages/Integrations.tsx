@@ -20,7 +20,7 @@ import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { PageLoading } from "@/components/page-loading";
 import { cn } from "@/lib/utils";
 
-type TabId = "codex" | "mcp" | "clients" | "grok-build";
+type TabId = "codex" | "claude-code" | "mcp" | "clients" | "grok-build";
 
 /** Grok Build native multi-account routing (cli-chat-proxy). */
 const SHOW_GROK_BUILD_TAB = true;
@@ -170,6 +170,7 @@ export function IntegrationsPage() {
   const tabs = useMemo(() => {
     const list: { id: TabId; label: string }[] = [
       { id: "codex", label: t.integrations.tabCodex },
+      { id: "claude-code", label: t.integrations.tabClaudeCode },
       { id: "mcp", label: t.integrations.tabMcp },
       { id: "clients", label: t.integrations.tabClients },
     ];
@@ -178,6 +179,26 @@ export function IntegrationsPage() {
     }
     return list;
   }, [t]);
+
+  const claudeBaseUrl = useMemo(() => {
+    if (!config) return "http://127.0.0.1:8787";
+    const host = config.lanEnabled ? "0.0.0.0" : "127.0.0.1";
+    // Prefer actualPort when set; UI status often has the live port in gateway.
+    const port = config.actualPort || config.preferredPort || 8787;
+    // Match backend anthropic_base_url (no /v1). When LAN, backend uses LAN IP;
+    // snippet from status is authoritative when available.
+    if (status?.claudeCodeSnippet) {
+      try {
+        const parsed = JSON.parse(status.claudeCodeSnippet) as {
+          env?: { ANTHROPIC_BASE_URL?: string };
+        };
+        if (parsed.env?.ANTHROPIC_BASE_URL) return parsed.env.ANTHROPIC_BASE_URL;
+      } catch {
+        /* ignore */
+      }
+    }
+    return `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}`;
+  }, [config, status]);
 
   const clients = useMemo(
     () => (config ? buildClientSnippets(config, t) : []),
@@ -405,6 +426,119 @@ export function IntegrationsPage() {
                 >
                   {t.integrations.importCcSwitch}
                 </Button>
+              </CardContent>
+            </Card>
+          </>
+        )}
+
+        {tab === "claude-code" && (
+          <>
+            <Card>
+              <CardHeader className="py-3">
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Plug className="h-4 w-4 text-neutral-500" />
+                  {t.integrations.sectionClaudeCode}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <p className="text-sm text-neutral-600 dark:text-neutral-400">
+                  {t.integrations.claudeCodeDesc}
+                </p>
+                <div className="space-y-1 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2.5 dark:border-neutral-800 dark:bg-neutral-900/40">
+                  <div className="text-xs font-medium text-neutral-500">
+                    {t.integrations.claudeCodeBaseUrl}
+                  </div>
+                  <div className="truncate font-mono text-sm">{claudeBaseUrl}</div>
+                  <p className="text-[11px] text-neutral-400">
+                    {t.integrations.claudeCodeBaseUrlHint}
+                  </p>
+                </div>
+                <p className="text-xs text-amber-600/90 dark:text-amber-400/90">
+                  {t.integrations.claudeCodeRestartHint}
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader className="py-3">
+                <CardTitle className="text-base">{t.integrations.ccSwitch}</CardTitle>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="min-w-0 space-y-1">
+                  <p className="text-sm text-neutral-500">
+                    {t.integrations.importClaudeCcSwitch}
+                    {" · "}
+                    app_type=claude
+                  </p>
+                  <p className="truncate font-mono text-[11px] text-neutral-400">
+                    {status.ccSwitchDbPath}
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  className="shrink-0"
+                  disabled={busy !== null}
+                  onClick={async () => {
+                    setBusy("cc-claude");
+                    try {
+                      const msg = await api.importClaudeToCcSwitch();
+                      toast(msg?.trim() || t.overview.importCcSwitchSuccess, "success");
+                      await load();
+                    } catch (e) {
+                      const raw = String(e);
+                      const cleaned = raw
+                        .replace(/^Error:\s*/i, "")
+                        .replace(/^.*failed to.*?[:：]\s*/i, "")
+                        .trim();
+                      toast(
+                        cleaned
+                          ? `${t.overview.importCcSwitchFailed}\n${cleaned}`
+                          : t.overview.importCcSwitchFailed,
+                        "error"
+                      );
+                    } finally {
+                      setBusy(null);
+                    }
+                  }}
+                >
+                  {t.integrations.importClaudeCcSwitch}
+                </Button>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader className="py-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="space-y-1">
+                    <CardTitle className="text-base">
+                      {t.integrations.claudeCodeSnippet}
+                    </CardTitle>
+                    <p className="text-sm text-neutral-500">
+                      {t.integrations.claudeCodeSnippetDesc}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!status.claudeCodeSnippet}
+                    onClick={() =>
+                      void copyText(
+                        t.integrations.claudeCodeSnippet,
+                        status.claudeCodeSnippet || ""
+                      )
+                    }
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    {t.common.copy}
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <Textarea
+                  readOnly
+                  className="min-h-[200px] font-mono text-xs"
+                  value={status.claudeCodeSnippet || ""}
+                />
               </CardContent>
             </Card>
           </>

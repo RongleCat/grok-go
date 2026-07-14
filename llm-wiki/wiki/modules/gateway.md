@@ -13,6 +13,8 @@
 | POST | `/v1/responses` | Responses API 主入口 |
 | POST | `/v1/responses/compact` | 多轮 compaction |
 | POST | `/v1/chat/completions` | Chat Completions 兼容 |
+| POST | `/v1/messages` | **Anthropic Messages**（Claude Code；转 xAI chat + 回写） |
+| POST | `/v1/messages/count_tokens` | Claude Code token 预检（粗估） |
 | POST | `/v1/images/generations` | 文生图 |
 | POST | `/v1/images/edits` | 图编辑 |
 | POST | `/v1/videos/generations` | 文/图生视频 |
@@ -36,9 +38,10 @@
 
 ## 关键实现点
 
-- 授权：`proxy::authorize_request`
+- 授权：`proxy::authorize_request`（`Bearer` **或** `x-api-key` = `localToken`，兼容 Claude Code）
 - 上游发送：`proxy::send_with_account_failover`（最多 3 账号尝试）
 - 模型解析：`config::resolve_model`
+- **Anthropic Messages**：`gateway/anthropic/*` + `proxy::proxy_anthropic_messages`（Messages ⇄ Chat Completions；流式 SSE 状态机）
 - Responses 清洗：`sanitize::sanitize_responses_request`
 - 多轮体积极膨胀抑制：`payload_optimize`（去重/折叠/截断 + `store:false`）
 - 大文本 Files 分流：`files_api` + `offload_large_text_blobs`（`input_file.file_id`）

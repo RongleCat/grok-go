@@ -79,6 +79,8 @@ pub struct IntegrationStatus {
     pub mcp_snippet: String,
     /// Ready-to-paste standard session routing block.
     pub grok_build_snippet: String,
+    /// Claude Code / CC Switch env JSON (ANTHROPIC_BASE_URL without `/v1`).
+    pub claude_code_snippet: String,
 }
 
 pub fn integration_status() -> AppResult<IntegrationStatus> {
@@ -142,6 +144,7 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
         provider_snippet: provider_snippet(&config),
         mcp_snippet: mcp_snippet(&config),
         grok_build_snippet: grok_build_snippet(&config),
+        claude_code_snippet: claude_code_settings_snippet(&config),
     })
 }
 
@@ -283,6 +286,17 @@ fn gateway_base_url(config: &AppConfig) -> String {
         "127.0.0.1".into()
     };
     format!("http://{}:{}/v1", host, config.actual_port)
+}
+
+/// Claude Code `ANTHROPIC_BASE_URL` — host root **without** `/v1`
+/// (client appends `/v1/messages`).
+fn anthropic_base_url(config: &AppConfig) -> String {
+    let host = if config.lan_enabled {
+        local_lan_host()
+    } else {
+        "127.0.0.1".into()
+    };
+    format!("http://{}:{}", host, config.actual_port)
 }
 
 /// Snippet for copy/paste: standard cli-chat-proxy session routing.
@@ -1139,13 +1153,35 @@ fn backup_codex_agents_md(content: &str) -> AppResult<()> {
 }
 
 pub fn import_cc_switch_provider() -> AppResult<String> {
+    import_cc_switch_provider_for_app("codex")
+}
+
+/// Import GrokGo as a Claude Code provider into CC Switch (`app_type = claude`).
+pub fn import_cc_switch_claude_provider() -> AppResult<String> {
+    import_cc_switch_provider_for_app("claude")
+}
+
+fn import_cc_switch_provider_for_app(app_type: &str) -> AppResult<String> {
+    let app_type = match app_type {
+        "claude" => "claude",
+        _ => "codex",
+    };
     let config = load_config()?;
     // If MCP inject is currently on (flag or live codex config), ship MCP with the provider.
     let include_mcp = config.auto_inject_codex_mcp || codex_mcp_currently_injected();
     let db_path = cc_switch_db_path();
     if !db_path.exists() {
-        let payload = provider_export_json(&config, include_mcp);
-        let export_path = crate::paths::app_home()?.join("cc-switch-provider-export.json");
+        let payload = if app_type == "claude" {
+            claude_provider_export_json(&config)
+        } else {
+            provider_export_json(&config, include_mcp)
+        };
+        let export_name = if app_type == "claude" {
+            "cc-switch-claude-provider-export.json"
+        } else {
+            "cc-switch-provider-export.json"
+        };
+        let export_path = crate::paths::app_home()?.join(export_name);
         fs::write(&export_path, serde_json::to_string_pretty(&payload)?)?;
         return Ok(format!(
             "未检测到 CC Switch 数据库（{}）。已把配置导出到：\n{}\n请先安装并打开一次 CC Switch，或在 CC Switch 里手动导入该 JSON。",
@@ -1162,17 +1198,23 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
     })?;
 
     let name = "GrokGo";
-    let settings = provider_settings_config(&config, include_mcp);
+    let settings = if app_type == "claude" {
+        claude_provider_settings_config(&config)
+    } else {
+        provider_settings_config(&config, include_mcp)
+    };
     let settings_text = serde_json::to_string(&settings)?;
     let now = Utc::now().timestamp_millis();
-    let notes = if include_mcp {
+    let notes = if app_type == "claude" {
+        "由 GrokGo 同步（Claude Code / Anthropic Messages）"
+    } else if include_mcp {
         "由 GrokGo 同步（含 MCP）"
     } else {
         "由 GrokGo 同步"
     };
 
-    // Prefer updating an existing GrokGo Codex provider instead of inserting duplicates.
-    let existing = find_existing_grokgo_provider(&conn)?;
+    // Prefer updating an existing GrokGo provider for this app_type.
+    let existing = find_existing_grokgo_provider_for_app(&conn, app_type)?;
     let (action_zh, provider_id) = if let Some((id, _created)) = existing {
         conn.execute(
             r#"
@@ -1181,13 +1223,12 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
                 settings_config = ?2,
                 notes = ?3,
                 category = 'custom'
-            WHERE id = ?4 AND app_type = 'codex'
+            WHERE id = ?4 AND app_type = ?5
             "#,
-            params![name, settings_text, notes, id],
+            params![name, settings_text, notes, id, app_type],
         )
         .map_err(|e| AppError::msg(format!("更新 CC Switch 中的 GrokGo 配置失败：{e}")))?;
-        // Clean accidental duplicate GrokGo rows from older versions that always INSERT.
-        let removed = remove_duplicate_grokgo_providers(&conn, &id).unwrap_or(0);
+        let removed = remove_duplicate_grokgo_providers_for_app(&conn, app_type, &id).unwrap_or(0);
         let mut action = "已更新".to_string();
         if removed > 0 {
             action = format!("已更新（并清理了 {removed} 条重复的 GrokGo 配置）");
@@ -1201,17 +1242,19 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
               id, app_type, name, settings_config, website_url, category, created_at,
               sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue,
               cost_multiplier, limit_daily_usd, limit_monthly_usd, provider_type
-            ) VALUES (?1,'codex',?2,?3,NULL,'custom',?4,NULL,?5,NULL,NULL,'{}',0,0,'1.0',NULL,NULL,NULL)
+            ) VALUES (?1,?2,?3,?4,NULL,'custom',?5,NULL,?6,NULL,NULL,'{}',0,0,'1.0',NULL,NULL,NULL)
             "#,
-            params![id, name, settings_text, now, notes],
+            params![id, app_type, name, settings_text, now, notes],
         )
         .map_err(|e| AppError::msg(format!("写入 CC Switch 失败：{e}")))?;
         ("已新增".to_string(), id)
     };
 
     let mut mcp_part = String::new();
-    if include_mcp {
-        match upsert_cc_switch_mcp_server(&conn, &config) {
+    // Always try MCP upsert for Claude (enable Claude app flag); for Codex only when include_mcp.
+    let should_mcp = app_type == "claude" || include_mcp;
+    if should_mcp {
+        match upsert_cc_switch_mcp_server_for_app(&conn, &config, app_type) {
             Ok(msg) => {
                 if msg.contains("updated") {
                     mcp_part = " MCP 已同步更新。".into();
@@ -1231,6 +1274,20 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
     }
 
     let import_model = crate::config::cc_switch_import_default_model(&config.default_model);
+    if app_type == "claude" {
+        let base = anthropic_base_url(&config);
+        return Ok(format!(
+            "{action_zh} CC Switch 中的 GrokGo（Claude Code）配置。\n\
+             已写入 ANTHROPIC_BASE_URL={base}（Messages 兼容层）。\n\
+             模型：Haiku/Sonnet/Opus → {import_model}（可在 model_mappings 覆盖）。\n\
+             请在 CC Switch 切换到 Claude 应用并选用 GrokGo，然后重启 Claude Code。{}",
+            mcp_part.trim_end(),
+        )
+        .trim()
+        .to_string()
+            + &format!("\n（配置 id：{provider_id}）"));
+    }
+
     let reasoning_note =
         if crate::config::xai_model_default_reasoning_effort(import_model).is_some() {
             " 已启用思考深度（model_reasoning_effort）。"
@@ -1251,18 +1308,21 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
     )
     .trim()
     .to_string()
-    + &format!("\n（配置 id：{provider_id}）"))
+        + &format!("\n（配置 id：{provider_id}）"))
 }
 
-/// Find existing GrokGo Codex provider: prefer `is_current`, else newest `created_at`.
-fn find_existing_grokgo_provider(conn: &Connection) -> AppResult<Option<(String, i64)>> {
-    // Match by name (primary) or legacy notes from older imports.
+/// Find existing GrokGo provider for `app_type` (`codex` | `claude`).
+fn find_existing_grokgo_provider_for_app(
+    conn: &Connection,
+    app_type: &str,
+) -> AppResult<Option<(String, i64)>> {
+    // Match by name (primary) or legacy notes / config fingerprints.
     let mut stmt = conn
         .prepare(
             r#"
             SELECT id, COALESCE(created_at, 0), COALESCE(is_current, 0)
             FROM providers
-            WHERE app_type = 'codex'
+            WHERE app_type = ?1
               AND (
                 name = 'GrokGo'
                 OR notes LIKE '%GrokGo%'
@@ -1270,13 +1330,14 @@ fn find_existing_grokgo_provider(conn: &Connection) -> AppResult<Option<(String,
                 OR settings_config LIKE '%"name": "grok-go"%'
                 OR settings_config LIKE '%name = "grok-go"%'
                 OR settings_config LIKE '%name = "GrokGo"%'
+                OR settings_config LIKE '%ANTHROPIC_BASE_URL%'
               )
             ORDER BY is_current DESC, created_at DESC
             "#,
         )
         .map_err(|e| AppError::msg(format!("查询 CC Switch 配置失败：{e}")))?;
     let mut rows = stmt
-        .query([])
+        .query(params![app_type])
         .map_err(|e| AppError::msg(format!("查询 CC Switch 配置失败：{e}")))?;
     if let Some(row) = rows
         .next()
@@ -1289,13 +1350,17 @@ fn find_existing_grokgo_provider(conn: &Connection) -> AppResult<Option<(String,
     Ok(None)
 }
 
-/// Remove other GrokGo Codex providers after we kept `keep_id`.
-fn remove_duplicate_grokgo_providers(conn: &Connection, keep_id: &str) -> AppResult<usize> {
+/// Remove other GrokGo providers for `app_type` after we kept `keep_id`.
+fn remove_duplicate_grokgo_providers_for_app(
+    conn: &Connection,
+    app_type: &str,
+    keep_id: &str,
+) -> AppResult<usize> {
     let n = conn.execute(
         r#"
         DELETE FROM providers
-        WHERE app_type = 'codex'
-          AND id != ?1
+        WHERE app_type = ?1
+          AND id != ?2
           AND (
             name = 'GrokGo'
             OR notes LIKE '%GrokGo%'
@@ -1303,7 +1368,7 @@ fn remove_duplicate_grokgo_providers(conn: &Connection, keep_id: &str) -> AppRes
             OR notes LIKE '%由 GrokGo%'
           )
         "#,
-        params![keep_id],
+        params![app_type, keep_id],
     )?;
     Ok(n)
 }
@@ -1318,8 +1383,11 @@ fn codex_mcp_currently_injected() -> bool {
         .unwrap_or(false)
 }
 
-/// Upsert GrokGo into CC Switch `mcp_servers` so MCP can be enabled independently.
-fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResult<String> {
+fn upsert_cc_switch_mcp_server_for_app(
+    conn: &Connection,
+    config: &AppConfig,
+    app_type: &str,
+) -> AppResult<String> {
     let has_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_servers' LIMIT 1",
@@ -1359,19 +1427,77 @@ fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResu
         )
         .unwrap_or(false);
 
+    let enable_codex = app_type == "codex";
+    let enable_claude = app_type == "claude";
+    // When updating for one app, preserve the other flag if the column exists.
+    let has_claude_col = conn
+        .prepare("SELECT enabled_claude FROM mcp_servers LIMIT 0")
+        .is_ok();
+
     if existing {
+        if has_claude_col {
+            if enable_claude {
+                conn.execute(
+                    r#"
+                    UPDATE mcp_servers
+                    SET name = ?1,
+                        server_config = ?2,
+                        description = ?3,
+                        enabled_claude = 1
+                    WHERE id = ?4
+                    "#,
+                    params![name, server_text, description, id],
+                )?;
+                Ok("updated mcp_servers.grok-go (enabled_claude=1)".into())
+            } else {
+                conn.execute(
+                    r#"
+                    UPDATE mcp_servers
+                    SET name = ?1,
+                        server_config = ?2,
+                        description = ?3,
+                        enabled_codex = 1
+                    WHERE id = ?4
+                    "#,
+                    params![name, server_text, description, id],
+                )?;
+                Ok("updated mcp_servers.grok-go (enabled_codex=1)".into())
+            }
+        } else {
+            conn.execute(
+                r#"
+                UPDATE mcp_servers
+                SET name = ?1,
+                    server_config = ?2,
+                    description = ?3,
+                    enabled_codex = 1
+                WHERE id = ?4
+                "#,
+                params![name, server_text, description, id],
+            )?;
+            Ok("updated mcp_servers.grok-go (enabled_codex=1)".into())
+        }
+    } else if has_claude_col {
         conn.execute(
             r#"
-            UPDATE mcp_servers
-            SET name = ?1,
-                server_config = ?2,
-                description = ?3,
-                enabled_codex = 1
-            WHERE id = ?4
+            INSERT INTO mcp_servers (
+              id, name, server_config, description, tags, enabled_codex, enabled_claude
+            ) VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?6)
             "#,
-            params![name, server_text, description, id],
+            params![
+                id,
+                name,
+                server_text,
+                description,
+                if enable_codex { 1 } else { 0 },
+                if enable_claude { 1 } else { 0 }
+            ],
         )?;
-        Ok("updated mcp_servers.grok-go (enabled_codex=1)".into())
+        Ok(format!(
+            "inserted mcp_servers.grok-go (enabled_codex={}, enabled_claude={})",
+            if enable_codex { 1 } else { 0 },
+            if enable_claude { 1 } else { 0 }
+        ))
     } else {
         conn.execute(
             r#"
@@ -1382,6 +1508,45 @@ fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResu
         )?;
         Ok("inserted mcp_servers.grok-go (enabled_codex=1)".into())
     }
+}
+
+/// CC Switch Claude provider `settings_config` shape (env block for Claude Code).
+fn claude_provider_settings_config(config: &AppConfig) -> serde_json::Value {
+    let base = anthropic_base_url(config);
+    let token = config.local_token.trim();
+    let model = crate::config::cc_switch_import_default_model(&config.default_model);
+    // Haiku can map to a lighter model when catalog allows; keep simple: same default
+    // unless user default is already grok-4.3.
+    let haiku = if model == "grok-4.5" {
+        "grok-4.3"
+    } else {
+        model
+    };
+    json!({
+        "env": {
+            "ANTHROPIC_BASE_URL": base,
+            "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_API_KEY": token,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model
+        }
+    })
+}
+
+fn claude_provider_export_json(config: &AppConfig) -> serde_json::Value {
+    json!({
+        "app_type": "claude",
+        "name": "GrokGo",
+        "settings_config": claude_provider_settings_config(config)
+    })
+}
+
+/// Human-readable snippet for the Integrations → Claude Code tab.
+pub fn claude_code_settings_snippet(config: &AppConfig) -> String {
+    let settings = claude_provider_settings_config(config);
+    serde_json::to_string_pretty(&settings).unwrap_or_else(|_| "{}".into())
 }
 
 fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
@@ -1709,6 +1874,50 @@ mod tests {
         assert!(toml2.contains("model = \"grok-4.5\""));
         assert!(toml2.contains("model_reasoning_effort = \"medium\""));
         assert!(!toml2.contains("grok-build-0.1"));
+    }
+
+    #[test]
+    fn claude_provider_settings_has_anthropic_env() {
+        let mut cfg = AppConfig::default();
+        cfg.actual_port = 8787;
+        cfg.preferred_port = 8787;
+        cfg.local_token = "tok_test".into();
+        cfg.default_model = "grok-4.5".into();
+        cfg.lan_enabled = false;
+        let settings = claude_provider_settings_config(&cfg);
+        let env = settings.get("env").expect("env");
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:8787")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()),
+            Some("tok_test")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
+            Some("grok-4.5")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("grok-4.3")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("grok-4.5")
+        );
+        // Must not include /v1 suffix.
+        let base = env
+            .get("ANTHROPIC_BASE_URL")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(!base.ends_with("/v1"));
+
+        let export = claude_provider_export_json(&cfg);
+        assert_eq!(export.get("app_type").and_then(|v| v.as_str()), Some("claude"));
+        assert_eq!(export.get("name").and_then(|v| v.as_str()), Some("GrokGo"));
     }
 
     #[test]

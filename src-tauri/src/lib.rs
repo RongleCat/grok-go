@@ -202,6 +202,7 @@ pub fn run() {
             commands::set_grok_build_inject,
             commands::restore_grok_build_backup,
             commands::import_to_cc_switch,
+            commands::import_claude_to_cc_switch,
             commands::export_provider_snippet,
         ])
         .build(tauri::generate_context!())

@@ -8,7 +8,8 @@ use crate::config::{
 use crate::error::{AppError, AppResult};
 use crate::gateway::server::{start_gateway, GatewayState};
 use crate::integrations::{
-    import_cc_switch_provider, inject_codex_agents_guide, integration_status, set_codex_mcp_inject,
+    import_cc_switch_claude_provider, import_cc_switch_provider, inject_codex_agents_guide,
+    integration_status, set_codex_mcp_inject,
     set_grok_build_inject as set_grok_build_inject_impl,
     restore_grok_build_backup as restore_grok_build_backup_impl, IntegrationStatus,
 };
@@ -711,6 +712,11 @@ pub fn restore_grok_build_backup() -> AppResult<IntegrationStatus> {
 #[tauri::command]
 pub fn import_to_cc_switch() -> AppResult<String> {
     import_cc_switch_provider()
+}
+
+#[tauri::command]
+pub fn import_claude_to_cc_switch() -> AppResult<String> {
+    import_cc_switch_claude_provider()
 }
 
 #[tauri::command]

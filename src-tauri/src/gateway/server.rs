@@ -17,7 +17,10 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::config::{load_auth, load_config, save_config, Account, AppConfig};
 use crate::error::{AppError, AppResult};
-use crate::gateway::proxy::{authorize_request, list_models_response, proxy_json, ProxyContext};
+use crate::gateway::proxy::{
+    authorize_request, list_models_response, proxy_anthropic_count_tokens, proxy_anthropic_messages,
+    proxy_json, ProxyContext,
+};
 use crate::auth::ensure_fresh_token;
 use crate::router::{pick_account_for, replace_account_tokens, MediaCapability};
 use crate::usage::{estimate_cost, RequestLog};
@@ -102,6 +105,9 @@ fn build_router(state: GatewayState) -> Router {
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(responses_compact))
         .route("/v1/chat/completions", post(chat_completions))
+        // Anthropic Messages API (Claude Code via ANTHROPIC_BASE_URL).
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route("/v1/images/generations", post(image_generations))
         .route("/v1/images/edits", post(image_edits))
         .route("/v1/videos/generations", post(video_generations))
@@ -217,6 +223,18 @@ async fn responses_compact(
 
 async fn chat_completions(State(state): State<GatewayState>, headers: HeaderMap, body: Bytes) -> Response {
     proxy_json(&state.proxy, Method::POST, "/chat/completions", headers, body, "openai-compat").await
+}
+
+async fn anthropic_messages(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    proxy_anthropic_messages(&state.proxy, headers, body).await
+}
+
+async fn anthropic_count_tokens(headers: HeaderMap, body: Bytes) -> Response {
+    proxy_anthropic_count_tokens(headers, body).await
 }
 
 async fn image_generations(State(state): State<GatewayState>, headers: HeaderMap, body: Bytes) -> Response {

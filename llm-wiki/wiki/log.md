@@ -1,5 +1,25 @@
 # Wiki 日志
 
+## 2026-07-14（集成页 Claude Code + CC Switch）
+
+- 集成页新增 **Claude Code** 选项卡：说明 `ANTHROPIC_BASE_URL`、可复制 env 片段。
+- `import_claude_to_cc_switch`：写入 CC Switch `app_type=claude` 的 GrokGo provider（env 块）；无 DB 时导出 JSON。
+- MCP upsert 支持 `enabled_claude`；与 Codex 导入分离，避免互相覆盖。
+
+## 2026-07-14（Anthropic Messages 兼容落地）
+
+- 实现自包含转换层 `gateway/anthropic/`（request/response/schema/stream），不引外部协议 crate。
+- 路由：`POST /v1/messages`、`POST /v1/messages/count_tokens`；鉴权接受 `x-api-key` 与 Bearer。
+- 上游走 xAI `/chat/completions` + 现有选号/failover/usage；工具调用双向保真 + 流式 `input_json_delta`。
+- 细节对齐调研：tool_choice 映射、BatchTool 过滤、schema normalize、`disable_parallel_tool_use`。
+- 单测 13 项；全库 `cargo test --lib` 138 通过。
+
+## 2026-07-14（Anthropic / Claude Code 开源方案调研）
+
+- 新建 `queries/anthropic-claude-code-research` + raw 协议笔记。
+- 对比可复用开源：`llm-bridge-core`（Apache 纯协议库，首选）、`anthropic-proxy-rs`（MIT，Claude Code 向但 tool_choice 丢弃）、CLIProxyAPI / CCR（成熟网关，宜抄不宜嵌）、new-api（AGPL 勿嵌）。
+- 明确自补项：`disable_parallel_tool_use`、schema normalize、x-api-key 鉴权、模型映射。
+
 ## 2026-07-14（token / 缓存命中护栏）
 
 - 审计 Grok Build 路径：避免 Codex 专用逻辑破坏 SuperGrok 缓存与重复计费。

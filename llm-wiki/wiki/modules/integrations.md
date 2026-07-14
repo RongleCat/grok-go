@@ -31,7 +31,28 @@ Authorization = "Bearer <localToken>"
 ## CC Switch
 
 - 目标 DB：`~/.cc-switch/cc-switch.db`
-- `import_to_cc_switch` 写入 provider 记录，便于一键切换
+- `import_to_cc_switch` → `app_type=codex`（Responses / OpenAI 兼容）
+- `import_claude_to_cc_switch` → `app_type=claude`（Anthropic Messages env）
+
+### Claude Code provider 形状
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:<port>",
+    "ANTHROPIC_AUTH_TOKEN": "<localToken>",
+    "ANTHROPIC_API_KEY": "<localToken>",
+    "ANTHROPIC_MODEL": "grok-4.5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "grok-4.3",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "grok-4.5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "grok-4.5"
+  }
+}
+```
+
+- `ANTHROPIC_BASE_URL` **不含** `/v1`（Claude Code 会拼 `/v1/messages`）
+- 网关侧由 `gateway/anthropic` 做 Messages ⇄ Chat Completions
+- MCP：同步时对 `mcp_servers.grok-go` 置 `enabled_claude=1`（列存在时）
 
 ## Grok Build / CLI（标准 Session 路由）
 

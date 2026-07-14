@@ -200,6 +200,7 @@ pub fn run() {
             commands::set_mcp_inject,
             commands::inject_agents_guide,
             commands::set_grok_build_inject,
+            commands::restore_grok_build_backup,
             commands::import_to_cc_switch,
             commands::export_provider_snippet,
         ])

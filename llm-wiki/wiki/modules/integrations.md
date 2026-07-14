@@ -33,11 +33,18 @@ Authorization = "Bearer <localToken>"
 - 目标 DB：`~/.cc-switch/cc-switch.db`
 - `import_to_cc_switch` 写入 provider 记录，便于一键切换
 
-## Grok Build / CLI
+## Grok Build / CLI（标准 Session 路由）
 
-- 目标：`~/.grok/config.toml`（或 `$GROK_HOME`）
-- 注入指向本网关的 base URL / 环境变量片段
-- 清理历史错误的单模型 key `grok-go`
+- 目标：`~/.grok/config.toml` + `~/.grok/auth.json`（`$GROK_HOME`）
+- **只支持标准 SuperGrok 路径**（不接 Custom Models / API-key 摸索）：
+  - 写入 `[endpoints] cli_chat_proxy_base_url = "http://127.0.0.1:<port>/v1"`
+  - 等价 env：`GROK_CLI_CHAT_PROXY_BASE_URL`
+  - 开启时把账号池中较优 OAuth 会话同步进 `auth.json`（绕过免费号订阅门闸）
+  - **禁止**写入 `models_base_url`（console API / 计费路径）；若历史误指向本机则清理
+- 网关侧：识别 `X-XAI-Token-Auth` / `x-grok-model-override` / grok-build UA → 上游 `cli_chat_proxy_base_url`（默认 `https://cli-chat-proxy.grok.com/v1`）
+  - 替换客户端 Bearer 为池账号 token；透传 build 头 + session affinity / `prompt_cache_key`
+- 开启前备份到 `~/.grok-go/backups/grok-build-pre-route/`；支持一键还原
+- 清理历史错误：指向本机的 `models_base_url`、单模型 key `grok-go`
 
 ## 运行时 agents-guide
 
@@ -59,7 +66,7 @@ Authorization = "Bearer <localToken>"
 ## UI 入口
 
 - 页面：`src/pages/Integrations.tsx`
-- commands：`get_integrations`、`set_mcp_inject`、`inject_agents_guide`、`set_grok_build_inject`、`import_to_cc_switch`
+- commands：`get_integrations`、`set_mcp_inject`、`inject_agents_guide`、`set_grok_build_inject`、`restore_grok_build_backup`、`import_to_cc_switch`
 
 ## 相关页面
 

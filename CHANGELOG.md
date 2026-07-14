@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-14
+
+> 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
+
+### Added
+
+- **Grok Build multi-account routing (standard Session plane)**: Integrations can point Grok Build `cli_chat_proxy_base_url` at this gateway; pool OAuth sessions sync into `~/.grok/auth.json`; pre-route backup of `config.toml` + `auth.json` with one-click restore.
+- **cli-chat-proxy build plane**: detect `X-XAI-Token-Auth` / `x-grok-model-override` / grok-build UA → upstream `cli-chat-proxy.grok.com` (SuperGrok credits, not console API billing).
+- **Paywall remote routes**: proxy `GET /v1/user`, `/v1/settings`, `/v1/login-config`, `/v1/subagents/bundle` so GrowthBook `allow_access` works.
+- **Codex premature-stop recovery**: structure-based empty/narration completion retry + synthetic shell probe so agent loops keep going (`empty_completion_retry`).
+
+### Fixed
+
+- **Prompt cache / token blow-up on Grok Build**: sticky keys honor `x-grok-conv-id` / `x-grok-session-id` / `x-grok-agent-id`; never overwrite client conv-id with a derived seed; build plane keeps `previous_response_id` / `prompt_cache_retention` / OpenAI-compat body fields; disables empty-completion silent retry, nuclear strip, and Files offload on the build plane (those are Codex/console-only).
+- **cli-chat-proxy 426 Upgrade Required**: inject `x-grok-client-version` (default `0.2.101`) when the client omits it.
+- **Build header passthrough**: forward `User-Agent`, `x-email`, `x-models-etag`, `Accept-Language`, tracing headers; inject a sensible UA when missing.
+- **Codex empty completion / CC Switch import**: recover premature agent stops; tighten CC Switch model catalog import (thinking-depth models only when xAI accepts `reasoning.effort`).
+
+### Changed
+
+- **Account pick soft preference**: prefer JWT `referrer=grok-build` + full CLI scopes / higher tier for SuperGrok-capable pool accounts.
+- **Integrations UI**: Grok Build panel shows protocol, account count, session email/tier/referrer, gate warnings, backup restore.
+
+**中文 · 新增**
+
+- **Grok Build 多账号路由（标准 Session）**：集成页一键写入 `cli_chat_proxy_base_url`；同步账号池到 `~/.grok/auth.json`；开启前备份并可一键还原。
+- **cli-chat-proxy 原生平面**：识别 Build 客户端头 → 上游 SuperGrok 会话面（非 console API 计费）。
+- **订阅门闸远程配置**：透传 `/v1/user`、`/v1/settings` 等，修复 subscription required。
+- **Codex 过早结束恢复**：空完成/纯叙述结构判定 + 软重试 + 合成 shell 探针。
+
+**中文 · 修复**
+
+- **Build 多轮缓存/token**：会话黏连读官方 conv/session 头；保留原生连续性字段；Build 平面关闭 Codex 专用重试/核剥离/Files 分流。
+- **426 版本门闸**：缺 `x-grok-client-version` 时注入默认版本。
+- **Build 头透传**：补齐 UA / email / etag / 语言 / tracing。
+- **Codex 空完成与 CC Switch 导入**收紧。
+
+**中文 · 变更**
+
+- 选号软偏好 `referrer=grok-build` 与更高 JWT tier。
+- 集成页展示 Build 协议、会话与门闸告警、备份还原。
+
 ## [0.1.5] - 2026-07-14
 
 > 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.

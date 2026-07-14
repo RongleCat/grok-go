@@ -41,6 +41,8 @@
 | `codex_config_path` | `~/.codex/config.toml` |
 | `codex_agents_md_path` | `~/.codex/AGENTS.md` |
 | `cc_switch_db_path` | `~/.cc-switch/cc-switch.db` |
+| `cli_chat_proxy_base_url`（AppConfig） | 默认 `https://cli-chat-proxy.grok.com/v1`（Grok Build 原生上游） |
+| `grok_build_restore_dir` | `~/.grok-go/backups/grok-build-pre-route/` |
 | `grok_build_config_path` | `~/.grok/config.toml` |
 
 ## 缓存

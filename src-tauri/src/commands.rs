@@ -9,7 +9,8 @@ use crate::error::{AppError, AppResult};
 use crate::gateway::server::{start_gateway, GatewayState};
 use crate::integrations::{
     import_cc_switch_provider, inject_codex_agents_guide, integration_status, set_codex_mcp_inject,
-    set_grok_build_inject as set_grok_build_inject_impl, IntegrationStatus,
+    set_grok_build_inject as set_grok_build_inject_impl,
+    restore_grok_build_backup as restore_grok_build_backup_impl, IntegrationStatus,
 };
 use crate::account_import::{
     credential_to_account, is_duplicate, parse_import_payload, ImportAccountsOptions,
@@ -700,6 +701,11 @@ pub fn inject_agents_guide() -> AppResult<IntegrationStatus> {
 #[tauri::command]
 pub fn set_grok_build_inject(enabled: bool) -> AppResult<IntegrationStatus> {
     set_grok_build_inject_impl(enabled)
+}
+
+#[tauri::command]
+pub fn restore_grok_build_backup() -> AppResult<IntegrationStatus> {
+    restore_grok_build_backup_impl()
 }
 
 #[tauri::command]

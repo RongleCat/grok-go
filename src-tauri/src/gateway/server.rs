@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -94,6 +94,11 @@ fn build_router(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        // Grok Build TUI paywall / GrowthBook + remote config (cli-chat-proxy).
+        .route("/v1/user", get(build_plane_get))
+        .route("/v1/settings", get(build_plane_get))
+        .route("/v1/login-config", get(build_plane_get))
+        .route("/v1/subagents/bundle", get(build_plane_get))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(responses_compact))
         .route("/v1/chat/completions", post(chat_completions))
@@ -142,6 +147,51 @@ async fn models(State(_state): State<GatewayState>, headers: HeaderMap) -> Respo
     }
     let value = list_models_response(&config).await;
     Json(value).into_response()
+}
+
+/// Proxy Grok Build remote-config GETs to cli-chat-proxy (preserve query string).
+///
+/// Critical paths observed in Grok Build 0.2.x:
+/// - `/v1/user?include=subscription` — paywall subscription probe
+/// - `/v1/settings` — GrowthBook-style remote settings including **`allow_access`**
+/// - `/v1/login-config`, `/v1/subagents/bundle` — startup remote config
+///
+/// Missing `/settings` makes the client keep `allow_access=false` forever even when
+/// `/user` returns a paid tier (logs: paywall_check_gate_kept_allow_access_false).
+async fn build_plane_get(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    uri: OriginalUri,
+) -> Response {
+    let full = uri
+        .0
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/v1/settings");
+    let upstream_path = full.strip_prefix("/v1").unwrap_or(full);
+    let upstream_path = if upstream_path.is_empty() {
+        "/".to_string()
+    } else if upstream_path.starts_with('/') {
+        upstream_path.to_string()
+    } else {
+        format!("/{upstream_path}")
+    };
+    let source = if upstream_path.starts_with("/user") {
+        "grok-build-user"
+    } else if upstream_path.starts_with("/settings") {
+        "grok-build-settings"
+    } else {
+        "grok-build-remote"
+    };
+    proxy_json(
+        &state.proxy,
+        Method::GET,
+        &upstream_path,
+        headers,
+        Bytes::new(),
+        source,
+    )
+    .await
 }
 
 async fn responses(State(state): State<GatewayState>, headers: HeaderMap, body: Bytes) -> Response {

@@ -1,5 +1,22 @@
 # Wiki 日志
 
+## 2026-07-14（token / 缓存命中护栏）
+
+- 审计 Grok Build 路径：避免 Codex 专用逻辑破坏 SuperGrok 缓存与重复计费。
+- `session_affinity` 识别 `x-grok-conv-id` / `x-grok-session-id` / `x-grok-agent-id`；优先透传客户端 `x-grok-conv-id`，不再用派生 seed 覆盖。
+- Build 平面 `sanitize` 保留 `previous_response_id` / `prompt_cache_retention`；关闭 empty-completion 静默重试、nuclear strip、Files offload（file_id 属 console API）。
+- Codex 失败重试在 strip 后重注入稳定 `prompt_cache_key`。
+- Build 平面缺 `x-grok-client-version` 时注入默认 `0.2.101`（避免 cli-chat-proxy 426 Upgrade Required）。
+- Build 透传补齐：`User-Agent` / `x-email` / `x-models-etag` / `Accept-Language` / tracing；缺 UA 时注入 `xai-grok-shell/<ver>`。
+- Build sanitize 不再 strip `stream_options`/`safety_identifier`/`context_management`，也不注入 Codex 专用 tools。
+
+## 2026-07-14（Grok Build 多账号原生路由）
+
+- 集成页打开 Grok Build 标签：一键把 `cli_chat_proxy_base_url` 指到本机网关（SuperGrok 协议，非 API）。
+- 开启前备份 `~/.grok/config.toml` + `auth.json`，支持一键还原。
+- 网关识别 Grok Build plane，上游走 `cli-chat-proxy.grok.com`，透传 CLI 头 + session affinity。
+- 明确不用 `models_base_url` / console API 计费路径。
+
 ## 2026-07-14（CC 导入思考深度）
 
 - 实测 xAI 接受 `reasoning.effort` 的模型：`grok-4.5`、`grok-4.3`、`grok-4.20-multi-agent-0309`。
@@ -143,3 +160,30 @@
 - Card SSO import now runs OIDC Device Flow in Rust (`sso_convert.rs`): SSO cookie → access/refresh, then official OAuth gateway path.
 - Added `convert_sso_accounts` for legacy SSO rows already on disk.
 - UI: hide SSO pool; show convert button for legacy SSO.
+
+## 2026-07-14 15:42 CST
+
+- Grok Build 集成收敛为**标准 Session 路径**：`cli_chat_proxy_base_url` + 账号池 auth.json 同步；不做 API-key / models_base_url 模式。
+- 开启前备份 `~/.grok/config.toml` 与 `auth.json`；UI 展示会话 email / JWT tier；网关侧 build plane 走 cli-chat-proxy。
+
+## 2026-07-14 15:48 CST
+
+- 定位 Grok Build 仍提示 subscription required：同步会话 JWT `referrer=sub2api`（非 `grok-build`），TUI 显示 x_premium_plus 仍 `allow_access=false`。
+- 选号评分改为强优先 `referrer=grok-build` + 完整 cli scope；UI 展示 referrer 与门闸告警。
+
+## 2026-07-14 15:55 CST
+
+- Grok Build 仍显示 subscription required 根因：TUI 订阅门闸会请求 `GET /v1/user?include=subscription`，但 GrokGo 网关未实现该路由（404），GrowthBook 直接拦截。
+- 修复：新增 `/v1/user` 透传到 cli-chat-proxy；选号对 JWT tier 做软偏好。实测上游返回 `subscriptionTier=GrokPro|XPremiumPlus`。
+
+## 2026-07-14 16:00 CST
+
+- Grok 日志确认：`/user` 已通且能识别 GrokPro/XPremiumPlus，但 GrowthBook `allow_access` 仍为 false（`paywall_check_gate_kept_allow_access_false`）。
+- 修复：对 `GET /v1/user` 成功响应做门闸改写——身份对齐会话 JWT；付费档 `subscriptionTiers` 映射为 `SuperGrok`（`user-profile-gate-rewrite`）。
+
+## 2026-07-14 16:03 CST
+
+- 日志演进：把 `/user.subscriptionTiers` 改成 `SuperGrok` 后客户端变成 `paywall_check_no_subscription`（API 枚举不认该字符串）。
+- 真正门闸字段在 **`GET /v1/settings`**：上游返回 `allow_access: true`、`subscription_tier_display: SuperGrok`；本地此前 404。
+- 修复：透传 `/v1/settings`（及 login-config/subagents/bundle）；撤回错误的 SuperGrok 订阅枚举改写，仅保留 `/user` 身份对齐。
+

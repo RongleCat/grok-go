@@ -35,20 +35,43 @@ pub struct SanitizeResult {
 }
 
 /// Sanitize a Responses API request body before forwarding to xAI.
+///
+/// `preserve_native_continuity`: when true (Grok Build / cli-chat-proxy plane),
+/// keep `previous_response_id` and related continuity fields so the native
+/// SuperGrok path can reuse server-side state and prompt cache. Codex → console
+/// API still strips them (`false`) because that path re-sends full history.
 pub fn sanitize_responses_request(value: &mut Value) -> SanitizeResult {
+    sanitize_responses_request_ex(value, false)
+}
+
+/// Same as [`sanitize_responses_request`] with continuity-preservation control.
+///
+/// When `preserve_native_continuity` is true (Grok Build / cli-chat-proxy):
+/// - **do not strip** any top-level continuity / OpenAI-compat keys
+/// - **do not inject** Codex-only tools (`x_search` / `web_search` / `image_gen`)
+/// - still convert `custom` tools if present (harmless if none)
+pub fn sanitize_responses_request_ex(
+    value: &mut Value,
+    preserve_native_continuity: bool,
+) -> SanitizeResult {
     let mut result = SanitizeResult::default();
 
-    // xAI does not honor OpenAI previous_response_id store semantics via this proxy.
-    if let Some(obj) = value.as_object_mut() {
-        for key in [
-            "previous_response_id",
-            "context_management",
-            "prompt_cache_retention",
-            "safety_identifier",
-            "stream_options",
-        ] {
-            if obj.remove(key).is_some() {
-                result.modified = true;
+    // Console API (Codex): xAI does not honor OpenAI previous_response_id store
+    // semantics via this proxy — strip so clients re-send full history cleanly.
+    // Build plane (cli-chat-proxy): keep *all* client body fields for native
+    // SuperGrok continuity and prompt cache.
+    if !preserve_native_continuity {
+        if let Some(obj) = value.as_object_mut() {
+            for key in [
+                "previous_response_id",
+                "context_management",
+                "prompt_cache_retention",
+                "safety_identifier",
+                "stream_options",
+            ] {
+                if obj.remove(key).is_some() {
+                    result.modified = true;
+                }
             }
         }
     }
@@ -84,8 +107,8 @@ pub fn sanitize_responses_request(value: &mut Value) -> SanitizeResult {
         *tools = next;
     }
 
-    // Ensure tools array exists for Codex custom-provider sessions (they omit built-ins).
-    {
+    // Codex custom-provider sessions omit built-ins — only inject for non-build plane.
+    if !preserve_native_continuity {
         let needs_tools = value
             .get("tools")
             .and_then(|t| t.as_array())
@@ -102,32 +125,42 @@ pub fn sanitize_responses_request(value: &mut Value) -> SanitizeResult {
     // Ensure X / web search + image_gen when tools are present (Codex agent loops).
     // Custom providers never get official built-in `image_gen`; we inject a function tool
     // and fulfill it server-side with Grok Imagine.
-    if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
-        let has_x = tools.iter().any(|t| {
-            matches!(
-                t.get("type").and_then(|v| v.as_str()),
-                Some("x_search" | "web_search")
-            )
-        });
-        if !has_x {
-            tools.push(json!({"type": "x_search"}));
-            tools.push(json!({"type": "web_search"}));
-            result.modified = true;
-        }
+    // Grok Build ships its own tool list — never inject extras on that plane.
+    if !preserve_native_continuity {
+        if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            let has_x = tools.iter().any(|t| {
+                matches!(
+                    t.get("type").and_then(|v| v.as_str()),
+                    Some("x_search" | "web_search")
+                )
+            });
+            if !has_x {
+                tools.push(json!({"type": "x_search"}));
+                tools.push(json!({"type": "web_search"}));
+                result.modified = true;
+            }
 
-        let has_image = tools.iter().any(|t| {
-            let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            matches!(ty, "image_generation" | "image_gen")
-                || crate::gateway::image_bridge::is_image_gen_name(name)
-        });
-        if !has_image {
-            tools.push(crate::gateway::image_bridge::image_gen_function_tool());
-            result.has_image_gen_tools = true;
-            result.custom_tool_names.insert("image_gen".into());
-            result.modified = true;
-        } else {
-            result.has_image_gen_tools = true;
+            let has_image = tools.iter().any(|t| {
+                let ty = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                matches!(ty, "image_generation" | "image_gen")
+                    || crate::gateway::image_bridge::is_image_gen_name(name)
+            });
+            if !has_image {
+                tools.push(crate::gateway::image_bridge::image_gen_function_tool());
+                result.has_image_gen_tools = true;
+                result.custom_tool_names.insert("image_gen".into());
+                result.modified = true;
+            } else {
+                result.has_image_gen_tools = true;
+                result.custom_tool_names.insert("image_gen".into());
+            }
+        }
+    } else {
+        // Still detect image tools for proxy bookkeeping without injecting.
+        result.has_image_gen_tools =
+            crate::gateway::image_bridge::request_has_image_tools(value);
+        if result.has_image_gen_tools {
             result.custom_tool_names.insert("image_gen".into());
         }
     }
@@ -897,6 +930,55 @@ mod tests {
         // reasoning summary preserved as assistant text + user message
         assert!(input.len() >= 1);
         assert!(input.iter().any(|i| i.get("role").and_then(|r| r.as_str()) == Some("user")));
+    }
+
+    #[test]
+    fn preserve_native_continuity_keeps_previous_response_id() {
+        let mut body = json!({
+            "previous_response_id": "resp_keep",
+            "prompt_cache_retention": "24h",
+            "stream_options": {"include_usage": true},
+            "safety_identifier": "sid",
+            "context_management": {"foo": 1},
+            "model": "grok-4.5",
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": []
+        });
+        let r = sanitize_responses_request_ex(&mut body, true);
+        assert_eq!(
+            body.get("previous_response_id").and_then(|v| v.as_str()),
+            Some("resp_keep")
+        );
+        // All continuity / OpenAI-compat keys kept on build plane.
+        assert_eq!(
+            body.get("prompt_cache_retention").and_then(|v| v.as_str()),
+            Some("24h")
+        );
+        assert!(body.get("stream_options").is_some());
+        assert!(body.get("safety_identifier").is_some());
+        assert!(body.get("context_management").is_some());
+        // No Codex tool injection when tools were empty.
+        assert!(
+            body.get("tools")
+                .and_then(|t| t.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(true),
+            "build plane must not inject tools: {:?}",
+            body.get("tools")
+        );
+        let _ = r;
+    }
+
+    #[test]
+    fn codex_sanitize_still_strips_previous_response_id() {
+        let mut body = json!({
+            "previous_response_id": "resp_drop",
+            "model": "grok-4.5",
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": []
+        });
+        sanitize_responses_request(&mut body);
+        assert!(body.get("previous_response_id").is_none());
     }
 
     #[test]

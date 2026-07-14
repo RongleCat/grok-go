@@ -60,8 +60,13 @@ pub struct AppConfig {
     /// and replaced with [`DEFAULT_XAI_CLIENT_ID`].
     #[serde(default = "default_xai_client_id")]
     pub xai_client_id: String,
+    /// Upstream for Codex / OpenAI-compatible clients (console API plane).
     #[serde(default = "default_xai_base_url")]
     pub xai_base_url: String,
+    /// Upstream for Grok Build TUI native plane (`cli-chat-proxy`, SuperGrok credits).
+    /// Do **not** point Grok Build at `xai_base_url` — that is the metered API path.
+    #[serde(default = "default_cli_chat_proxy_base_url")]
+    pub cli_chat_proxy_base_url: String,
     #[serde(default = "default_oauth_redirect_port")]
     pub oauth_redirect_port: u16,
     /// When true, upstream xAI/OAuth HTTP goes through `http_proxy_url`.
@@ -171,6 +176,11 @@ fn default_xai_base_url() -> String {
     "https://api.x.ai/v1".into()
 }
 
+/// Grok Build CLI default inference endpoint (session / SuperGrok credits).
+pub fn default_cli_chat_proxy_base_url() -> String {
+    "https://cli-chat-proxy.grok.com/v1".into()
+}
+
 fn default_oauth_redirect_port() -> u16 {
     56121
 }
@@ -205,6 +215,7 @@ impl Default for AppConfig {
             // allowlist registered with xAI (exact port + path).
             xai_client_id: default_xai_client_id(),
             xai_base_url: default_xai_base_url(),
+            cli_chat_proxy_base_url: default_cli_chat_proxy_base_url(),
             oauth_redirect_port: default_oauth_redirect_port(),
             http_proxy_enabled: false,
             http_proxy_url: String::new(),

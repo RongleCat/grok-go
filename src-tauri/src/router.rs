@@ -24,6 +24,16 @@ pub enum MediaCapability {
     Video,
 }
 
+/// Best-effort JWT `tier` claim (0 if missing). Used for Grok Build /user paywall picks.
+fn jwt_tier_score(account: &Account) -> i64 {
+    account
+        .access_token
+        .as_deref()
+        .and_then(crate::auth::jwt_payload)
+        .and_then(|p| p.get("tier").and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 impl MediaCapability {
     pub fn from_upstream_path(path: &str) -> Self {
         let p = path.to_ascii_lowercase();
@@ -241,6 +251,14 @@ pub fn pick_account_decision_cap(
     } else {
         candidates.sort_by_key(|a| a.consecutive_failures);
     }
+
+    // Soft preference for higher JWT subscription tier (helps Grok Build /user paywall
+    // and SuperGrok-capable pool accounts without changing strategy weights).
+    candidates.sort_by(|a, b| {
+        jwt_tier_score(b)
+            .cmp(&jwt_tier_score(a))
+            .then_with(|| a.consecutive_failures.cmp(&b.consecutive_failures))
+    });
 
     // Optional use-it-or-lose-it: among equals, prefer soonest weekly reset.
     if config.prefer_soonest_reset {

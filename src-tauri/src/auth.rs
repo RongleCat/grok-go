@@ -397,7 +397,7 @@ fn email_from_jwt(token: &str) -> Option<String> {
         })
 }
 
-fn jwt_payload(token: &str) -> Option<serde_json::Value> {
+pub(crate) fn jwt_payload(token: &str) -> Option<serde_json::Value> {
     let mut parts = token.split('.');
     let _header = parts.next()?;
     let payload_b64 = parts.next()?;

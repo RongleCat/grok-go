@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
-import { Copy, FileText, Plug, RefreshCw } from "lucide-react";
+import { Copy, FileText, Plug, RefreshCw, RotateCcw, Shield } from "lucide-react";
 import {
   api,
   isMcpToolEnabled,
@@ -22,8 +22,8 @@ import { cn } from "@/lib/utils";
 
 type TabId = "codex" | "mcp" | "clients" | "grok-build";
 
-/** Grok Build API-key endpoint inject — code ready, UI hidden until GA. */
-const SHOW_GROK_BUILD_TAB = false;
+/** Grok Build native multi-account routing (cli-chat-proxy). */
+const SHOW_GROK_BUILD_TAB = true;
 
 type ClientSnippet = {
   id: string;
@@ -517,68 +517,159 @@ export function IntegrationsPage() {
         )}
 
         {SHOW_GROK_BUILD_TAB && tab === "grok-build" && (
-          <Card>
-            <CardHeader className="py-3">
-              <CardTitle className="flex items-center gap-2 text-base">
-                {t.integrations.grokBuild}
-                <Badge variant={status.grokBuildInjected ? "success" : "outline"}>
-                  {status.grokBuildInjected
-                    ? t.integrations.grokBuildInjected
-                    : t.integrations.grokBuildNotInjected}
-                </Badge>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div className="min-w-0 space-y-1">
-                  {t.integrations.grokBuildDesc ? (
-                    <p className="text-sm text-neutral-500">{t.integrations.grokBuildDesc}</p>
-                  ) : null}
+          <div className="space-y-3">
+            <Card>
+              <CardHeader className="py-3">
+                <CardTitle className="flex flex-wrap items-center gap-2 text-base">
+                  {t.integrations.grokBuild}
+                  <Badge variant={status.grokBuildInjected ? "success" : "outline"}>
+                    {status.grokBuildInjected
+                      ? t.integrations.grokBuildInjected
+                      : t.integrations.grokBuildNotInjected}
+                  </Badge>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0 space-y-1.5">
+                    <p className="text-sm text-neutral-600 dark:text-neutral-400">
+                      {t.integrations.grokBuildDesc}
+                    </p>
+                    <p className="text-xs text-amber-600/90 dark:text-amber-400/90">
+                      {t.integrations.grokBuildRestartHint}
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 flex-col items-end gap-2">
+                    <Switch
+                      checked={status.grokBuildInjected}
+                      disabled={busy !== null}
+                      onCheckedChange={async (v) => {
+                        setBusy("grok-build");
+                        try {
+                          const next = await api.setGrokBuildInject(v);
+                          setStatus(next);
+                          toast(
+                            v
+                              ? t.integrations.grokBuildInjectedMsg
+                              : t.integrations.grokBuildRemovedMsg,
+                            "success"
+                          );
+                        } catch (e) {
+                          toast(String(e), "error");
+                        } finally {
+                          setBusy(null);
+                        }
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                  <div className="rounded-lg border border-neutral-200/80 bg-neutral-50/80 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900/40">
+                    <div className="text-[11px] uppercase tracking-wide text-neutral-400">
+                      {t.integrations.grokBuildProtocol}
+                    </div>
+                    <div className="mt-0.5 text-sm font-medium text-neutral-800 dark:text-neutral-100">
+                      {status.grokBuildProtocol || "cli-chat-proxy"}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-neutral-200/80 bg-neutral-50/80 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900/40">
+                    <div className="text-[11px] uppercase tracking-wide text-neutral-400">
+                      {t.integrations.grokBuildAccounts}
+                    </div>
+                    <div className="mt-0.5 text-sm font-medium text-neutral-800 dark:text-neutral-100">
+                      {status.grokBuildAccountCount ?? 0}
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-neutral-500">
+                      {t.integrations.grokBuildAccountsHint}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-neutral-200/80 bg-neutral-50/80 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900/40">
+                    <div className="text-[11px] uppercase tracking-wide text-neutral-400">
+                      {t.integrations.grokBuildSession}
+                    </div>
+                    <div className="mt-0.5 truncate text-sm font-medium text-neutral-800 dark:text-neutral-100">
+                      {status.grokBuildSessionEmail || t.integrations.grokBuildSessionEmpty}
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-neutral-500">
+                      {t.integrations.grokBuildSessionTier}:{" "}
+                      {status.grokBuildSessionTier != null ? status.grokBuildSessionTier : "—"}
+                      {status.grokBuildSessionReferrer
+                        ? ` · ${t.integrations.grokBuildSessionReferrer}: ${status.grokBuildSessionReferrer}`
+                        : ""}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-neutral-200/80 bg-neutral-50/80 px-3 py-2 dark:border-neutral-800 dark:bg-neutral-900/40">
+                    <div className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-neutral-400">
+                      <Shield className="h-3 w-3" />
+                      Backup
+                    </div>
+                    <div className="mt-0.5 text-sm font-medium text-neutral-800 dark:text-neutral-100">
+                      {status.grokBuildRestoreAvailable
+                        ? t.integrations.grokBuildInjected
+                        : t.integrations.grokBuildRestoreUnavailable}
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-neutral-500">
+                      {t.integrations.grokBuildBackupHint}
+                    </div>
+                  </div>
+                </div>
+
+                {status.grokBuildSessionWarn ? (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200/90">
+                    <div className="font-medium">{t.integrations.grokBuildSessionWarnTitle}</div>
+                    <p className="mt-1 whitespace-pre-wrap leading-relaxed">
+                      {status.grokBuildSessionWarn}
+                    </p>
+                  </div>
+                ) : null}
+
+                <div className="space-y-1">
                   <p className="truncate font-mono text-[11px] text-neutral-400">
                     {status.grokBuildConfigPath}
                   </p>
-                  {t.integrations.grokBuildEnvHint ? (
-                    <p className="text-xs text-neutral-500">{t.integrations.grokBuildEnvHint}</p>
-                  ) : null}
+                  <p className="truncate font-mono text-[11px] text-neutral-400">
+                    {status.grokBuildAuthPath}
+                  </p>
                 </div>
-                <Switch
-                  checked={status.grokBuildInjected}
-                  disabled={busy !== null}
-                  onCheckedChange={async (v) => {
-                    setBusy("grok-build");
-                    try {
-                      const next = await api.setGrokBuildInject(v);
-                      setStatus(next);
-                      toast(
-                        v
-                          ? t.integrations.grokBuildInjectedMsg
-                          : t.integrations.grokBuildRemovedMsg,
-                        "success"
-                      );
-                    } catch (e) {
-                      toast(String(e), "error");
-                    } finally {
-                      setBusy(null);
-                    }
-                  }}
-                />
-              </div>
-              {status.grokBuildSnippet ? (
+
                 <div className="flex flex-wrap gap-2">
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() =>
-                      void copyText(t.integrations.grokBuild, status.grokBuildSnippet)
-                    }
+                    disabled={busy !== null || !status.grokBuildRestoreAvailable}
+                    onClick={async () => {
+                      setBusy("grok-build-restore");
+                      try {
+                        const next = await api.restoreGrokBuildBackup();
+                        setStatus(next);
+                        toast(t.integrations.grokBuildRestoreMsg, "success");
+                      } catch (e) {
+                        toast(String(e), "error");
+                      } finally {
+                        setBusy(null);
+                      }
+                    }}
                   >
-                    <Copy className="h-3.5 w-3.5" />
-                    {t.common.copy}
+                    <RotateCcw className="h-3.5 w-3.5" />
+                    {t.integrations.grokBuildRestore}
                   </Button>
+                  {status.grokBuildSnippet ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        void copyText(t.integrations.grokBuild, status.grokBuildSnippet)
+                      }
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                      {t.common.copy}
+                    </Button>
+                  ) : null}
                 </div>
-              ) : null}
-            </CardContent>
-          </Card>
+              </CardContent>
+            </Card>
+          </div>
         )}
 
       <Dialog

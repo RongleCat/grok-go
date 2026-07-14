@@ -25,9 +25,11 @@ struct AffinityEntry {
 ///
 /// Priority (first non-empty wins):
 /// 1. Client `prompt_cache_key` (best — Codex usually keeps this stable per thread)
-/// 2. Conversation / metadata / session headers (stable across turns)
-/// 3. Hash of model + first user text (stable for the thread's opening)
-/// 4. `previous_response_id` last — only for account sticky chain, not as cache key
+/// 2. Body `conversation_id` / metadata session fields
+/// 3. Grok Build / CLI headers (`x-grok-conv-id`, `x-grok-session-id`, …)
+/// 4. Generic session / conversation headers
+/// 5. Hash of model + first user text (stable for the thread's opening)
+/// 6. `previous_response_id` last — only for account sticky chain, not as cache key
 ///    (it changes every turn; using it as `prompt_cache_key` destroys prefix cache)
 pub fn extract_session_key(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
     if let Some(v) = body {
@@ -44,7 +46,12 @@ pub fn extract_session_key(headers: &HeaderMap, body: Option<&Value>) -> Option<
         }
     }
 
+    // Grok Build / xAI CLI: stable per-session / per-conversation ids (must stick
+    // the same pool account or prompt cache collapses across multi-turn chat).
     for name in [
+        "x-grok-conv-id",
+        "x-grok-session-id",
+        "x-grok-agent-id",
         "x-session-id",
         "session_id",
         "session-id",
@@ -315,6 +322,35 @@ mod tests {
         assert_eq!(
             extract_session_key(&headers, None).as_deref(),
             Some("hdr:s-99")
+        );
+    }
+
+    #[test]
+    fn prefers_grok_build_conv_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-grok-conv-id", HeaderValue::from_static("conv-stable-1"));
+        headers.insert("x-session-id", HeaderValue::from_static("other"));
+        assert_eq!(
+            extract_session_key(&headers, None).as_deref(),
+            Some("hdr:conv-stable-1")
+        );
+        assert_eq!(
+            stable_cache_key("hdr:conv-stable-1").as_deref(),
+            Some("conv-stable-1")
+        );
+    }
+
+    #[test]
+    fn prefers_grok_session_over_seed() {
+        let body = json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-grok-session-id", HeaderValue::from_static("sess-abc"));
+        assert_eq!(
+            extract_session_key(&headers, Some(&body)).as_deref(),
+            Some("hdr:sess-abc")
         );
     }
 }

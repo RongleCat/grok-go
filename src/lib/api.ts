@@ -60,6 +60,8 @@ export type AppConfig = {
   minimizeToTray: boolean;
   xaiClientId: string;
   xaiBaseUrl: string;
+  /** Grok Build native SuperGrok plane (cli-chat-proxy). */
+  cliChatProxyBaseUrl?: string;
   oauthRedirectPort: number;
   /** When true, upstream xAI / OAuth requests use httpProxyUrl. Default false. */
   httpProxyEnabled: boolean;
@@ -210,9 +212,23 @@ export type IntegrationStatus = {
   /** Versioned full guide under ~/.grok-go/agents-guide.md */
   agentsGuideFilePath: string;
   ccSwitchDbPath: string;
-  /** Grok Build ~/.grok/config.toml has GrokGo model entry. */
+  /** Grok Build standard cli_chat_proxy_base_url points at this gateway. */
   grokBuildInjected: boolean;
   grokBuildConfigPath: string;
+  grokBuildAuthPath: string;
+  grokBuildRestoreAvailable: boolean;
+  grokBuildRestorePath: string;
+  grokBuildAccountCount: number;
+  /** e.g. cli-chat-proxy (SuperGrok / session) */
+  grokBuildProtocol: string;
+  /** Session email currently in ~/.grok/auth.json */
+  grokBuildSessionEmail?: string | null;
+  /** JWT tier claim in ~/.grok/auth.json */
+  grokBuildSessionTier?: number | null;
+  /** JWT referrer claim (grok-build preferred) */
+  grokBuildSessionReferrer?: string | null;
+  /** Paywall risk warning for current session */
+  grokBuildSessionWarn?: string | null;
   providerSnippet: string;
   mcpSnippet: string;
   grokBuildSnippet: string;
@@ -269,6 +285,7 @@ export const api = {
   injectAgentsGuide: () => invoke<IntegrationStatus>("inject_agents_guide"),
   setGrokBuildInject: (enabled: boolean) =>
     invoke<IntegrationStatus>("set_grok_build_inject", { enabled }),
+  restoreGrokBuildBackup: () => invoke<IntegrationStatus>("restore_grok_build_backup"),
   importToCcSwitch: () => invoke<string>("import_to_cc_switch"),
   exportProviderSnippet: () => invoke<string>("export_provider_snippet"),
 };

@@ -75,3 +75,15 @@ pub fn grok_build_home() -> PathBuf {
 pub fn grok_build_config_path() -> PathBuf {
     grok_build_home().join("config.toml")
 }
+
+/// Grok Build session credentials (`~/.grok/auth.json`).
+pub fn grok_build_auth_path() -> PathBuf {
+    grok_build_home().join("auth.json")
+}
+
+/// Stable one-click restore snapshot taken before multi-account routing inject.
+pub fn grok_build_restore_dir() -> AppResult<PathBuf> {
+    let dir = app_home()?.join("backups").join("grok-build-pre-route");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}

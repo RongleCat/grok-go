@@ -1,7 +1,7 @@
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::fs;
 use uuid::Uuid;
 
@@ -9,7 +9,7 @@ use crate::config::{load_config, save_config, AppConfig};
 use crate::error::{AppError, AppResult};
 use crate::paths::{
     agents_guide_file_path, app_home, cc_switch_db_path, codex_agents_md_path, codex_config_path,
-    grok_build_config_path,
+    grok_build_auth_path, grok_build_config_path, grok_build_restore_dir,
 };
 
 /// Markers around the short reference line in Codex `AGENTS.md`.
@@ -36,6 +36,13 @@ const MCP_SERVER_IDS: &[&str] = &[MCP_SERVER_ID, MCP_SERVER_ID_LEGACY];
 
 /// Legacy mistaken inject key (single custom model) — cleaned up on inject/remove.
 const GROK_BUILD_LEGACY_MODEL_KEY: &str = "grok-go";
+/// Grok Build native inference endpoint key (SuperGrok / session plane).
+const GROK_BUILD_CLI_CHAT_PROXY_KEY: &str = "cli_chat_proxy_base_url";
+/// Expensive API-key mode key — never use for multi-account routing inject.
+const GROK_BUILD_MODELS_BASE_URL_KEY: &str = "models_base_url";
+const GROK_BUILD_RESTORE_CONFIG: &str = "config.toml";
+const GROK_BUILD_RESTORE_AUTH: &str = "auth.json";
+const GROK_BUILD_RESTORE_META: &str = "meta.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -48,12 +55,29 @@ pub struct IntegrationStatus {
     /// Absolute path to the versioned guide file under `~/.grok-go/agents-guide.md`.
     pub agents_guide_file_path: String,
     pub cc_switch_db_path: String,
-    /// Whether `~/.grok/config.toml` has a GrokGo model entry pointing at this gateway.
+    /// Whether Grok Build standard session routing points at this gateway.
     pub grok_build_injected: bool,
     pub grok_build_config_path: String,
+    /// Path to Grok Build `auth.json` (session login; may be synced from pool).
+    pub grok_build_auth_path: String,
+    /// One-click restore snapshot is available under backups.
+    pub grok_build_restore_available: bool,
+    pub grok_build_restore_path: String,
+    /// Enabled OAuth accounts that can serve Grok Build multi-route.
+    pub grok_build_account_count: usize,
+    /// Protocol label for UI (cli-chat-proxy / SuperGrok session).
+    pub grok_build_protocol: String,
+    /// Email of the session currently in ~/.grok/auth.json.
+    pub grok_build_session_email: Option<String>,
+    /// JWT `tier` claim currently present in ~/.grok/auth.json (if any).
+    pub grok_build_session_tier: Option<i64>,
+    /// JWT `referrer` claim (grok-build preferred; sub2api often fails TUI gate).
+    pub grok_build_session_referrer: Option<String>,
+    /// Warning when synced session is unlikely to pass Grok Build paywall.
+    pub grok_build_session_warn: Option<String>,
     pub provider_snippet: String,
     pub mcp_snippet: String,
-    /// Ready-to-paste Grok Build custom model block.
+    /// Ready-to-paste standard session routing block.
     pub grok_build_snippet: String,
 }
 
@@ -76,12 +100,27 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let grok_path = grok_build_config_path();
+    let grok_auth = grok_build_auth_path();
     let grok_injected = if grok_path.exists() {
         let raw = fs::read_to_string(&grok_path).unwrap_or_default();
         grok_build_is_injected(&raw, &config)
     } else {
         false
     };
+    let restore_dir = grok_build_restore_dir().unwrap_or_else(|_| {
+        std::path::PathBuf::from(".grok-go/backups/grok-build-pre-route")
+    });
+    let restore_available = restore_dir.join(GROK_BUILD_RESTORE_CONFIG).is_file()
+        || restore_dir.join(GROK_BUILD_RESTORE_AUTH).is_file();
+    let account_count = crate::config::load_auth()
+        .map(|s| {
+            s.accounts
+                .iter()
+                .filter(|a| a.enabled && a.is_credentialed())
+                .count()
+        })
+        .unwrap_or(0);
+    let session = read_grok_build_session_info();
     Ok(IntegrationStatus {
         codex_mcp_injected: injected,
         codex_config_path: codex_path.display().to_string(),
@@ -91,6 +130,15 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
         cc_switch_db_path: cc_switch_db_path().display().to_string(),
         grok_build_injected: grok_injected,
         grok_build_config_path: grok_path.display().to_string(),
+        grok_build_auth_path: grok_auth.display().to_string(),
+        grok_build_restore_available: restore_available,
+        grok_build_restore_path: restore_dir.display().to_string(),
+        grok_build_account_count: account_count,
+        grok_build_protocol: "cli-chat-proxy (SuperGrok / session)".into(),
+        grok_build_session_email: session.as_ref().and_then(|s| s.email.clone()),
+        grok_build_session_tier: session.as_ref().and_then(|s| s.tier),
+        grok_build_session_referrer: session.as_ref().and_then(|s| s.referrer.clone()),
+        grok_build_session_warn: session.as_ref().and_then(|s| s.warn.clone()),
         provider_snippet: provider_snippet(&config),
         mcp_snippet: mcp_snippet(&config),
         grok_build_snippet: grok_build_snippet(&config),
@@ -155,22 +203,76 @@ pub fn set_codex_mcp_inject(enabled: bool) -> AppResult<IntegrationStatus> {
     integration_status()
 }
 
-/// Point Grok Build's **whole inference endpoint** at this gateway (API-key mode).
+/// Point Grok Build's **standard cli-chat-proxy session plane** at this gateway.
 ///
-/// Official path (Grok Build docs — Custom Models Endpoint):
-/// - `~/.grok/config.toml` → `[endpoints] models_base_url = "http://127.0.0.1:PORT/v1"`
-/// - `XAI_API_KEY` / Bearer = GrokGo `localToken` (not an xAI console key)
+/// Official SuperGrok path (not Custom Models / API-key mode):
+/// - `~/.grok/config.toml` → `[endpoints] cli_chat_proxy_base_url = "http://127.0.0.1:PORT/v1"`
+/// - Sync a pool OAuth session into `~/.grok/auth.json` so the TUI subscription gate can open
+/// - Strip accidental `models_base_url` pointing at us (legacy API-key inject)
 ///
-/// When `models_base_url` is set, Grok Build uses API-key auth for all models
-/// (`GET /models` + inference), not a single `[model.*]` override.
-/// Account pool + weighted routing stay entirely inside GrokGo.
+/// GrokGo accepts the client Bearer, replaces it with a pool token, and forwards to
+/// `cli-chat-proxy.grok.com` with session affinity.
 pub fn set_grok_build_inject(enabled: bool) -> AppResult<IntegrationStatus> {
     let config = load_config()?;
     if enabled {
-        inject_grok_build_endpoints(&config)?;
+        inject_grok_build_routing(&config)?;
     } else {
-        remove_grok_build_endpoints(&config)?;
+        remove_grok_build_routing(&config)?;
     }
+    integration_status()
+}
+
+/// Restore `~/.grok/config.toml` + `auth.json` from the pre-inject snapshot.
+pub fn restore_grok_build_backup() -> AppResult<IntegrationStatus> {
+    let restore_dir = grok_build_restore_dir()?;
+    let cfg_src = restore_dir.join(GROK_BUILD_RESTORE_CONFIG);
+    let auth_src = restore_dir.join(GROK_BUILD_RESTORE_AUTH);
+    if !cfg_src.is_file() && !auth_src.is_file() {
+        return Err(AppError::msg(
+            "没有可还原的 Grok Build 备份。请先在集成页开启多账号路由（开启前会自动备份）。",
+        ));
+    }
+
+    let home = crate::paths::grok_build_home();
+    fs::create_dir_all(&home)?;
+
+    // Safety: timestamped copy of current live files before overwrite.
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let live_cfg = grok_build_config_path();
+    let live_auth = grok_build_auth_path();
+    if live_cfg.exists() {
+        let _ = backup_file_to(
+            &live_cfg,
+            &app_home()?
+                .join("backups")
+                .join(format!("grok-config-before-restore-{stamp}.toml")),
+        );
+    }
+    if live_auth.exists() {
+        let _ = backup_file_to(
+            &live_auth,
+            &app_home()?
+                .join("backups")
+                .join(format!("grok-auth-before-restore-{stamp}.json")),
+        );
+    }
+
+    if cfg_src.is_file() {
+        fs::copy(&cfg_src, &live_cfg).map_err(|e| {
+            AppError::msg(format!("还原 config.toml 失败：{e}"))
+        })?;
+    }
+    if auth_src.is_file() {
+        fs::copy(&auth_src, &live_auth).map_err(|e| {
+            AppError::msg(format!("还原 auth.json 失败：{e}"))
+        })?;
+    }
+
+    tracing::info!(
+        target: "integrations",
+        restore = %restore_dir.display(),
+        "restored Grok Build config/auth from pre-route snapshot"
+    );
     integration_status()
 }
 
@@ -183,19 +285,23 @@ fn gateway_base_url(config: &AppConfig) -> String {
     format!("http://{}:{}/v1", host, config.actual_port)
 }
 
-/// Snippet for copy/paste: endpoints block + env vars (API-key mode).
+/// Snippet for copy/paste: standard cli-chat-proxy session routing.
 fn grok_build_snippet(config: &AppConfig) -> String {
     let base = gateway_base_url(config);
-    let token = config.local_token.as_str();
     format!(
-        r#"# ~/.grok/config.toml  — full API-key endpoint (not a single custom model)
+        r#"# ~/.grok/config.toml  — Grok Build 标准协议（SuperGrok / cli-chat-proxy）
+# 开启集成时 GrokGo 会：
+# 1) 写入 cli_chat_proxy_base_url → 本机网关
+# 2) 用账号池较优 OAuth 会话同步到 ~/.grok/auth.json（客户端订阅门闸）
+# 勿设置 models_base_url（那是 console API / Custom Models 路径）。
 [endpoints]
-models_base_url = "{base}"
+{cli_key} = "{base}"
 
-# Shell (API key = GrokGo local token; GrokGo routes upstream accounts)
-export GROK_MODELS_BASE_URL="{base}"
-export XAI_API_KEY="{token}"
-"#
+export GROK_CLI_CHAT_PROXY_BASE_URL="{base}"
+# 然后重启 `grok`。推理选号 / failover 由 GrokGo 网关负责。
+"#,
+        cli_key = GROK_BUILD_CLI_CHAT_PROXY_KEY,
+        base = base,
     )
 }
 
@@ -205,7 +311,6 @@ fn url_points_at_gateway(url: &str, config: &AppConfig) -> bool {
     if u == expected {
         return true;
     }
-    // Port match on loopback / LAN bind
     let port = config.actual_port;
     (u.contains(&format!("127.0.0.1:{port}"))
         || u.contains(&format!("localhost:{port}"))
@@ -213,7 +318,7 @@ fn url_points_at_gateway(url: &str, config: &AppConfig) -> bool {
         && (u.ends_with("/v1") || u.contains("/v1/") || u.ends_with(&format!(":{port}/v1")))
 }
 
-/// True when `[endpoints].models_base_url` points at this GrokGo instance.
+/// True when `[endpoints].cli_chat_proxy_base_url` points at this GrokGo instance.
 fn grok_build_is_injected(raw: &str, config: &AppConfig) -> bool {
     let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
         return false;
@@ -221,13 +326,16 @@ fn grok_build_is_injected(raw: &str, config: &AppConfig) -> bool {
     let Some(endpoints) = doc.get("endpoints").and_then(|i| i.as_table()) else {
         return false;
     };
-    let Some(base) = endpoints.get("models_base_url").and_then(|v| v.as_str()) else {
+    let Some(base) = endpoints
+        .get(GROK_BUILD_CLI_CHAT_PROXY_KEY)
+        .and_then(|v| v.as_str())
+    else {
         return false;
     };
     url_points_at_gateway(base, config)
 }
 
-fn inject_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
+fn inject_grok_build_routing(config: &AppConfig) -> AppResult<()> {
     let path = grok_build_config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -237,7 +345,16 @@ fn inject_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
     } else {
         String::new()
     };
+
+    // Snapshot login + config before first inject only.
+    let already = grok_build_is_injected(&original, config);
+    if !already {
+        snapshot_grok_build_for_restore(&original)?;
+    }
     backup_grok_build_config(&original)?;
+
+    // Sync pool OAuth into ~/.grok/auth.json for TUI paywall / subscription gate.
+    sync_grok_build_session_auth(config)?;
 
     let mut doc = if original.trim().is_empty() {
         toml_edit::DocumentMut::new()
@@ -253,9 +370,20 @@ fn inject_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
     let table = endpoints
         .as_table_mut()
         .ok_or_else(|| AppError::msg("endpoints is not a table in ~/.grok/config.toml"))?;
-    table["models_base_url"] = toml_edit::value(gateway_base_url(config));
 
-    // Remove legacy single-model inject if present (wrong approach).
+    table[GROK_BUILD_CLI_CHAT_PROXY_KEY] = toml_edit::value(gateway_base_url(config));
+
+    // Clean accidental API-key endpoint pointing at us (legacy mistake).
+    if let Some(models_url) = table
+        .get(GROK_BUILD_MODELS_BASE_URL_KEY)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        if url_points_at_gateway(&models_url, config) {
+            table.remove(GROK_BUILD_MODELS_BASE_URL_KEY);
+        }
+    }
+
     if let Some(models) = doc.get_mut("model").and_then(|i| i.as_table_mut()) {
         models.remove(GROK_BUILD_LEGACY_MODEL_KEY);
         if models.is_empty() {
@@ -263,11 +391,17 @@ fn inject_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
         }
     }
 
-    fs::write(path, doc.to_string())?;
+    fs::write(&path, doc.to_string())?;
+    tracing::info!(
+        target: "integrations",
+        path = %path.display(),
+        base = %gateway_base_url(config),
+        "injected Grok Build standard cli-chat-proxy routing"
+    );
     Ok(())
 }
 
-fn remove_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
+fn remove_grok_build_routing(config: &AppConfig) -> AppResult<()> {
     let path = grok_build_config_path();
     if !path.exists() {
         return Ok(());
@@ -279,20 +413,27 @@ fn remove_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
         .map_err(|e| AppError::msg(format!("invalid ~/.grok/config.toml: {e}")))?;
 
     if let Some(endpoints) = doc.get_mut("endpoints").and_then(|i| i.as_table_mut()) {
-        let ours = endpoints
-            .get("models_base_url")
+        let ours_cli = endpoints
+            .get(GROK_BUILD_CLI_CHAT_PROXY_KEY)
             .and_then(|v| v.as_str())
             .map(|u| url_points_at_gateway(u, config))
             .unwrap_or(false);
-        if ours {
-            endpoints.remove("models_base_url");
+        if ours_cli {
+            endpoints.remove(GROK_BUILD_CLI_CHAT_PROXY_KEY);
+        }
+        let ours_models = endpoints
+            .get(GROK_BUILD_MODELS_BASE_URL_KEY)
+            .and_then(|v| v.as_str())
+            .map(|u| url_points_at_gateway(u, config))
+            .unwrap_or(false);
+        if ours_models {
+            endpoints.remove(GROK_BUILD_MODELS_BASE_URL_KEY);
         }
         if endpoints.is_empty() {
             doc.remove("endpoints");
         }
     }
 
-    // Always clean legacy model.grok-go if still around.
     if let Some(models) = doc.get_mut("model").and_then(|i| i.as_table_mut()) {
         models.remove(GROK_BUILD_LEGACY_MODEL_KEY);
         if models.is_empty() {
@@ -304,6 +445,307 @@ fn remove_grok_build_endpoints(config: &AppConfig) -> AppResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct GrokBuildSessionInfo {
+    email: Option<String>,
+    tier: Option<i64>,
+    /// JWT `referrer` claim (e.g. grok-build / sub2api). GrowthBook gate cares about this.
+    referrer: Option<String>,
+    /// Human-readable risk note when session is unlikely to pass TUI paywall.
+    warn: Option<String>,
+}
+
+/// Read Grok Build `auth.json` session email + JWT tier/referrer (no verify).
+fn read_grok_build_session_info() -> Option<GrokBuildSessionInfo> {
+    let path = grok_build_auth_path();
+    let raw = fs::read_to_string(path).ok()?;
+    let map: serde_json::Map<String, Value> = serde_json::from_str(&raw).ok()?;
+    // Prefer official OIDC client entry shape: { "https://auth.x.ai::<client>": { key, email, ... } }
+    for (_k, v) in map.iter() {
+        let Some(obj) = v.as_object() else { continue };
+        let token = obj
+            .get("key")
+            .or_else(|| obj.get("access_token"))
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty());
+        let email = obj
+            .get("email")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string());
+        let payload = token.and_then(crate::auth::jwt_payload);
+        let tier = payload
+            .as_ref()
+            .and_then(|p| p.get("tier").and_then(|x| x.as_i64()));
+        let referrer = payload
+            .as_ref()
+            .and_then(|p| p.get("referrer").and_then(|x| x.as_str()))
+            .map(|s| s.to_string());
+        let warn = session_gate_warning(tier, referrer.as_deref(), payload.as_ref());
+        if email.is_some() || tier.is_some() || token.is_some() {
+            return Some(GrokBuildSessionInfo {
+                email,
+                tier,
+                referrer,
+                warn,
+            });
+        }
+    }
+    None
+}
+
+fn session_gate_warning(
+    tier: Option<i64>,
+    referrer: Option<&str>,
+    payload: Option<&Value>,
+) -> Option<String> {
+    let ref_l = referrer.unwrap_or("").to_ascii_lowercase();
+    let scope = payload
+        .and_then(|p| p.get("scope").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    if !ref_l.is_empty() && ref_l != "grok-build" {
+        return Some(format!(
+            "当前会话 JWT referrer={referrer:?}（非 grok-build）。Grok Build TUI 的 GrowthBook 门闸可能仍拦截（显示 subscription required）。请用 GrokGo 对该账号重新 OAuth 登录（referrer=grok-build）后再开启集成。"
+        ));
+    }
+    if !scope.contains("grok-cli:access") {
+        return Some(
+            "当前会话缺少 grok-cli:access 权限范围，Grok Build 可能无法正常鉴权。".into(),
+        );
+    }
+    if tier.unwrap_or(0) < 2 {
+        return Some(
+            "当前会话 JWT tier 偏低，可能仍被订阅门闸拦截。请换 SuperGrok 账号并确保是 grok-build 登录面。".into(),
+        );
+    }
+    None
+}
+
+/// Score pool accounts for Grok Build session login (client paywall / GrowthBook).
+///
+/// Order of importance (observed from Grok Build 0.2.x TUI):
+/// 1. JWT `referrer=grok-build` — sub2api/CPA imports often keep referrer=sub2api and fail gate
+///    even when `tier` looks like SuperGrok / x_premium_plus
+/// 2. `grok-cli:access` + conversations scopes (official Grok Build OAuth surface)
+/// 3. Higher JWT `tier` / remaining SuperGrok quota
+fn score_account_for_grok_build_session(account: &crate::config::Account) -> i64 {
+    if !account.enabled || !account.is_credentialed() {
+        return i64::MIN / 4;
+    }
+    if matches!(account.auth_kind, crate::config::AccountAuthKind::Sso) {
+        return i64::MIN / 4;
+    }
+    let mut score: i64 = 0;
+    if let Some(token) = account.access_token.as_deref() {
+        if let Some(payload) = crate::auth::jwt_payload(token) {
+            let tier = payload.get("tier").and_then(|v| v.as_i64()).unwrap_or(0);
+            score += tier.saturating_mul(100_000);
+
+            let referrer = payload
+                .get("referrer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if referrer == "grok-build" {
+                // Hard preference: TUI GrowthBook gate is calibrated for this surface.
+                score += 50_000_000;
+            } else if referrer.is_empty() {
+                score += 1_000_000;
+            } else if referrer.contains("sub2api")
+                || referrer.contains("cpa")
+                || referrer.contains("card")
+            {
+                // High tier from import pipelines often still gets allow_access=false.
+                score -= 40_000_000;
+            } else {
+                score -= 10_000_000;
+            }
+
+            if let Some(scope) = payload.get("scope").and_then(|v| v.as_str()) {
+                if scope.contains("grok-cli:access") {
+                    score += 500_000;
+                }
+                if scope.contains("conversations:write") {
+                    score += 200_000;
+                }
+                if scope.contains("conversations:read") {
+                    score += 100_000;
+                }
+            }
+        }
+    } else if account.refresh_token.is_some() {
+        // Refreshable but no access yet — still usable after ensure_fresh.
+        score += 1_000;
+    }
+    if let Some(q) = account.quota.as_ref() {
+        score += (q.remaining_percent.clamp(0.0, 100.0) * 100.0) as i64;
+    }
+    // Prefer tokens that are not already expired in local metadata.
+    if let Some(exp) = account.expires_at {
+        if exp > Utc::now() {
+            score += 5_000;
+        } else {
+            score -= 2_000;
+        }
+    }
+    if matches!(account.health, crate::config::AccountHealth::Healthy) {
+        score += 1_000;
+    }
+    score
+}
+
+fn pick_best_account_for_grok_build_session(
+    store: &crate::config::AuthStore,
+) -> Option<crate::config::Account> {
+    store
+        .accounts
+        .iter()
+        .filter(|a| a.enabled && a.is_credentialed())
+        .filter(|a| !matches!(a.auth_kind, crate::config::AccountAuthKind::Sso))
+        .max_by_key(|a| score_account_for_grok_build_session(a))
+        .cloned()
+}
+
+/// Write pool OAuth credentials into Grok Build `auth.json` session format so the
+/// TUI subscription gate / check_subscription can pass for SuperGrok-capable accounts.
+///
+/// The pre-inject snapshot under backups/grok-build-pre-route keeps the user's original
+/// `grok login` session for one-click restore.
+fn sync_grok_build_session_auth(config: &AppConfig) -> AppResult<()> {
+    let store = crate::config::load_auth()?;
+    let Some(account) = pick_best_account_for_grok_build_session(&store) else {
+        tracing::warn!(
+            target: "integrations",
+            "no credentialed OAuth account available to sync into ~/.grok/auth.json"
+        );
+        return Ok(());
+    };
+
+    // Refresh if expiring / missing access — keep pool store updated.
+    let mut account = account;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| AppError::msg(format!("tokio runtime for token refresh: {e}")))?;
+    match rt.block_on(crate::auth::ensure_fresh_token(config, &mut account)) {
+        Ok(_) => {
+            // Persist refreshed tokens back into GrokGo pool.
+            if let Ok(mut pool) = crate::config::load_auth() {
+                if let Some(slot) = pool.accounts.iter_mut().find(|a| a.id == account.id) {
+                    *slot = account.clone();
+                    let _ = crate::config::save_auth(&pool);
+                }
+            }
+        }
+        Err(err) => {
+            // Still try writing existing access token if present.
+            tracing::warn!(
+                target: "integrations",
+                account = %account.id,
+                "refresh before Grok Build session sync failed: {err}"
+            );
+            if account.access_token.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
+                return Err(AppError::msg(format!(
+                    "无法刷新账号 {} 的 token，Grok Build 会话同步失败：{err}",
+                    account.email.clone().unwrap_or_else(|| account.name.clone())
+                )));
+            }
+        }
+    }
+
+    let access = account
+        .access_token
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| AppError::msg("selected account has empty access token"))?;
+    let refresh = account
+        .refresh_token
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| AppError::msg("selected account missing refresh token"))?;
+
+    let payload = crate::auth::jwt_payload(&access).unwrap_or_else(|| json!({}));
+    let client_id = config.effective_xai_client_id().to_string();
+    let principal_id = payload
+        .get("principal_id")
+        .or_else(|| payload.get("sub"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let team_id = payload
+        .get("team_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let email = account
+        .email
+        .clone()
+        .or_else(|| {
+            payload
+                .get("email")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| account.name.clone());
+    let expires_at = account
+        .expires_at
+        .map(|t| t.to_rfc3339())
+        .or_else(|| {
+            payload
+                .get("exp")
+                .and_then(|v| v.as_i64())
+                .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
+                .map(|t| t.to_rfc3339())
+        })
+        .unwrap_or_else(|| (Utc::now() + chrono::Duration::hours(6)).to_rfc3339());
+    let tier = payload.get("tier").and_then(|v| v.as_i64());
+
+    let entry = json!({
+        "key": access,
+        "auth_mode": "oidc",
+        "create_time": Utc::now().to_rfc3339(),
+        "user_id": principal_id,
+        "email": email,
+        "principal_type": payload.get("principal_type").and_then(|v| v.as_str()).unwrap_or("User"),
+        "principal_id": principal_id,
+        "team_id": team_id,
+        "coding_data_retention_opt_out": true,
+        "refresh_token": refresh,
+        "expires_at": expires_at,
+        "oidc_issuer": "https://auth.x.ai",
+        "oidc_client_id": client_id,
+    });
+
+    let key = format!("https://auth.x.ai::{client_id}");
+    let mut root = serde_json::Map::new();
+    root.insert(key, entry);
+    let auth_path = grok_build_auth_path();
+    if let Some(parent) = auth_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Atomic-ish write
+    let tmp = auth_path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(&Value::Object(root))?)?;
+    fs::rename(&tmp, &auth_path).map_err(|e| {
+        // fallback copy
+        let _ = fs::copy(&tmp, &auth_path);
+        let _ = fs::remove_file(&tmp);
+        if auth_path.exists() {
+            Ok(())
+        } else {
+            Err(AppError::msg(format!("write ~/.grok/auth.json failed: {e}")))
+        }
+    }).or_else(|e| e)?;
+
+    tracing::info!(
+        target: "integrations",
+        account = %account.id,
+        email = %email,
+        ?tier,
+        path = %auth_path.display(),
+        "synced Grok Build session auth from pool account"
+    );
+    Ok(())
+}
+
 fn backup_grok_build_config(content: &str) -> AppResult<()> {
     if content.is_empty() {
         return Ok(());
@@ -312,6 +754,46 @@ fn backup_grok_build_config(content: &str) -> AppResult<()> {
     fs::create_dir_all(&backup_dir)?;
     let name = format!("grok-config-{}.toml", Utc::now().format("%Y%m%d-%H%M%S"));
     fs::write(backup_dir.join(name), content)?;
+    Ok(())
+}
+
+/// Snapshot config.toml + auth.json for one-click restore (login credentials included).
+fn snapshot_grok_build_for_restore(config_content: &str) -> AppResult<()> {
+    let dir = grok_build_restore_dir()?;
+    // config
+    fs::write(dir.join(GROK_BUILD_RESTORE_CONFIG), config_content)?;
+    // auth.json (may be missing if user never logged in)
+    let auth_path = grok_build_auth_path();
+    if auth_path.exists() {
+        fs::copy(&auth_path, dir.join(GROK_BUILD_RESTORE_AUTH)).map_err(|e| {
+            AppError::msg(format!("备份 Grok Build auth.json 失败：{e}"))
+        })?;
+    } else if dir.join(GROK_BUILD_RESTORE_AUTH).exists() {
+        // Keep previous auth snapshot if live file missing.
+    }
+    let meta = json!({
+        "savedAt": Utc::now().to_rfc3339(),
+        "reason": "pre-multi-account-route-inject",
+        "configPath": grok_build_config_path().display().to_string(),
+        "authPath": auth_path.display().to_string(),
+    });
+    fs::write(
+        dir.join(GROK_BUILD_RESTORE_META),
+        serde_json::to_string_pretty(&meta)?,
+    )?;
+    tracing::info!(
+        target: "integrations",
+        dir = %dir.display(),
+        "saved Grok Build pre-route restore snapshot"
+    );
+    Ok(())
+}
+
+fn backup_file_to(src: &std::path::Path, dest: &std::path::Path) -> AppResult<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(src, dest).map_err(|e| AppError::msg(format!("backup {} failed: {e}", src.display())))?;
     Ok(())
 }
 
@@ -1277,14 +1759,94 @@ url = "http://127.0.0.1:8787/mcp"
     }
 
     #[test]
-    fn grok_build_detects_endpoints_models_base_url() {
+    fn scores_prefer_grok_build_referrer_over_sub2api_high_tier() {
+        use crate::config::{Account, AccountAuthKind};
+        let mut sub2 = Account::new("sub2");
+        sub2.enabled = true;
+        sub2.auth_kind = AccountAuthKind::Oauth;
+        sub2.refresh_token = Some("rt".into());
+        // tier=4 but referrer=sub2api — often fails TUI GrowthBook gate
+        sub2.access_token = Some(
+            "eyJhbGciOiJub25lIn0.eyJ0aWVyIjo0LCJyZWZlcnJlciI6InN1YjJhcGkiLCJzY29wZSI6Im9wZW5pZCBncm9rLWNsaTphY2Nlc3MgYXBpOmFjY2VzcyJ9.sig".into(),
+        );
+
+        let mut native = Account::new("native");
+        native.enabled = true;
+        native.auth_kind = AccountAuthKind::Oauth;
+        native.refresh_token = Some("rt".into());
+        // lower tier but official grok-build surface
+        native.access_token = Some(
+            "eyJhbGciOiJub25lIn0.eyJ0aWVyIjoxLCJyZWZlcnJlciI6Imdyb2stYnVpbGQiLCJzY29wZSI6Im9wZW5pZCBncm9rLWNsaTphY2Nlc3MgYXBpOmFjY2VzcyBjb252ZXJzYXRpb25zOnJlYWQgY29udmVyc2F0aW9uczp3cml0ZSJ9.sig".into(),
+        );
+
+        assert!(
+            score_account_for_grok_build_session(&native)
+                > score_account_for_grok_build_session(&sub2)
+        );
+    }
+
+    #[test]
+    fn scores_higher_tier_for_session_pick() {
+        use crate::config::{Account, AccountAuthKind};
+        let mut low = Account::new("low");
+        low.enabled = true;
+        low.auth_kind = AccountAuthKind::Oauth;
+        low.refresh_token = Some("rt".into());
+        low.access_token = None;
+
+        let mut high = Account::new("high");
+        high.enabled = true;
+        high.auth_kind = AccountAuthKind::Oauth;
+        high.refresh_token = Some("rt".into());
+        high.access_token = Some(
+            "eyJhbGciOiJub25lIn0.eyJ0aWVyIjo0LCJyZWZlcnJlciI6Imdyb2stYnVpbGQiLCJzY29wZSI6Imdyb2stY2xpOmFjY2VzcyJ9.sig".into(),
+        );
+
+        assert!(
+            score_account_for_grok_build_session(&high)
+                > score_account_for_grok_build_session(&low)
+        );
+    }
+
+    #[test]
+    fn picks_enabled_credentialed_over_disabled() {
+        use crate::config::{Account, AccountAuthKind, AuthStore};
+        let mut disabled = Account::new("d");
+        disabled.enabled = false;
+        disabled.auth_kind = AccountAuthKind::Oauth;
+        disabled.access_token = Some(
+            "eyJhbGciOiJub25lIn0.eyJ0aWVyIjo0fQ.sig".into(),
+        );
+        disabled.refresh_token = Some("rt".into());
+        let mut enabled = Account::new("e");
+        enabled.enabled = true;
+        enabled.auth_kind = AccountAuthKind::Oauth;
+        enabled.access_token = Some(
+            "eyJhbGciOiJub25lIn0.eyJ0aWVyIjoxfQ.sig".into(),
+        );
+        enabled.refresh_token = Some("rt".into());
+        let store = AuthStore {
+            accounts: vec![disabled, enabled.clone()],
+        };
+        let picked = pick_best_account_for_grok_build_session(&store).unwrap();
+        assert_eq!(picked.name, enabled.name);
+    }
+
+    #[test]
+    fn grok_build_detects_cli_chat_proxy_base_url() {
         let mut cfg = AppConfig::default();
         cfg.actual_port = 8787;
         let raw = r#"
 [endpoints]
-models_base_url = "http://127.0.0.1:8787/v1"
+cli_chat_proxy_base_url = "http://127.0.0.1:8787/v1"
 "#;
         assert!(grok_build_is_injected(raw, &cfg));
+        // models_base_url alone is NOT the standard inject path.
+        let api_only = r#"
+[endpoints]
+models_base_url = "http://127.0.0.1:8787/v1"
+"#;
+        assert!(!grok_build_is_injected(api_only, &cfg));
     }
 
     #[test]
@@ -1300,4 +1862,19 @@ api_key = "x"
 "#;
         assert!(!grok_build_is_injected(raw, &cfg));
     }
+
+    #[test]
+    fn grok_build_snippet_is_standard_session() {
+        let mut cfg = AppConfig::default();
+        cfg.actual_port = 8787;
+        let snip = grok_build_snippet(&cfg);
+        assert!(snip.contains("cli_chat_proxy_base_url"));
+        assert!(snip.contains("GROK_CLI_CHAT_PROXY_BASE_URL"));
+        // Must not assign models_base_url (comment warning is fine).
+        assert!(!snip.contains("models_base_url ="));
+        assert!(!snip.contains("XAI_API_KEY"));
+        assert!(!snip.contains("GROK_MODELS_BASE_URL"));
+    }
+
+
 }

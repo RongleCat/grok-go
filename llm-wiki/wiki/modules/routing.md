@@ -36,11 +36,26 @@
 - 全部 cooldown：返回最早解禁时间
 - 本请求已无剩余号：`no more accounts available for failover`
 
+## Grok Build 原生平面
+
+- 客户端带 `X-XAI-Token-Auth: xai-grok-cli` / `x-grok-model-override` 时走 **cli-chat-proxy** 上游（`cli_chat_proxy_base_url`），不是 console `api.x.ai`。
+- 会话黏连与 `prompt_cache_key` / `x-grok-conv-id` 与 Codex 路径共用；并透传 Grok Build 所需 CLI 头。
+- **缓存 / token 护栏**（防止多轮 miss 与重复计费）：
+  - sticky key 优先读 `x-grok-conv-id` / `x-grok-session-id` / `x-grok-agent-id`
+  - 上游 `x-grok-conv-id` **优先透传客户端原值**（勿用 seed 覆盖）
+  - Build 平面保留 `previous_response_id` / `prompt_cache_retention`；**不**跑 empty-completion 静默重试、nuclear strip、Files offload
+- **必须透传** `GET /v1/user?include=subscription` 与 **`GET /v1/settings`**：
+  - `/user`：订阅枚举（GrokPro / XPremiumPlus…）
+  - `/settings`：远程配置含 **`allow_access`**（真正开关；缺路由会一直 subscription required）
+  - 不要把 `subscriptionTiers` 改写成非 API 枚举（如 `SuperGrok` 字符串会触发 `paywall_check_no_subscription`）
+- 集成注入见 [[integrations]]。
+
 ## 相关页面
 
 - [[auth-oauth]]
 - [[gateway]]
 - [[config-runtime]]
+- [[integrations]]
 
 ## 来源
 

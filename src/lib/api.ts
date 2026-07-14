@@ -232,6 +232,8 @@ export type IntegrationStatus = {
   providerSnippet: string;
   mcpSnippet: string;
   grokBuildSnippet: string;
+  /** Claude Code env JSON for CC Switch / ~/.claude/settings.json */
+  claudeCodeSnippet: string;
 };
 
 export type ModelOptions = {
@@ -287,5 +289,6 @@ export const api = {
     invoke<IntegrationStatus>("set_grok_build_inject", { enabled }),
   restoreGrokBuildBackup: () => invoke<IntegrationStatus>("restore_grok_build_backup"),
   importToCcSwitch: () => invoke<string>("import_to_cc_switch"),
+  importClaudeToCcSwitch: () => invoke<string>("import_claude_to_cc_switch"),
   exportProviderSnippet: () => invoke<string>("export_provider_snippet"),
 };

@@ -1,6 +1,7 @@
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -82,23 +83,59 @@ pub async fn authorize_request(headers: &HeaderMap, config: &AppConfig) -> Resul
     if !config.require_token {
         return Ok(());
     }
+    let expected = config.local_token.trim();
+    if expected.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            crate::gateway::anthropic::anthropic_error_body(
+                "authentication_error",
+                "local token is empty; set requireToken=false or configure localToken",
+            )
+            .to_string(),
+        )
+            .into_response());
+    }
+
+    // Bearer (OpenAI / Codex / Grok Build)
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    let token = auth.strip_prefix("Bearer ").unwrap_or(auth).trim();
-    if token == config.local_token {
+    let bearer = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .unwrap_or(auth)
+        .trim();
+    if !bearer.is_empty() && bearer == expected {
         return Ok(());
     }
+
+    // Anthropic / Claude Code: x-api-key (and occasional bare Authorization without Bearer)
+    let x_api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if !x_api_key.is_empty() && x_api_key == expected {
+        return Ok(());
+    }
+    if !bearer.is_empty() && bearer == expected {
+        return Ok(());
+    }
+
     // Grok Build native plane sends the user's session OAuth token (auth.json).
     // GrokGo replaces it with a pool account token upstream; accept any non-empty
     // bearer when build-plane markers are present (local multi-account routing).
-    if is_grok_build_plane(headers) && !token.is_empty() {
+    if is_grok_build_plane(headers) && !bearer.is_empty() {
         return Ok(());
     }
     Err((
         StatusCode::UNAUTHORIZED,
-        json!({"error": {"message": "invalid local bearer token", "type": "auth_error"}}).to_string(),
+        crate::gateway::anthropic::anthropic_error_body(
+            "authentication_error",
+            "invalid local token (use Authorization: Bearer or x-api-key)",
+        )
+        .to_string(),
     )
         .into_response())
 }
@@ -257,6 +294,319 @@ pub async fn proxy_json(
         )
             .into_response(),
     }
+}
+
+/// Claude Code / Anthropic Messages API → xAI Chat Completions → Anthropic response.
+///
+/// Endpoint: `POST /v1/messages` (and streaming via `stream: true`).
+pub async fn proxy_anthropic_messages(
+    ctx: &ProxyContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match proxy_anthropic_messages_inner(ctx, headers, body).await {
+        Ok(resp) => resp,
+        Err(err) => {
+            let status = StatusCode::BAD_GATEWAY;
+            let body = crate::gateway::anthropic::anthropic_error_body("api_error", err.to_string());
+            (status, body.to_string()).into_response()
+        }
+    }
+}
+
+/// Claude Code token preflight: `POST /v1/messages/count_tokens`.
+pub async fn proxy_anthropic_count_tokens(
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::gateway::anthropic::anthropic_error_body("api_error", err.to_string())
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+    if let Err(resp) = authorize_request(&headers, &config).await {
+        return resp;
+    }
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                crate::gateway::anthropic::anthropic_error_body(
+                    "invalid_request_error",
+                    format!("invalid JSON: {err}"),
+                )
+                .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let input_tokens = crate::gateway::anthropic::estimate_token_count(&value);
+    Json(json!({
+        "input_tokens": input_tokens
+    }))
+    .into_response()
+}
+
+async fn proxy_anthropic_messages_inner(
+    ctx: &ProxyContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    use crate::gateway::anthropic::{
+        anthropic_to_openai_chat, map_client_model, openai_chat_to_anthropic,
+        openai_error_to_anthropic, OpenAiToAnthropicSse,
+    };
+    use crate::gateway::payload_optimize::optimize_responses_payload;
+    use futures_util::stream;
+
+    let config = load_config()?;
+    authorize_request(&headers, &config)
+        .await
+        .map_err(|resp| AppError::msg(format!("unauthorized: {}", response_to_text(resp))))?;
+
+    let anthropic_req: Value = serde_json::from_slice(&body)
+        .map_err(|e| AppError::msg(format!("invalid JSON body: {e}")))?;
+
+    let converted = anthropic_to_openai_chat(&anthropic_req)
+        .map_err(|e| AppError::msg(format!("anthropic request convert: {e}")))?;
+
+    let (mapped_model, map_reason) =
+        map_client_model(&converted.requested_model, &config.default_model);
+    let (resolved_model, resolve_reason) = resolve_model(&config, &mapped_model);
+    let mapping_reason = format!("anthropic:{map_reason}:{resolve_reason}");
+
+    let mut chat_body = converted.body;
+    chat_body["model"] = Value::String(resolved_model.clone());
+
+    // Reuse multi-turn payload shrink (images / huge tool outputs).
+    let opt = optimize_responses_payload(&mut chat_body);
+    if opt.modified {
+        opt.log_summary("/v1/messages");
+    }
+
+    let client_wants_stream = converted.stream
+        || headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+    if client_wants_stream {
+        chat_body["stream"] = Value::Bool(true);
+        if chat_body.get("stream_options").is_none() {
+            chat_body["stream_options"] = json!({"include_usage": true});
+        }
+    }
+
+    let outbound_body = Bytes::from(serde_json::to_vec(&chat_body)?);
+    let session_key = session_affinity::extract_session_key(&headers, Some(&chat_body));
+    let http = ctx.client();
+    let upstream_base = config.xai_base_url.trim_end_matches('/');
+    let url = format!("{upstream_base}/chat/completions");
+
+    let build_upstream = {
+        let url = url.clone();
+        move |client: &reqwest::Client, token: &str, body: Bytes| {
+            client
+                .post(&url)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::ACCEPT,
+                    if client_wants_stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
+                .body(body)
+        }
+    };
+
+    let started = Instant::now();
+    let request_id = Uuid::new_v4().to_string();
+    let (mut account, _token, upstream) = send_with_account_failover(
+        &config,
+        &http,
+        &url,
+        &build_upstream,
+        outbound_body,
+        session_key.as_deref(),
+        false, // Files offload is Responses-oriented; skip for Anthropic chat path
+    )
+    .await?;
+
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+    apply_rate_limit_headers(&mut account, &upstream_headers);
+    let is_stream = status.is_success()
+        && upstream_headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream") || v.contains("stream"))
+            .unwrap_or(false);
+
+    let latency_ms = started.elapsed().as_millis() as u64;
+    let path = "/v1/messages";
+    let client_source = "anthropic-messages";
+
+    if is_stream {
+        if status.is_success() {
+            mark_success(&mut account);
+            touch_account_cache(&account);
+            if let Some(key) = session_key.as_ref() {
+                if config.session_affinity {
+                    session_affinity::bind(key, &account.id, config.session_affinity_ttl_secs);
+                }
+            }
+        } else {
+            apply_status_failure(&mut account, status, &upstream_headers);
+            let _ = replace_account_tokens(&account);
+        }
+
+        let usage_tracker = Arc::new(StreamUsageTracker::new(
+            request_id.clone(),
+            Some(account.id.clone()),
+            path.to_string(),
+            Some(converted.requested_model.clone()),
+            Some(resolved_model.clone()),
+            status.as_u16(),
+            latency_ms,
+            client_source.to_string(),
+            config.session_affinity,
+            config.session_affinity_ttl_secs,
+            account.id.clone(),
+        ));
+        // Shared converter so we can push chunks then finish() after upstream closes
+        // (covers providers that omit `data: [DONE]`).
+        let converter = Arc::new(parking_lot::Mutex::new(OpenAiToAnthropicSse::new()));
+        let tracker = usage_tracker.clone();
+        let conv_push = converter.clone();
+        let head = upstream.bytes_stream().map(move |chunk| {
+            chunk
+                .map(|bytes| {
+                    tracker.note_chunk(&bytes);
+                    let mut c = conv_push.lock();
+                    Bytes::from(c.push(&bytes))
+                })
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        });
+        let conv_fin = converter.clone();
+        let tail = stream::once(async move {
+            let mut c = conv_fin.lock();
+            Ok::<Bytes, std::io::Error>(Bytes::from(c.finish()))
+        });
+        let body = Body::from_stream(head.chain(tail));
+        let mut response = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(body)
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+        for (k, v) in upstream_headers.iter() {
+            let key = k.as_str().to_ascii_lowercase();
+            if matches!(key.as_str(), "x-request-id") {
+                if let Ok(name) = HeaderName::from_bytes(k.as_ref()) {
+                    response.headers_mut().insert(name, v.clone());
+                }
+            }
+        }
+        tracing::debug!(
+            target: "gateway",
+            %mapping_reason,
+            model = %resolved_model,
+            "anthropic messages stream started"
+        );
+        return Ok(response);
+    }
+
+    // Non-streaming JSON
+    let bytes = upstream.bytes().await?;
+    if status.is_success() {
+        mark_success(&mut account);
+        touch_account_cache(&account);
+        if let Some(key) = session_key.as_ref() {
+            if config.session_affinity {
+                session_affinity::bind(key, &account.id, config.session_affinity_ttl_secs);
+            }
+        }
+    } else {
+        apply_status_failure(&mut account, status, &upstream_headers);
+        let _ = replace_account_tokens(&account);
+    }
+
+    let upstream_json: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        json!({"error": {"message": String::from_utf8_lossy(&bytes), "type": "upstream_error"}})
+    });
+
+    let (out_status, out_value) = if status.is_success() {
+        match openai_chat_to_anthropic(&upstream_json) {
+            Ok(v) => (StatusCode::OK, v),
+            Err(err) => (
+                StatusCode::BAD_GATEWAY,
+                crate::gateway::anthropic::anthropic_error_body(
+                    "api_error",
+                    format!("response convert failed: {err}"),
+                ),
+            ),
+        }
+    } else {
+        (
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            openai_error_to_anthropic(status.as_u16(), &upstream_json),
+        )
+    };
+
+    let (i, o, c) = extract_usage_tokens(&upstream_json);
+    // Also read Anthropic-shaped usage if conversion already happened.
+    let (i, o, c) = if i == 0 && o == 0 {
+        let input = out_value
+            .pointer("/usage/input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output = out_value
+            .pointer("/usage/output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        (input, output, c)
+    } else {
+        (i, o, c)
+    };
+
+    log_request(
+        &request_id,
+        Some(account.id.clone()),
+        path,
+        Some(converted.requested_model),
+        Some(resolved_model),
+        out_status.as_u16(),
+        started.elapsed().as_millis() as u64,
+        None,
+        i,
+        o,
+        c,
+        if out_status.is_success() {
+            None
+        } else {
+            Some(out_value.to_string())
+        },
+        client_source,
+        Some(mapping_reason),
+    );
+
+    let mut response = Response::builder()
+        .status(out_status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&out_value)?))
+        .unwrap_or_else(|_| Response::new(Body::empty()));
+    copy_safe_headers(upstream_headers, response.headers_mut());
+    Ok(response)
 }
 
 async fn proxy_json_inner(

@@ -473,7 +473,9 @@ export function SettingsPage() {
                           />
                           <div className="min-w-0">
                             <div className="text-sm font-medium">{opt.label}</div>
-                            <div className="text-xs text-neutral-500">{opt.desc}</div>
+                            {opt.desc ? (
+                              <div className="text-xs text-neutral-500">{opt.desc}</div>
+                            ) : null}
                           </div>
                         </button>
                       );
@@ -737,7 +739,9 @@ export function SettingsPage() {
                 <CardTitle className="text-base">{t.settings.routing}</CardTitle>
               </CardHeader>
               <CardContent className="grid gap-3 md:grid-cols-2">
-                <p className="text-sm text-neutral-500 md:col-span-2">{t.settings.routingDesc}</p>
+                {t.settings.routingDesc ? (
+                  <p className="text-sm text-neutral-500 md:col-span-2">{t.settings.routingDesc}</p>
+                ) : null}
                 <div className="md:col-span-2">
                   <Label>{t.settings.routingStrategy}</Label>
                   <Select
@@ -757,7 +761,9 @@ export function SettingsPage() {
                 <div className="flex items-center justify-between gap-3 rounded-md border border-neutral-200 px-3 py-2">
                   <div className="min-w-0">
                     <div className="text-sm font-medium">{t.settings.sessionAffinity}</div>
-                    <div className="text-xs text-neutral-500">{t.settings.sessionAffinityDesc}</div>
+                    {t.settings.sessionAffinityDesc ? (
+                      <div className="text-xs text-neutral-500">{t.settings.sessionAffinityDesc}</div>
+                    ) : null}
                   </div>
                   <Switch
                     checked={config.sessionAffinity !== false}
@@ -767,7 +773,9 @@ export function SettingsPage() {
                 <div className="flex items-center justify-between gap-3 rounded-md border border-neutral-200 px-3 py-2">
                   <div className="min-w-0">
                     <div className="text-sm font-medium">{t.settings.quotaAwareRouting}</div>
-                    <div className="text-xs text-neutral-500">{t.settings.quotaAwareRoutingDesc}</div>
+                    {t.settings.quotaAwareRoutingDesc ? (
+                      <div className="text-xs text-neutral-500">{t.settings.quotaAwareRoutingDesc}</div>
+                    ) : null}
                   </div>
                   <Switch
                     checked={config.quotaAwareRouting !== false}
@@ -777,7 +785,9 @@ export function SettingsPage() {
                 <div className="flex items-center justify-between gap-3 rounded-md border border-neutral-200 px-3 py-2">
                   <div className="min-w-0">
                     <div className="text-sm font-medium">{t.settings.preferSoonestReset}</div>
-                    <div className="text-xs text-neutral-500">{t.settings.preferSoonestResetDesc}</div>
+                    {t.settings.preferSoonestResetDesc ? (
+                      <div className="text-xs text-neutral-500">{t.settings.preferSoonestResetDesc}</div>
+                    ) : null}
                   </div>
                   <Switch
                     checked={Boolean(config.preferSoonestReset)}
@@ -796,7 +806,9 @@ export function SettingsPage() {
                       })
                     }
                   />
-                  <p className="mt-1 text-xs text-neutral-500">{t.settings.accountMaxConcurrencyDesc}</p>
+                  {t.settings.accountMaxConcurrencyDesc ? (
+                    <p className="mt-1 text-xs text-neutral-500">{t.settings.accountMaxConcurrencyDesc}</p>
+                  ) : null}
                 </div>
               </CardContent>
             </Card>
@@ -937,7 +949,7 @@ function BackupSectionCard({
               />
               <div className="min-w-0">
                 <div className="text-sm font-medium">{row.label}</div>
-                <div className="text-xs text-neutral-500">{row.desc}</div>
+                {row.desc ? <div className="text-xs text-neutral-500">{row.desc}</div> : null}
               </div>
             </label>
           ))}

@@ -10,6 +10,7 @@
 - [[queries/faq]]：高频问题
 - [[queries/account-quota-research]]：反代项目如何获取用量/刷新时间（调研结论）
 - [[queries/proxy-cache-routing-research]]：sub2api/CPA 缓存省量与流量分配策略（可借鉴清单）
+- [[queries/anthropic-claude-code-research]]：Anthropic Messages / Claude Code 接入与开源转换方案对比
 
 ## 模块
 

@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod empty_completion;
 pub mod files_api;
 pub mod image_bridge;

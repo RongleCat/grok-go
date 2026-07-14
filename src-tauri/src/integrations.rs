@@ -1,16 +1,34 @@
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::config::{load_config, save_config, AppConfig};
+use crate::auth::TokenProbe;
+use crate::config::{load_config, save_config, Account, AppConfig};
 use crate::error::{AppError, AppResult};
 use crate::paths::{
     agents_guide_file_path, app_home, cc_switch_db_path, codex_agents_md_path, codex_config_path,
     grok_build_auth_path, grok_build_config_path, grok_build_restore_dir,
 };
+
+/// Serialize writes to `~/.grok/auth.json` (inject + background maintainer).
+static GROK_AUTH_WRITE_LOCK: Lazy<AsyncMutex<()>> = Lazy::new(|| AsyncMutex::new(()));
+/// Ensure the maintainer loop is only started once per process.
+static GROK_AUTH_MAINTAINER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// How often to refresh a validated pool session into Grok Build `auth.json`.
+/// Token lifetimes are usually hours; 15m keeps `expires_at` healthy without hammering IdP.
+const GROK_AUTH_MAINTAIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Delay before the first maintenance tick so startup / gateway settle first.
+const GROK_AUTH_MAINTAIN_INITIAL_DELAY: Duration = Duration::from_secs(45);
+/// How many pool accounts to try (best → next) if userinfo rejects the token.
+const GROK_AUTH_MAX_ACCOUNT_TRIES: usize = 3;
 
 /// Markers around the short reference line in Codex `AGENTS.md`.
 /// Detection of "injected" is presence of this fixed start marker (or legacy ones).
@@ -79,6 +97,8 @@ pub struct IntegrationStatus {
     pub mcp_snippet: String,
     /// Ready-to-paste standard session routing block.
     pub grok_build_snippet: String,
+    /// Claude Code / CC Switch env JSON (ANTHROPIC_BASE_URL without `/v1`).
+    pub claude_code_snippet: String,
 }
 
 pub fn integration_status() -> AppResult<IntegrationStatus> {
@@ -142,6 +162,7 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
         provider_snippet: provider_snippet(&config),
         mcp_snippet: mcp_snippet(&config),
         grok_build_snippet: grok_build_snippet(&config),
+        claude_code_snippet: claude_code_settings_snippet(&config),
     })
 }
 
@@ -283,6 +304,17 @@ fn gateway_base_url(config: &AppConfig) -> String {
         "127.0.0.1".into()
     };
     format!("http://{}:{}/v1", host, config.actual_port)
+}
+
+/// Claude Code `ANTHROPIC_BASE_URL` — host root **without** `/v1`
+/// (client appends `/v1/messages`).
+fn anthropic_base_url(config: &AppConfig) -> String {
+    let host = if config.lan_enabled {
+        local_lan_host()
+    } else {
+        "127.0.0.1".into()
+    };
+    format!("http://{}:{}", host, config.actual_port)
 }
 
 /// Snippet for copy/paste: standard cli-chat-proxy session routing.
@@ -596,59 +628,166 @@ fn score_account_for_grok_build_session(account: &crate::config::Account) -> i64
 fn pick_best_account_for_grok_build_session(
     store: &crate::config::AuthStore,
 ) -> Option<crate::config::Account> {
-    store
+    ranked_accounts_for_grok_build_session(store).into_iter().next()
+}
+
+/// Seconds before JWT / expires_at that Grok CLI may still treat as valid.
+/// Grok docs mention `GROK_AUTH_EARLY_INVALIDATION_SECS` (default often ~300).
+const GROK_AUTH_EARLY_INVALIDATION_SECS: i64 = 300;
+
+/// Start a background loop that keeps `~/.grok/auth.json` fresh **only while**
+/// Grok Build routing points at this gateway. Idempotent.
+pub fn start_grok_build_auth_maintainer() {
+    if GROK_AUTH_MAINTAINER_STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(
+            target: "integrations",
+            interval_secs = GROK_AUTH_MAINTAIN_INTERVAL.as_secs(),
+            "Grok Build auth maintainer started"
+        );
+        tokio::time::sleep(GROK_AUTH_MAINTAIN_INITIAL_DELAY).await;
+        loop {
+            if let Err(err) = maintain_grok_build_session_auth().await {
+                tracing::warn!(
+                    target: "integrations",
+                    error = %err,
+                    "Grok Build auth maintain tick failed"
+                );
+            }
+            tokio::time::sleep(GROK_AUTH_MAINTAIN_INTERVAL).await;
+        }
+    });
+}
+
+/// One maintenance tick: if routing is injected, refresh + userinfo-probe a pool
+/// account and write only after the IdP confirms the token is valid.
+pub async fn maintain_grok_build_session_auth() -> AppResult<()> {
+    let config = load_config()?;
+    let path = grok_build_config_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&path).unwrap_or_default();
+    if !grok_build_is_injected(&raw, &config) {
+        return Ok(());
+    }
+    sync_grok_build_session_auth_async(&config, /*require_success*/ false).await
+}
+
+/// Sync path for inject (sync command handlers). Blocks on async work.
+fn sync_grok_build_session_auth(config: &AppConfig) -> AppResult<()> {
+    // Prefer current runtime when already inside Tauri/tokio; fall back to a
+    // dedicated runtime if called from a pure sync context.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return tokio::task::block_in_place(|| {
+            handle.block_on(sync_grok_build_session_auth_async(config, true))
+        });
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| AppError::msg(format!("tokio runtime for Grok Build auth sync: {e}")))?;
+    rt.block_on(sync_grok_build_session_auth_async(config, true))
+}
+
+/// Refresh the best pool account(s), **probe OIDC userinfo**, then write
+/// `~/.grok/auth.json` only when the IdP accepts the access token.
+///
+/// - `require_success`: inject path — surface errors to the user
+/// - maintainer path: log and leave existing file alone on failure
+async fn sync_grok_build_session_auth_async(
+    config: &AppConfig,
+    require_success: bool,
+) -> AppResult<()> {
+    let _guard = GROK_AUTH_WRITE_LOCK.lock().await;
+
+    let store = crate::config::load_auth()?;
+    let candidates = ranked_accounts_for_grok_build_session(&store);
+    if candidates.is_empty() {
+        let msg = "no credentialed OAuth account available to sync into ~/.grok/auth.json";
+        tracing::warn!(target: "integrations", "{msg}");
+        if require_success {
+            return Err(AppError::msg(
+                "没有可用的 OAuth 账号可同步到 Grok Build。请先在账号页登录。",
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut last_err: Option<String> = None;
+    for account in candidates.into_iter().take(GROK_AUTH_MAX_ACCOUNT_TRIES) {
+        match try_refresh_probe_and_write_session(config, account).await {
+            Ok(email) => {
+                tracing::info!(
+                    target: "integrations",
+                    %email,
+                    path = %grok_build_auth_path().display(),
+                    "Grok Build auth.json updated after userinfo validation"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "integrations",
+                    error = %err,
+                    "candidate account failed Grok Build auth sync"
+                );
+                last_err = Some(err.to_string());
+            }
+        }
+    }
+
+    let detail = last_err.unwrap_or_else(|| "all candidates failed".into());
+    if require_success {
+        return Err(AppError::msg(format!(
+            "无法把有效会话写入 ~/.grok/auth.json：{detail}\n\
+             请在账号页重新登录后再开启 Grok Build，或先用 `grok login` 登录。"
+        )));
+    }
+    // Maintainer: keep whatever is already on disk.
+    Ok(())
+}
+
+fn ranked_accounts_for_grok_build_session(store: &crate::config::AuthStore) -> Vec<Account> {
+    let mut list: Vec<Account> = store
         .accounts
         .iter()
         .filter(|a| a.enabled && a.is_credentialed())
         .filter(|a| !matches!(a.auth_kind, crate::config::AccountAuthKind::Sso))
-        .max_by_key(|a| score_account_for_grok_build_session(a))
         .cloned()
+        .collect();
+    list.sort_by_key(|a| std::cmp::Reverse(score_account_for_grok_build_session(a)));
+    list
 }
 
-/// Write pool OAuth credentials into Grok Build `auth.json` session format so the
-/// TUI subscription gate / check_subscription can pass for SuperGrok-capable accounts.
-///
-/// The pre-inject snapshot under backups/grok-build-pre-route keeps the user's original
-/// `grok login` session for one-click restore.
-fn sync_grok_build_session_auth(config: &AppConfig) -> AppResult<()> {
-    let store = crate::config::load_auth()?;
-    let Some(account) = pick_best_account_for_grok_build_session(&store) else {
-        tracing::warn!(
-            target: "integrations",
-            "no credentialed OAuth account available to sync into ~/.grok/auth.json"
-        );
-        return Ok(());
-    };
+/// Refresh → userinfo probe → write. Never writes without a Valid probe.
+async fn try_refresh_probe_and_write_session(
+    config: &AppConfig,
+    mut account: Account,
+) -> AppResult<String> {
+    // Force refresh so we do not probe a stale access token from disk.
+    crate::auth::refresh_account(config, &mut account)
+        .await
+        .map_err(|err| {
+            AppError::msg(format!(
+                "刷新账号 {} 失败：{err}",
+                account
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| account.name.clone())
+            ))
+        })?;
 
-    // Refresh if expiring / missing access — keep pool store updated.
-    let mut account = account;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| AppError::msg(format!("tokio runtime for token refresh: {e}")))?;
-    match rt.block_on(crate::auth::ensure_fresh_token(config, &mut account)) {
-        Ok(_) => {
-            // Persist refreshed tokens back into GrokGo pool.
-            if let Ok(mut pool) = crate::config::load_auth() {
-                if let Some(slot) = pool.accounts.iter_mut().find(|a| a.id == account.id) {
-                    *slot = account.clone();
-                    let _ = crate::config::save_auth(&pool);
-                }
-            }
-        }
-        Err(err) => {
-            // Still try writing existing access token if present.
-            tracing::warn!(
-                target: "integrations",
-                account = %account.id,
-                "refresh before Grok Build session sync failed: {err}"
-            );
-            if account.access_token.as_ref().map(|t| t.is_empty()).unwrap_or(true) {
-                return Err(AppError::msg(format!(
-                    "无法刷新账号 {} 的 token，Grok Build 会话同步失败：{err}",
-                    account.email.clone().unwrap_or_else(|| account.name.clone())
-                )));
-            }
+    // Persist refreshed tokens back into GrokGo pool (best-effort).
+    if let Ok(mut pool) = crate::config::load_auth() {
+        if let Some(slot) = pool.accounts.iter_mut().find(|a| a.id == account.id) {
+            *slot = account.clone();
+            let _ = crate::config::save_auth(&pool);
         }
     }
 
@@ -656,14 +795,67 @@ fn sync_grok_build_session_auth(config: &AppConfig) -> AppResult<()> {
         .access_token
         .clone()
         .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| AppError::msg("selected account has empty access token"))?;
+        .ok_or_else(|| AppError::msg("empty access token after refresh"))?;
     let refresh = account
         .refresh_token
         .clone()
         .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| AppError::msg("selected account missing refresh token"))?;
+        .ok_or_else(|| AppError::msg("missing refresh token after refresh"))?;
 
-    let payload = crate::auth::jwt_payload(&access).unwrap_or_else(|| json!({}));
+    // Live validation against auth.x.ai — only write if IdP accepts the token.
+    let probe = crate::auth::probe_access_token_userinfo(&access).await?;
+    match &probe {
+        TokenProbe::Valid { email, .. } => {
+            tracing::info!(
+                target: "integrations",
+                account = %account.id,
+                ?email,
+                "userinfo accepted access token"
+            );
+        }
+        TokenProbe::Invalid { status, detail } => {
+            return Err(AppError::msg(format!(
+                "userinfo 拒绝账号 {} 的 token (HTTP {status}): {detail}",
+                account
+                    .email
+                    .clone()
+                    .unwrap_or_else(|| account.name.clone())
+            )));
+        }
+        TokenProbe::Unreachable { detail } => {
+            return Err(AppError::msg(format!(
+                "无法校验 token（userinfo 不可达）：{detail}"
+            )));
+        }
+    }
+
+    // Reject near-expiry JWT even if userinfo briefly accepted it.
+    if let Some(exp) = crate::auth::jwt_payload(&access)
+        .and_then(|p| p.get("exp").and_then(|x| x.as_i64()))
+        .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
+    {
+        let horizon = Utc::now() + chrono::Duration::seconds(GROK_AUTH_EARLY_INVALIDATION_SECS);
+        if exp <= horizon {
+            return Err(AppError::msg(format!(
+                "access token 将在 {} 前失效，拒绝写入",
+                exp.to_rfc3339()
+            )));
+        }
+    }
+
+    let email = write_grok_build_auth_entry(config, &account, &access, &refresh, &probe)?;
+    Ok(email)
+}
+
+/// Merge validated credentials into `~/.grok/auth.json` (preserves profile fields).
+fn write_grok_build_auth_entry(
+    config: &AppConfig,
+    account: &Account,
+    access: &str,
+    refresh: &str,
+    probe: &TokenProbe,
+) -> AppResult<String> {
+    let payload = crate::auth::jwt_payload(access).unwrap_or_else(|| json!({}));
     let client_id = config.effective_xai_client_id().to_string();
     let principal_id = payload
         .get("principal_id")
@@ -671,13 +863,23 @@ fn sync_grok_build_session_auth(config: &AppConfig) -> AppResult<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if principal_id.is_empty() {
+        return Err(AppError::msg(
+            "token missing principal_id/sub; refuse writing Grok Build auth.json",
+        ));
+    }
     let team_id = payload
         .get("team_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let probe_email = match probe {
+        TokenProbe::Valid { email, .. } => email.clone(),
+        _ => None,
+    };
     let email = account
         .email
         .clone()
+        .or(probe_email)
         .or_else(|| {
             payload
                 .get("email")
@@ -685,47 +887,58 @@ fn sync_grok_build_session_auth(config: &AppConfig) -> AppResult<()> {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| account.name.clone());
-    let expires_at = account
-        .expires_at
+    let expires_at = payload
+        .get("exp")
+        .and_then(|v| v.as_i64())
+        .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
         .map(|t| t.to_rfc3339())
-        .or_else(|| {
-            payload
-                .get("exp")
-                .and_then(|v| v.as_i64())
-                .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
-                .map(|t| t.to_rfc3339())
-        })
+        .or_else(|| account.expires_at.map(|t| t.to_rfc3339()))
         .unwrap_or_else(|| (Utc::now() + chrono::Duration::hours(6)).to_rfc3339());
     let tier = payload.get("tier").and_then(|v| v.as_i64());
 
-    let entry = json!({
-        "key": access,
-        "auth_mode": "oidc",
-        "create_time": Utc::now().to_rfc3339(),
-        "user_id": principal_id,
-        "email": email,
-        "principal_type": payload.get("principal_type").and_then(|v| v.as_str()).unwrap_or("User"),
-        "principal_id": principal_id,
-        "team_id": team_id,
-        "coding_data_retention_opt_out": true,
-        "refresh_token": refresh,
-        "expires_at": expires_at,
-        "oidc_issuer": "https://auth.x.ai",
-        "oidc_client_id": client_id,
-    });
-
-    let key = format!("https://auth.x.ai::{client_id}");
-    let mut root = serde_json::Map::new();
-    root.insert(key, entry);
     let auth_path = grok_build_auth_path();
+    let mut root: serde_json::Map<String, Value> = fs::read_to_string(&auth_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let entry_key = format!("https://auth.x.ai::{client_id}");
+    let mut entry = root
+        .get(&entry_key)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    entry.insert("key".into(), json!(access));
+    entry.insert("auth_mode".into(), json!("oidc"));
+    if !entry.contains_key("create_time") {
+        entry.insert("create_time".into(), json!(Utc::now().to_rfc3339()));
+    }
+    entry.insert("user_id".into(), json!(principal_id.clone()));
+    entry.insert("email".into(), json!(email.clone()));
+    entry.insert(
+        "principal_type".into(),
+        json!(payload
+            .get("principal_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("User")),
+    );
+    entry.insert("principal_id".into(), json!(principal_id));
+    if let Some(tid) = team_id {
+        entry.insert("team_id".into(), json!(tid));
+    }
+    entry.insert("coding_data_retention_opt_out".into(), json!(true));
+    entry.insert("refresh_token".into(), json!(refresh));
+    entry.insert("expires_at".into(), json!(expires_at));
+    entry.insert("oidc_issuer".into(), json!("https://auth.x.ai"));
+    entry.insert("oidc_client_id".into(), json!(client_id));
+
+    root.insert(entry_key, Value::Object(entry));
     if let Some(parent) = auth_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Atomic-ish write
     let tmp = auth_path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_string_pretty(&Value::Object(root))?)?;
     fs::rename(&tmp, &auth_path).map_err(|e| {
-        // fallback copy
         let _ = fs::copy(&tmp, &auth_path);
         let _ = fs::remove_file(&tmp);
         if auth_path.exists() {
@@ -741,9 +954,9 @@ fn sync_grok_build_session_auth(config: &AppConfig) -> AppResult<()> {
         email = %email,
         ?tier,
         path = %auth_path.display(),
-        "synced Grok Build session auth from pool account"
+        "wrote validated session into Grok Build auth.json"
     );
-    Ok(())
+    Ok(email)
 }
 
 fn backup_grok_build_config(content: &str) -> AppResult<()> {
@@ -1139,13 +1352,35 @@ fn backup_codex_agents_md(content: &str) -> AppResult<()> {
 }
 
 pub fn import_cc_switch_provider() -> AppResult<String> {
+    import_cc_switch_provider_for_app("codex")
+}
+
+/// Import GrokGo as a Claude Code provider into CC Switch (`app_type = claude`).
+pub fn import_cc_switch_claude_provider() -> AppResult<String> {
+    import_cc_switch_provider_for_app("claude")
+}
+
+fn import_cc_switch_provider_for_app(app_type: &str) -> AppResult<String> {
+    let app_type = match app_type {
+        "claude" => "claude",
+        _ => "codex",
+    };
     let config = load_config()?;
     // If MCP inject is currently on (flag or live codex config), ship MCP with the provider.
     let include_mcp = config.auto_inject_codex_mcp || codex_mcp_currently_injected();
     let db_path = cc_switch_db_path();
     if !db_path.exists() {
-        let payload = provider_export_json(&config, include_mcp);
-        let export_path = crate::paths::app_home()?.join("cc-switch-provider-export.json");
+        let payload = if app_type == "claude" {
+            claude_provider_export_json(&config)
+        } else {
+            provider_export_json(&config, include_mcp)
+        };
+        let export_name = if app_type == "claude" {
+            "cc-switch-claude-provider-export.json"
+        } else {
+            "cc-switch-provider-export.json"
+        };
+        let export_path = crate::paths::app_home()?.join(export_name);
         fs::write(&export_path, serde_json::to_string_pretty(&payload)?)?;
         return Ok(format!(
             "未检测到 CC Switch 数据库（{}）。已把配置导出到：\n{}\n请先安装并打开一次 CC Switch，或在 CC Switch 里手动导入该 JSON。",
@@ -1162,17 +1397,26 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
     })?;
 
     let name = "GrokGo";
-    let settings = provider_settings_config(&config, include_mcp);
+    let settings = if app_type == "claude" {
+        claude_provider_settings_config(&config)
+    } else {
+        provider_settings_config(&config, include_mcp)
+    };
     let settings_text = serde_json::to_string(&settings)?;
     let now = Utc::now().timestamp_millis();
-    let notes = if include_mcp {
+    let notes = if app_type == "claude" {
+        "由 GrokGo 同步（Claude Code / Anthropic Messages）"
+    } else if include_mcp {
         "由 GrokGo 同步（含 MCP）"
     } else {
         "由 GrokGo 同步"
     };
 
-    // Prefer updating an existing GrokGo Codex provider instead of inserting duplicates.
-    let existing = find_existing_grokgo_provider(&conn)?;
+    // Prefer updating a *true* GrokGo provider for this app_type.
+    // Never hijack third-party Claude providers (DeepSeek / Kimi / …) just because
+    // they also ship `ANTHROPIC_BASE_URL` in settings_config.
+    let website_url = grokgo_provider_website_url(app_type, &config);
+    let existing = find_existing_grokgo_provider_for_app(&conn, app_type)?;
     let (action_zh, provider_id) = if let Some((id, _created)) = existing {
         conn.execute(
             r#"
@@ -1180,14 +1424,16 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
             SET name = ?1,
                 settings_config = ?2,
                 notes = ?3,
-                category = 'custom'
-            WHERE id = ?4 AND app_type = 'codex'
+                website_url = ?4,
+                category = 'custom',
+                icon = NULL,
+                icon_color = NULL
+            WHERE id = ?5 AND app_type = ?6
             "#,
-            params![name, settings_text, notes, id],
+            params![name, settings_text, notes, website_url, id, app_type],
         )
         .map_err(|e| AppError::msg(format!("更新 CC Switch 中的 GrokGo 配置失败：{e}")))?;
-        // Clean accidental duplicate GrokGo rows from older versions that always INSERT.
-        let removed = remove_duplicate_grokgo_providers(&conn, &id).unwrap_or(0);
+        let removed = remove_duplicate_grokgo_providers_for_app(&conn, app_type, &id).unwrap_or(0);
         let mut action = "已更新".to_string();
         if removed > 0 {
             action = format!("已更新（并清理了 {removed} 条重复的 GrokGo 配置）");
@@ -1201,17 +1447,19 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
               id, app_type, name, settings_config, website_url, category, created_at,
               sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue,
               cost_multiplier, limit_daily_usd, limit_monthly_usd, provider_type
-            ) VALUES (?1,'codex',?2,?3,NULL,'custom',?4,NULL,?5,NULL,NULL,'{}',0,0,'1.0',NULL,NULL,NULL)
+            ) VALUES (?1,?2,?3,?4,?5,'custom',?6,NULL,?7,NULL,NULL,'{}',0,0,'1.0',NULL,NULL,NULL)
             "#,
-            params![id, name, settings_text, now, notes],
+            params![id, app_type, name, settings_text, website_url, now, notes],
         )
         .map_err(|e| AppError::msg(format!("写入 CC Switch 失败：{e}")))?;
         ("已新增".to_string(), id)
     };
 
     let mut mcp_part = String::new();
-    if include_mcp {
-        match upsert_cc_switch_mcp_server(&conn, &config) {
+    // Always try MCP upsert for Claude (enable Claude app flag); for Codex only when include_mcp.
+    let should_mcp = app_type == "claude" || include_mcp;
+    if should_mcp {
+        match upsert_cc_switch_mcp_server_for_app(&conn, &config, app_type) {
             Ok(msg) => {
                 if msg.contains("updated") {
                     mcp_part = " MCP 已同步更新。".into();
@@ -1231,6 +1479,20 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
     }
 
     let import_model = crate::config::cc_switch_import_default_model(&config.default_model);
+    if app_type == "claude" {
+        let base = anthropic_base_url(&config);
+        return Ok(format!(
+            "{action_zh} CC Switch 中的 GrokGo（Claude Code）配置。\n\
+             已写入 ANTHROPIC_BASE_URL={base}（Messages 兼容层）。\n\
+             模型：Haiku/Sonnet/Opus → {import_model}（可在 model_mappings 覆盖）。\n\
+             请在 CC Switch 切换到 Claude 应用并选用 GrokGo，然后重启 Claude Code。{}",
+            mcp_part.trim_end(),
+        )
+        .trim()
+        .to_string()
+            + &format!("\n（配置 id：{provider_id}）"));
+    }
+
     let reasoning_note =
         if crate::config::xai_model_default_reasoning_effort(import_model).is_some() {
             " 已启用思考深度（model_reasoning_effort）。"
@@ -1251,32 +1513,76 @@ pub fn import_cc_switch_provider() -> AppResult<String> {
     )
     .trim()
     .to_string()
-    + &format!("\n（配置 id：{provider_id}）"))
+        + &format!("\n（配置 id：{provider_id}）"))
 }
 
-/// Find existing GrokGo Codex provider: prefer `is_current`, else newest `created_at`.
-fn find_existing_grokgo_provider(conn: &Connection) -> AppResult<Option<(String, i64)>> {
-    // Match by name (primary) or legacy notes from older imports.
+/// Website URL written into CC Switch for GrokGo providers.
+/// Local gateway — never reuse third-party marketing URLs (DeepSeek / Kimi / …).
+fn grokgo_provider_website_url(app_type: &str, config: &AppConfig) -> String {
+    if app_type == "claude" {
+        anthropic_base_url(config)
+    } else {
+        gateway_base_url(config)
+    }
+}
+
+/// Find existing GrokGo provider for `app_type` (`codex` | `claude`).
+///
+/// Identity is intentionally strict:
+/// - **name = GrokGo** (primary, both apps)
+/// - **notes** written by our sync
+/// - **Codex** settings fingerprints (`model_providers.grok-go`, …)
+/// - **Claude** only when `settings_config` already contains *this* local gateway
+///   base URL. Bare `ANTHROPIC_BASE_URL` must NOT match — every Claude provider
+///   in CC Switch has that key (DeepSeek, Kimi, Z.ai, …).
+fn find_existing_grokgo_provider_for_app(
+    conn: &Connection,
+    app_type: &str,
+) -> AppResult<Option<(String, i64)>> {
+    let config = load_config().unwrap_or_default();
+    let local_anthropic = anthropic_base_url(&config);
+    // Containment match on our gateway root (no `/v1`). Escape LIKE metacharacters.
+    let local_base_like = format!(
+        "%{}%",
+        local_anthropic
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+
     let mut stmt = conn
         .prepare(
             r#"
             SELECT id, COALESCE(created_at, 0), COALESCE(is_current, 0)
             FROM providers
-            WHERE app_type = 'codex'
+            WHERE app_type = ?1
               AND (
                 name = 'GrokGo'
-                OR notes LIKE '%GrokGo%'
-                OR settings_config LIKE '%model_providers.grok-go%'
-                OR settings_config LIKE '%"name": "grok-go"%'
-                OR settings_config LIKE '%name = "grok-go"%'
-                OR settings_config LIKE '%name = "GrokGo"%'
+                OR notes LIKE '%由 GrokGo 同步%'
+                OR notes LIKE '%Imported from GrokGo%'
+                OR (
+                  ?1 = 'codex'
+                  AND (
+                    settings_config LIKE '%model_providers.grok-go%'
+                    OR settings_config LIKE '%"name": "grok-go"%'
+                    OR settings_config LIKE '%name = "grok-go"%'
+                    OR settings_config LIKE '%name = "GrokGo"%'
+                  )
+                )
+                OR (
+                  ?1 = 'claude'
+                  AND settings_config LIKE ?2 ESCAPE '\'
+                )
               )
-            ORDER BY is_current DESC, created_at DESC
+            ORDER BY
+              CASE WHEN name = 'GrokGo' THEN 0 ELSE 1 END,
+              is_current DESC,
+              created_at DESC
             "#,
         )
         .map_err(|e| AppError::msg(format!("查询 CC Switch 配置失败：{e}")))?;
     let mut rows = stmt
-        .query([])
+        .query(params![app_type, local_base_like])
         .map_err(|e| AppError::msg(format!("查询 CC Switch 配置失败：{e}")))?;
     if let Some(row) = rows
         .next()
@@ -1289,21 +1595,25 @@ fn find_existing_grokgo_provider(conn: &Connection) -> AppResult<Option<(String,
     Ok(None)
 }
 
-/// Remove other GrokGo Codex providers after we kept `keep_id`.
-fn remove_duplicate_grokgo_providers(conn: &Connection, keep_id: &str) -> AppResult<usize> {
+/// Remove other GrokGo providers for `app_type` after we kept `keep_id`.
+/// Only rows that are clearly ours (name / our notes) — never third-party providers.
+fn remove_duplicate_grokgo_providers_for_app(
+    conn: &Connection,
+    app_type: &str,
+    keep_id: &str,
+) -> AppResult<usize> {
     let n = conn.execute(
         r#"
         DELETE FROM providers
-        WHERE app_type = 'codex'
-          AND id != ?1
+        WHERE app_type = ?1
+          AND id != ?2
           AND (
             name = 'GrokGo'
-            OR notes LIKE '%GrokGo%'
             OR notes LIKE '%Imported from GrokGo%'
             OR notes LIKE '%由 GrokGo%'
           )
         "#,
-        params![keep_id],
+        params![app_type, keep_id],
     )?;
     Ok(n)
 }
@@ -1318,8 +1628,11 @@ fn codex_mcp_currently_injected() -> bool {
         .unwrap_or(false)
 }
 
-/// Upsert GrokGo into CC Switch `mcp_servers` so MCP can be enabled independently.
-fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResult<String> {
+fn upsert_cc_switch_mcp_server_for_app(
+    conn: &Connection,
+    config: &AppConfig,
+    app_type: &str,
+) -> AppResult<String> {
     let has_table: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='mcp_servers' LIMIT 1",
@@ -1359,19 +1672,77 @@ fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResu
         )
         .unwrap_or(false);
 
+    let enable_codex = app_type == "codex";
+    let enable_claude = app_type == "claude";
+    // When updating for one app, preserve the other flag if the column exists.
+    let has_claude_col = conn
+        .prepare("SELECT enabled_claude FROM mcp_servers LIMIT 0")
+        .is_ok();
+
     if existing {
+        if has_claude_col {
+            if enable_claude {
+                conn.execute(
+                    r#"
+                    UPDATE mcp_servers
+                    SET name = ?1,
+                        server_config = ?2,
+                        description = ?3,
+                        enabled_claude = 1
+                    WHERE id = ?4
+                    "#,
+                    params![name, server_text, description, id],
+                )?;
+                Ok("updated mcp_servers.grok-go (enabled_claude=1)".into())
+            } else {
+                conn.execute(
+                    r#"
+                    UPDATE mcp_servers
+                    SET name = ?1,
+                        server_config = ?2,
+                        description = ?3,
+                        enabled_codex = 1
+                    WHERE id = ?4
+                    "#,
+                    params![name, server_text, description, id],
+                )?;
+                Ok("updated mcp_servers.grok-go (enabled_codex=1)".into())
+            }
+        } else {
+            conn.execute(
+                r#"
+                UPDATE mcp_servers
+                SET name = ?1,
+                    server_config = ?2,
+                    description = ?3,
+                    enabled_codex = 1
+                WHERE id = ?4
+                "#,
+                params![name, server_text, description, id],
+            )?;
+            Ok("updated mcp_servers.grok-go (enabled_codex=1)".into())
+        }
+    } else if has_claude_col {
         conn.execute(
             r#"
-            UPDATE mcp_servers
-            SET name = ?1,
-                server_config = ?2,
-                description = ?3,
-                enabled_codex = 1
-            WHERE id = ?4
+            INSERT INTO mcp_servers (
+              id, name, server_config, description, tags, enabled_codex, enabled_claude
+            ) VALUES (?1, ?2, ?3, ?4, '[]', ?5, ?6)
             "#,
-            params![name, server_text, description, id],
+            params![
+                id,
+                name,
+                server_text,
+                description,
+                if enable_codex { 1 } else { 0 },
+                if enable_claude { 1 } else { 0 }
+            ],
         )?;
-        Ok("updated mcp_servers.grok-go (enabled_codex=1)".into())
+        Ok(format!(
+            "inserted mcp_servers.grok-go (enabled_codex={}, enabled_claude={})",
+            if enable_codex { 1 } else { 0 },
+            if enable_claude { 1 } else { 0 }
+        ))
     } else {
         conn.execute(
             r#"
@@ -1382,6 +1753,45 @@ fn upsert_cc_switch_mcp_server(conn: &Connection, config: &AppConfig) -> AppResu
         )?;
         Ok("inserted mcp_servers.grok-go (enabled_codex=1)".into())
     }
+}
+
+/// CC Switch Claude provider `settings_config` shape (env block for Claude Code).
+fn claude_provider_settings_config(config: &AppConfig) -> serde_json::Value {
+    let base = anthropic_base_url(config);
+    let token = config.local_token.trim();
+    let model = crate::config::cc_switch_import_default_model(&config.default_model);
+    // Haiku can map to a lighter model when catalog allows; keep simple: same default
+    // unless user default is already grok-4.3.
+    let haiku = if model == "grok-4.5" {
+        "grok-4.3"
+    } else {
+        model
+    };
+    json!({
+        "env": {
+            "ANTHROPIC_BASE_URL": base,
+            "ANTHROPIC_AUTH_TOKEN": token,
+            "ANTHROPIC_API_KEY": token,
+            "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": model
+        }
+    })
+}
+
+fn claude_provider_export_json(config: &AppConfig) -> serde_json::Value {
+    json!({
+        "app_type": "claude",
+        "name": "GrokGo",
+        "settings_config": claude_provider_settings_config(config)
+    })
+}
+
+/// Human-readable snippet for the Integrations → Claude Code tab.
+pub fn claude_code_settings_snippet(config: &AppConfig) -> String {
+    let settings = claude_provider_settings_config(config);
+    serde_json::to_string_pretty(&settings).unwrap_or_else(|_| "{}".into())
 }
 
 fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
@@ -1712,6 +2122,103 @@ mod tests {
     }
 
     #[test]
+    fn claude_provider_settings_has_anthropic_env() {
+        let mut cfg = AppConfig::default();
+        cfg.actual_port = 8787;
+        cfg.preferred_port = 8787;
+        cfg.local_token = "tok_test".into();
+        cfg.default_model = "grok-4.5".into();
+        cfg.lan_enabled = false;
+        let settings = claude_provider_settings_config(&cfg);
+        let env = settings.get("env").expect("env");
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:8787")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()),
+            Some("tok_test")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
+            Some("grok-4.5")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("grok-4.3")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("grok-4.5")
+        );
+        // Must not include /v1 suffix.
+        let base = env
+            .get("ANTHROPIC_BASE_URL")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(!base.ends_with("/v1"));
+
+        let export = claude_provider_export_json(&cfg);
+        assert_eq!(export.get("app_type").and_then(|v| v.as_str()), Some("claude"));
+        assert_eq!(export.get("name").and_then(|v| v.as_str()), Some("GrokGo"));
+    }
+
+    /// Regression: bare `ANTHROPIC_BASE_URL` must NOT claim DeepSeek/Kimi/etc.
+    /// Only name/notes/local-gateway fingerprints identify our Claude provider.
+    #[test]
+    fn find_claude_provider_ignores_third_party_anthropic_env() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE providers (
+              id TEXT NOT NULL,
+              app_type TEXT NOT NULL,
+              name TEXT NOT NULL,
+              settings_config TEXT NOT NULL,
+              website_url TEXT,
+              category TEXT,
+              created_at INTEGER,
+              notes TEXT,
+              is_current BOOLEAN NOT NULL DEFAULT 0,
+              PRIMARY KEY (id, app_type)
+            );
+            INSERT INTO providers (id, app_type, name, settings_config, website_url, created_at, notes, is_current)
+            VALUES
+              ('deepseek-1', 'claude', 'DeepSeek',
+               '{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic","ANTHROPIC_MODEL":"deepseek-v4-pro"}}',
+               'https://platform.deepseek.com', 1, '', 1),
+              ('kimi-1', 'claude', 'Kimi',
+               '{"env":{"ANTHROPIC_BASE_URL":"https://api.kimi.com/coding/"}}',
+               'https://www.kimi.com', 2, '', 0);
+            "#,
+        )
+        .unwrap();
+
+        // No GrokGo row yet → must not match third-party Claude providers.
+        let found = find_existing_grokgo_provider_for_app(&conn, "claude").unwrap();
+        assert!(
+            found.is_none(),
+            "must not hijack DeepSeek/Kimi via bare ANTHROPIC_BASE_URL, got {found:?}"
+        );
+
+        // A true GrokGo row (by name) is found even if settings were corrupted.
+        conn.execute(
+            r#"
+            INSERT INTO providers (id, app_type, name, settings_config, website_url, created_at, notes, is_current)
+            VALUES ('gg-1', 'claude', 'GrokGo',
+                    '{"env":{"ANTHROPIC_BASE_URL":"https://api.deepseek.com/anthropic"}}',
+                    'https://platform.deepseek.com', 3, '由 GrokGo 同步（Claude Code / Anthropic Messages）', 0)
+            "#,
+            [],
+        )
+        .unwrap();
+        let found = find_existing_grokgo_provider_for_app(&conn, "claude").unwrap();
+        assert_eq!(found.map(|(id, _)| id), Some("gg-1".into()));
+    }
+
+    #[test]
     fn provider_settings_includes_mcp_when_requested() {
         let mut cfg = AppConfig::default();
         cfg.actual_port = 8787;
@@ -1756,6 +2263,82 @@ url = "http://127.0.0.1:8787/mcp"
         ));
         // Header alone without url.
         assert!(!codex_mcp_is_injected("[mcp_servers.grok-go]\nenabled = true\n"));
+    }
+
+    /// Build a minimal unsigned JWT with the given `exp` claim (seconds since epoch).
+    fn test_jwt_with_exp(exp: i64) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload =
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp},"scope":"openid grok-cli:access"}}"#));
+        format!("{header}.{payload}.sig")
+    }
+
+    /// Same acceptance criteria as `existing_grok_auth_is_usable` (unit-testable without env).
+    fn auth_map_is_usable(map: &serde_json::Map<String, Value>) -> bool {
+        let horizon = Utc::now() + chrono::Duration::seconds(GROK_AUTH_EARLY_INVALIDATION_SECS);
+        for (_k, v) in map.iter() {
+            let Some(obj) = v.as_object() else { continue };
+            let Some(token) = obj
+                .get("key")
+                .or_else(|| obj.get("access_token"))
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                continue;
+            };
+            let has_refresh = obj
+                .get("refresh_token")
+                .and_then(|x| x.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let jwt_ok = crate::auth::jwt_payload(token)
+                .and_then(|p| p.get("exp").and_then(|x| x.as_i64()))
+                .and_then(|secs| chrono::DateTime::<Utc>::from_timestamp(secs, 0))
+                .map(|exp| exp > horizon)
+                .unwrap_or(false);
+            if jwt_ok {
+                return true;
+            }
+            let meta_ok = obj
+                .get("expires_at")
+                .and_then(|x| x.as_str())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc) > horizon)
+                .unwrap_or(false);
+            if has_refresh && meta_ok {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn existing_grok_auth_usable_when_jwt_not_near_expiry() {
+        let far = (Utc::now() + chrono::Duration::hours(2)).timestamp();
+        let body = serde_json::json!({
+            "https://auth.x.ai::client": {
+                "key": test_jwt_with_exp(far),
+                "refresh_token": "rt",
+                "expires_at": (Utc::now() + chrono::Duration::hours(2)).to_rfc3339(),
+            }
+        });
+        let map = body.as_object().unwrap().clone();
+        assert!(auth_map_is_usable(&map), "fresh JWT must be usable");
+
+        let past = (Utc::now() - chrono::Duration::hours(1)).timestamp();
+        let body2 = serde_json::json!({
+            "https://auth.x.ai::client": {
+                "key": test_jwt_with_exp(past),
+                "refresh_token": "rt",
+                "expires_at": (Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+            }
+        });
+        let map2 = body2.as_object().unwrap().clone();
+        assert!(
+            !auth_map_is_usable(&map2),
+            "expired JWT must NOT be treated as usable"
+        );
     }
 
     #[test]

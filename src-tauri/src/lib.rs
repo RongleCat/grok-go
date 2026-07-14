@@ -20,7 +20,10 @@ use gateway::server::{start_gateway, GatewayState};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, WindowEvent};
+use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent};
+
+#[cfg(target_os = "macos")]
+use tauri::ActivationPolicy;
 
 // ── Embedded brand icons (variants under icons/variants/{dark,light}/) ────────
 // macOS tray: black glyph template (system tints for light/dark menu bar).
@@ -155,6 +158,10 @@ pub fn run() {
                 }
             });
 
+            // Keep ~/.grok/auth.json fresh while Grok Build routing is enabled:
+            // refresh pool token → userinfo probe → write only if IdP accepts it.
+            integrations::start_grok_build_auth_maintainer();
+
             setup_tray(app)?;
             // Apply configured style immediately. Default is Dark (black bg);
             // main bundle icons also ship as Dark so Dock matches before this runs.
@@ -166,9 +173,21 @@ pub fn run() {
                 let minimize = config::load_config()
                     .map(|c| c.minimize_to_tray)
                     .unwrap_or(true);
+                // Always intercept close so we can either hide-to-tray or confirm quit.
+                api.prevent_close();
+                let app = window.app_handle().clone();
                 if minimize {
-                    let _ = window.hide();
-                    api.prevent_close();
+                    // Keep tray; hide Dock / taskbar entry so the app is tray-only until reopened.
+                    if let Some(main) = app.get_webview_window("main") {
+                        hide_main_window_to_tray(&main);
+                    } else {
+                        let _ = window.hide();
+                    }
+                } else {
+                    // Quit path: confirm first — closing stops the local gateway process.
+                    if confirm_quit_and_stop_proxy() {
+                        app.exit(0);
+                    }
                 }
             }
         })
@@ -202,6 +221,7 @@ pub fn run() {
             commands::set_grok_build_inject,
             commands::restore_grok_build_backup,
             commands::import_to_cc_switch,
+            commands::import_claude_to_cc_switch,
             commands::export_provider_snippet,
         ])
         .build(tauri::generate_context!())
@@ -224,6 +244,58 @@ fn apply_configured_app_icon(app: &AppHandle) {
     }
 }
 
+/// Hide main window while keeping the tray icon. Removes Dock (macOS) / taskbar
+/// (Windows/Linux) entry so the app is only reachable via the tray.
+fn hide_main_window_to_tray(window: &WebviewWindow) {
+    let _ = window.hide();
+    // Hide from taskbar / app switcher list (no-op on some platforms if unsupported).
+    if let Err(err) = window.set_skip_taskbar(true) {
+        tracing::debug!("set_skip_taskbar(true): {err}");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Accessory = no Dock icon; menu bar / tray still works.
+        if let Err(err) = window
+            .app_handle()
+            .set_activation_policy(ActivationPolicy::Accessory)
+        {
+            tracing::debug!("set_activation_policy(Accessory): {err}");
+        }
+    }
+}
+
+/// Restore main window + Dock / taskbar presence after tray hide.
+fn show_main_window_from_tray(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(err) = app.set_activation_policy(ActivationPolicy::Regular) {
+            tracing::debug!("set_activation_policy(Regular): {err}");
+        }
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(err) = window.set_skip_taskbar(false) {
+            tracing::debug!("set_skip_taskbar(false): {err}");
+        }
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+/// Native confirm before quitting when "minimize to tray" is off.
+/// Quitting ends the process and therefore stops the local gateway.
+fn confirm_quit_and_stop_proxy() -> bool {
+    rfd::MessageDialog::new()
+        .set_title("退出 GrokGo")
+        .set_description(
+            "关闭窗口将退出应用，本地代理网关会停止，依赖本机网关的客户端将无法连接。\n\n确定退出吗？",
+        )
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .set_level(rfd::MessageLevel::Warning)
+        .show()
+        == rfd::MessageDialogResult::Ok
+}
+
 fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show_i = MenuItem::with_id(app, "show", "Show GrokGo", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -243,13 +315,10 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .tooltip("GrokGo")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
+                show_main_window_from_tray(app);
             }
             "quit" => {
+                // Explicit quit from tray — no second confirm (user chose Quit).
                 app.exit(0);
             }
             _ => {}
@@ -266,11 +335,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
                     if window.is_visible().unwrap_or(false) {
-                        let _ = window.hide();
+                        hide_main_window_to_tray(&window);
                     } else {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
+                        show_main_window_from_tray(app);
                     }
                 }
             }

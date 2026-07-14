@@ -1225,7 +1225,7 @@ export function AccountsPage() {
       <Dialog
         open={importOpen}
         title={t.accounts.importTitle}
-        description={t.accounts.importHint}
+        description={t.accounts.importHint || undefined}
         className="max-w-xl"
         onClose={importBusy ? undefined : () => setImportOpen(false)}
       >

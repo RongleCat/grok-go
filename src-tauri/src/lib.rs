@@ -161,6 +161,8 @@ pub fn run() {
             // Keep ~/.grok/auth.json fresh while Grok Build routing is enabled:
             // refresh pool token → userinfo probe → write only if IdP accepts it.
             integrations::start_grok_build_auth_maintainer();
+            // Sequential silent SuperGrok quota refresh (never fan-out all accounts).
+            quota::start_quota_refresh_maintainer();
 
             setup_tray(app)?;
             // Apply configured style immediately. Default is Dark (black bg);
@@ -223,6 +225,11 @@ pub fn run() {
             commands::import_to_cc_switch,
             commands::import_claude_to_cc_switch,
             commands::export_provider_snippet,
+            commands::set_opencode_model_inject_cmd,
+            commands::set_opencode_mcp_inject_cmd,
+            commands::set_workbuddy_model_inject_cmd,
+            commands::set_workbuddy_mcp_inject_cmd,
+            commands::set_cursor_mcp_inject_cmd,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

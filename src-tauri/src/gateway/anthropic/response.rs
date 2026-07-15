@@ -182,13 +182,13 @@ fn uuid_like() -> String {
     format!("{nanos:x}")
 }
 
-/// Convert OpenAI error JSON into Anthropic error shape when possible.
+/// Convert OpenAI / xAI error JSON into Anthropic error shape when possible.
+///
+/// xAI often returns `{"code":"invalid-argument","error":"<string>"}` (error is a
+/// **string**, not `{message}`). Older extractors only read `/error/message`, so
+/// Claude Code only saw the useless "upstream error".
 pub fn openai_error_to_anthropic(status: u16, body: &Value) -> Value {
-    let message = body
-        .pointer("/error/message")
-        .and_then(|m| m.as_str())
-        .or_else(|| body.get("message").and_then(|m| m.as_str()))
-        .unwrap_or("upstream error");
+    let message = extract_upstream_error_message(body);
     let error_type = match status {
         401 | 403 => "authentication_error",
         429 => "rate_limit_error",
@@ -198,6 +198,46 @@ pub fn openai_error_to_anthropic(status: u16, body: &Value) -> Value {
         _ => "api_error",
     };
     anthropic_error_body(error_type, message)
+}
+
+/// Pull a human-readable message from OpenAI-shaped or xAI-shaped error bodies.
+pub fn extract_upstream_error_message(body: &Value) -> String {
+    // OpenAI: { "error": { "message": "...", "type": "..." } }
+    if let Some(m) = body.pointer("/error/message").and_then(|m| m.as_str()) {
+        if !m.trim().is_empty() {
+            return m.to_string();
+        }
+    }
+    // xAI: { "code": "invalid-argument", "error": "..." }  (error is a string)
+    if let Some(m) = body.get("error").and_then(|e| e.as_str()) {
+        if !m.trim().is_empty() {
+            let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
+            if code.is_empty() {
+                return m.to_string();
+            }
+            return format!("{code}: {m}");
+        }
+    }
+    // Nested string under error.error
+    if let Some(m) = body.pointer("/error/error").and_then(|m| m.as_str()) {
+        if !m.trim().is_empty() {
+            return m.to_string();
+        }
+    }
+    if let Some(m) = body.get("message").and_then(|m| m.as_str()) {
+        if !m.trim().is_empty() {
+            return m.to_string();
+        }
+    }
+    // Last resort: compact JSON so logs/UI still show something actionable.
+    let compact = body.to_string();
+    if compact.len() > 8 && compact != "null" && compact != "{}" {
+        if compact.len() > 800 {
+            return format!("{}…", &compact[..800]);
+        }
+        return compact;
+    }
+    "upstream error".into()
 }
 
 #[cfg(test)]
@@ -221,6 +261,30 @@ mod tests {
         assert_eq!(out["stop_reason"], "end_turn");
         assert_eq!(out["usage"]["input_tokens"], 3);
         assert!(out["id"].as_str().unwrap().starts_with("msg_"));
+    }
+
+    #[test]
+    fn xai_string_error_is_surfaced() {
+        let body = json!({
+            "code": "invalid-argument",
+            "error": "Invalid tool call arguments: unexpected end of JSON"
+        });
+        let out = openai_error_to_anthropic(400, &body);
+        assert_eq!(out["type"], "error");
+        assert_eq!(out["error"]["type"], "invalid_request_error");
+        let msg = out["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("Invalid tool call"));
+        assert!(msg.contains("invalid-argument"));
+        assert!(!msg.contains("upstream error") || msg.len() > 20);
+    }
+
+    #[test]
+    fn openai_object_error_is_surfaced() {
+        let body = json!({
+            "error": {"message": "context_length_exceeded", "type": "invalid_request_error"}
+        });
+        let out = openai_error_to_anthropic(400, &body);
+        assert_eq!(out["error"]["message"], "context_length_exceeded");
     }
 
     #[test]

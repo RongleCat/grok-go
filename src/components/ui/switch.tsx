@@ -1,11 +1,13 @@
 import { cn } from "@/lib/utils";
 
 export function Switch({
+  id,
   checked,
   onCheckedChange,
   className,
   disabled,
 }: {
+  id?: string;
   checked: boolean;
   onCheckedChange: (v: boolean) => void;
   className?: string;
@@ -13,6 +15,7 @@ export function Switch({
 }) {
   return (
     <button
+      id={id}
       type="button"
       role="switch"
       aria-checked={checked}

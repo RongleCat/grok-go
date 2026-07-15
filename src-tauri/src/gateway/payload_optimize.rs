@@ -11,10 +11,11 @@
 //!
 //! ## Strategies (from xAI docs + CPA / sub2api research)
 //!
-//! 1. **Files API offload**: large text blobs → `POST /v1/files` → `input_file`
-//!    `{ file_id }` so document content is processed via `attachment_search`
-//!    instead of sitting in every prompt (xAI: content does not reappear fully
-//!    in message history).
+//! 1. **Files API offload (tool outputs only)**: large `function_call_output`
+//!    blobs → `POST /v1/files` → short stub + optional `input_file` reference.
+//!    **Never** offload message `input_text` (Codex skills / developer bootstrap
+//!    often exceeds 32KB — stripping them and telling the model to
+//!    `attachment_search` causes agent death loops; see session `019f65cb`).
 //! 2. **Image dedupe / collapse**: identical `data:` URLs kept once; older
 //!    historical images beyond a budget become short text stubs.
 //! 3. **`store: false` when images present**: xAI warns that storing
@@ -50,6 +51,22 @@ pub const MIN_DATA_URL_CHARS: usize = 2_000;
 const TRUNC_HEAD: usize = 4_000;
 const TRUNC_TAIL: usize = 1_500;
 
+/// Soft estimated-token budget for **chat** bodies (Claude Code / Anthropic path).
+///
+/// Body-byte budgets (12–24 MiB) almost never fire for text agent loops: 100k+
+/// tokens is still well under 1 MiB. Without a token budget, Claude Code keeps
+/// re-sending full tool history until xAI/proxy long-SSE becomes flaky and the
+/// client sees "Connection closed mid-response".
+pub const CHAT_TOKEN_SOFT: u64 = 80_000;
+/// Hard estimated-token budget — more aggressive prune + tool-schema shrink.
+pub const CHAT_TOKEN_HARD: u64 = 100_000;
+/// Assumed safe context window for output-cap math (leave room for reasoning).
+pub const CHAT_CONTEXT_WINDOW: u64 = 128_000;
+/// Prefer at least this many completion tokens when capping `max_tokens`.
+pub const CHAT_MIN_OUTPUT_TOKENS: u64 = 4_096;
+/// Never allow a single chat completion request to ask for more than this.
+pub const CHAT_MAX_OUTPUT_TOKENS: u64 = 16_384;
+
 #[derive(Debug, Default, Clone)]
 pub struct OptimizeStats {
     pub modified: bool,
@@ -60,11 +77,17 @@ pub struct OptimizeStats {
     pub texts_truncated: usize,
     pub files_offloaded: usize,
     pub store_forced_false: bool,
+    /// Estimated tokens before chat budget enforcement (0 if not run).
+    pub tokens_before: u64,
+    /// Estimated tokens after chat budget enforcement (0 if not run).
+    pub tokens_after: u64,
+    pub tools_shrunk: usize,
+    pub max_tokens_capped: bool,
 }
 
 impl OptimizeStats {
     pub fn log_summary(&self, path: &str) {
-        if !self.modified && self.files_offloaded == 0 {
+        if !self.modified && self.files_offloaded == 0 && self.tokens_before == 0 {
             return;
         }
         tracing::info!(
@@ -76,6 +99,10 @@ impl OptimizeStats {
             texts_truncated = self.texts_truncated,
             files_offloaded = self.files_offloaded,
             store_forced_false = self.store_forced_false,
+            tokens_before = self.tokens_before,
+            tokens_after = self.tokens_after,
+            tools_shrunk = self.tools_shrunk,
+            max_tokens_capped = self.max_tokens_capped,
             "payload optimized before upstream"
         );
     }
@@ -130,8 +157,354 @@ pub fn optimize_responses_payload(value: &mut Value) -> OptimizeStats {
     stats
 }
 
-/// After account selection: offload huge text blobs to xAI Files API and
-/// replace them with `input_file` references (+ short text stub).
+/// Token-aware shrink for OpenAI **chat completions** bodies (Anthropic bridge).
+///
+/// Call after [`optimize_responses_payload`]. Progressive:
+/// 1. If over soft budget → truncate older message/tool text hard
+/// 2. If still over soft → also cap recent tool outputs
+/// 3. If over hard → shrink tool descriptions / schema verbosity
+/// 4. Always cap `max_tokens` so input+output fit a safe window
+pub fn enforce_chat_context_budget(body: &mut Value) -> OptimizeStats {
+    let original_bytes = body.to_string().len();
+    let tokens_before = estimate_chat_tokens(body);
+    let mut stats = OptimizeStats {
+        original_bytes,
+        optimized_bytes: original_bytes,
+        tokens_before,
+        tokens_after: tokens_before,
+        ..Default::default()
+    };
+
+    if tokens_before > CHAT_TOKEN_SOFT {
+        // Keep last 10 messages fuller; older tool/user blobs → short stubs.
+        prune_chat_text(body, /*keep_recent*/ 10, /*max_chars*/ 2_500, &mut stats);
+    }
+    if estimate_chat_tokens(body) > CHAT_TOKEN_SOFT {
+        // Recent turns still fat (Claude Code last N tool results): cap tools harder.
+        prune_chat_text(body, /*keep_recent*/ 4, /*max_chars*/ 1_500, &mut stats);
+        prune_tool_role_contents(body, /*max_chars*/ 2_000, &mut stats);
+    }
+    if estimate_chat_tokens(body) > CHAT_TOKEN_HARD {
+        shrink_tools_for_budget(body, &mut stats);
+        prune_chat_text(body, /*keep_recent*/ 2, /*max_chars*/ 800, &mut stats);
+        prune_tool_role_contents(body, /*max_chars*/ 800, &mut stats);
+    }
+
+    if cap_chat_max_tokens(body, estimate_chat_tokens(body)) {
+        stats.max_tokens_capped = true;
+        stats.modified = true;
+    }
+
+    stats.tokens_after = estimate_chat_tokens(body);
+    stats.optimized_bytes = body.to_string().len();
+    if stats.optimized_bytes != stats.original_bytes
+        || stats.tokens_after != stats.tokens_before
+        || stats.max_tokens_capped
+    {
+        stats.modified = true;
+    }
+    if stats.modified {
+        tracing::info!(
+            target: "gateway",
+            tokens_before = stats.tokens_before,
+            tokens_after = stats.tokens_after,
+            texts_truncated = stats.texts_truncated,
+            tools_shrunk = stats.tools_shrunk,
+            max_tokens_capped = stats.max_tokens_capped,
+            "chat context budget enforced (Claude Code / Anthropic path)"
+        );
+    }
+    stats
+}
+
+/// ~4 chars/token heuristic over messages + tools (matches count_tokens path).
+pub fn estimate_chat_tokens(body: &Value) -> u64 {
+    let mut chars = 0usize;
+    if let Some(msgs) = body.get("messages") {
+        chars += estimate_value_chars(msgs);
+    }
+    if let Some(tools) = body.get("tools") {
+        chars += estimate_value_chars(tools);
+    }
+    if let Some(sys) = body.get("system") {
+        chars += estimate_value_chars(sys);
+    }
+    ((chars / 4) as u64).saturating_add(32)
+}
+
+fn estimate_value_chars(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.iter().map(estimate_value_chars).sum(),
+        Value::Object(o) => o.values().map(estimate_value_chars).sum(),
+        Value::Number(n) => n.to_string().len(),
+        Value::Bool(_) | Value::Null => 1,
+    }
+}
+
+fn prune_chat_text(body: &mut Value, keep_recent: usize, max_chars: usize, stats: &mut OptimizeStats) {
+    let Some(items) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    let n = items.len();
+    let recent_start = n.saturating_sub(keep_recent);
+    for (i, item) in items.iter_mut().enumerate() {
+        let limit = if i >= recent_start {
+            // Even "recent" content is capped when we are over budget.
+            max_chars.saturating_mul(2).max(max_chars)
+        } else {
+            max_chars
+        };
+        truncate_message_content(item, limit, stats);
+    }
+}
+
+fn prune_tool_role_contents(body: &mut Value, max_chars: usize, stats: &mut OptimizeStats) {
+    let Some(items) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for item in items.iter_mut() {
+        let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "tool" {
+            continue;
+        }
+        truncate_message_content(item, max_chars, stats);
+    }
+}
+
+fn truncate_message_content(item: &mut Value, limit: usize, stats: &mut OptimizeStats) {
+    if let Some(content) = item.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for part in content.iter_mut() {
+            if let Some(obj) = part.as_object_mut() {
+                if let Some(s) = obj.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+                    if s.len() > limit {
+                        obj.insert(
+                            "text".into(),
+                            Value::String(truncate_text(&s, limit / 2, limit / 4)),
+                        );
+                        stats.texts_truncated += 1;
+                        stats.modified = true;
+                    }
+                }
+            }
+        }
+    } else if let Some(s) = item
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        if s.len() > limit {
+            if let Some(obj) = item.as_object_mut() {
+                obj.insert(
+                    "content".into(),
+                    Value::String(truncate_text(&s, limit / 2, limit / 4)),
+                );
+                stats.texts_truncated += 1;
+                stats.modified = true;
+            }
+        }
+    }
+    // Assistant tool_calls[].function.arguments can bloat (large Write/Edit payloads).
+    // CRITICAL: never mid-string truncate — xAI requires arguments to be valid JSON and
+    // rejects the whole request with 400 if we inject "…[truncated]…" into the string.
+    if let Some(tcs) = item.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+        for tc in tcs.iter_mut() {
+            if let Some(args) = tc
+                .pointer("/function/arguments")
+                .and_then(|a| a.as_str())
+                .map(|s| s.to_string())
+            {
+                if args.len() > limit {
+                    if let Some(func) = tc.get_mut("function").and_then(|f| f.as_object_mut()) {
+                        func.insert(
+                            "arguments".into(),
+                            Value::String(stub_tool_arguments_json(&args, limit)),
+                        );
+                        stats.texts_truncated += 1;
+                        stats.modified = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Replace oversized tool-call argument strings with a **valid JSON** stub.
+fn stub_tool_arguments_json(args: &str, limit: usize) -> String {
+    // Prefer keeping a structured preview when the original parses as JSON object.
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(args) {
+        let mut preview = serde_json::Map::new();
+        preview.insert(
+            "_grok_go_truncated".into(),
+            Value::Bool(true),
+        );
+        preview.insert(
+            "_original_chars".into(),
+            json!(args.len()),
+        );
+        for (k, v) in map.iter() {
+            match v {
+                Value::String(s) if s.len() > 120 => {
+                    let head: String = s.chars().take(80).collect();
+                    preview.insert(
+                        k.clone(),
+                        Value::String(format!("{head}…[{} chars]", s.len())),
+                    );
+                }
+                Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
+                    preview.insert(k.clone(), v.clone());
+                }
+                other => {
+                    let s = other.to_string();
+                    if s.len() <= 160 {
+                        preview.insert(k.clone(), other.clone());
+                    } else {
+                        preview.insert(
+                            k.clone(),
+                            Value::String(format!("[{} chars {}]", s.len(), other_type_name(other))),
+                        );
+                    }
+                }
+            }
+        }
+        return Value::Object(preview).to_string();
+    }
+    // Non-JSON or non-object: still emit valid JSON (never raw truncated source).
+    let head: String = args.chars().take(limit.min(200)).collect();
+    json!({
+        "_grok_go_truncated": true,
+        "_original_chars": args.len(),
+        "preview": head,
+    })
+    .to_string()
+}
+
+fn other_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::String(_) => "string",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "bool",
+        Value::Null => "null",
+    }
+}
+
+fn shrink_tools_for_budget(body: &mut Value, stats: &mut OptimizeStats) {
+    let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return;
+    };
+    const DESC_MAX: usize = 160;
+    for tool in tools.iter_mut() {
+        // OpenAI function tools: function.description / function.parameters
+        if let Some(func) = tool.get_mut("function").and_then(|f| f.as_object_mut()) {
+            if let Some(desc) = func.get("description").and_then(|d| d.as_str()).map(|s| s.to_string())
+            {
+                if desc.len() > DESC_MAX {
+                    let short: String = desc.chars().take(DESC_MAX).collect();
+                    func.insert(
+                        "description".into(),
+                        Value::String(format!("{short}…")),
+                    );
+                    stats.tools_shrunk += 1;
+                    stats.modified = true;
+                }
+            }
+            // Drop verbose JSON-schema fluff that models rarely need at scale.
+            if let Some(params) = func.get_mut("parameters") {
+                if strip_schema_verbosity(params) {
+                    stats.tools_shrunk += 1;
+                    stats.modified = true;
+                }
+            }
+        }
+    }
+}
+
+fn strip_schema_verbosity(params: &mut Value) -> bool {
+    let mut changed = false;
+    match params {
+        Value::Object(map) => {
+            for key in ["title", "examples", "default", "$schema", "$id"] {
+                if map.remove(key).is_some() {
+                    changed = true;
+                }
+            }
+            // Long descriptions on nested properties.
+            if let Some(Value::String(d)) = map.get_mut("description") {
+                if d.len() > 120 {
+                    *d = d.chars().take(120).collect::<String>() + "…";
+                    changed = true;
+                }
+            }
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                if let Some(child) = map.get_mut(&k) {
+                    if strip_schema_verbosity(child) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                if strip_schema_verbosity(child) {
+                    changed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
+}
+
+fn cap_chat_max_tokens(body: &mut Value, input_est: u64) -> bool {
+    let room = CHAT_CONTEXT_WINDOW
+        .saturating_sub(input_est)
+        .min(CHAT_MAX_OUTPUT_TOKENS)
+        .max(CHAT_MIN_OUTPUT_TOKENS);
+    let Some(current) = body.get("max_tokens").and_then(|v| v.as_u64()) else {
+        // Claude Code always sends max_tokens; set a safe default if missing.
+        body["max_tokens"] = json!(room.min(8192));
+        return true;
+    };
+    if current > room {
+        body["max_tokens"] = json!(room);
+        return true;
+    }
+    false
+}
+
+/// True when text is Codex/system bootstrap that must stay inline.
+///
+/// Offloading these (≥32KB skills lists, developer permissions, etc.) and
+/// injecting "use attachment_search" makes the model hunt for tools/files it
+/// cannot use, which turns into multi-turn death loops.
+pub fn is_protected_bootstrap_text(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<skills_instructions>",
+        "<permissions instructions>",
+        "<permissions_instructions>",
+        "<app-context>",
+        "<collaboration_mode>",
+        "<plugins_instructions>",
+        "<apps_instructions>",
+        "<environment_context>",
+        "<recommended_plugins>",
+        "You are Codex, a coding agent",
+        "AGENTS.md instructions for",
+        "# Codex Global Instructions",
+        "Filesystem sandboxing defines which files",
+    ];
+    let head = text.get(..512).unwrap_or(text);
+    MARKERS.iter().any(|m| head.contains(m) || text.contains(m))
+}
+
+/// After account selection: offload huge **tool outputs** to xAI Files API.
+///
+/// Only `function_call_output` / `custom_tool_call_output` are candidates.
+/// Message `input_text` (skills, developer prompts, user paste) is left alone —
+/// historical truncation handles old bloat without stripping live instructions.
 pub async fn offload_large_text_blobs(
     value: &mut Value,
     client: &reqwest::Client,
@@ -151,139 +524,93 @@ pub async fn offload_large_text_blobs(
         return Ok(stats);
     };
 
-    // Process from oldest so we free budget first; skip tiny blobs.
-    let mut pending_file_parts: Vec<(usize, String, String)> = Vec::new(); // (item_idx, file_id, note)
+    // (item_idx, file_id) — attach quietly; do NOT tell the agent to search.
+    let mut pending_file_ids: Vec<(usize, String)> = Vec::new();
 
     for (idx, item) in items.iter_mut().enumerate() {
-        // function_call_output.output (string)
         let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if ty == "function_call_output" || ty == "custom_tool_call_output" {
-            if let Some(output) = item.get("output").and_then(|v| v.as_str()) {
-                if output.len() >= OFFLOAD_TEXT_MIN && !output.starts_with("data:") {
-                    let bytes = output.as_bytes().to_vec();
-                    let filename = format!("tool-output-{idx}.txt");
-                    match files_api::upload_cached(
-                        client,
-                        xai_base_url,
-                        token,
-                        account_id,
-                        &filename,
-                        bytes,
-                        Some(DEFAULT_OFFLOAD_TTL_SECS),
-                    )
-                    .await
-                    {
-                        Ok(file_id) => {
-                            let note = format!(
-                                "[content offloaded to xAI file {file_id}; full text available via attachment_search / input_file]"
-                            );
-                            if let Some(obj) = item.as_object_mut() {
-                                obj.insert("output".into(), Value::String(note.clone()));
-                            }
-                            pending_file_parts.push((idx, file_id, note));
-                            stats.files_offloaded += 1;
-                            stats.modified = true;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                account = %account_id,
-                                "files offload failed (will truncate instead): {err}"
-                            );
-                            // Fallback truncate
-                            if let Some(obj) = item.as_object_mut() {
-                                if let Some(s) = obj.get("output").and_then(|v| v.as_str()) {
-                                    let stub = truncate_text(s, TRUNC_HEAD, TRUNC_TAIL);
-                                    obj.insert("output".into(), Value::String(stub));
-                                    stats.texts_truncated += 1;
-                                    stats.modified = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if ty != "function_call_output" && ty != "custom_tool_call_output" {
+            // Intentionally skip message content offload (skills / bootstrap /
+            // user messages). Session 019f65cb: skills_instructions ~39KB was
+            // uploaded every turn and the model was steered into a tool loop.
+            continue;
+        }
+        let Some(output) = item.get("output").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if output.len() < OFFLOAD_TEXT_MIN || output.starts_with("data:") {
+            continue;
+        }
+        // Defensive: never offload if a tool somehow echoed bootstrap text.
+        if is_protected_bootstrap_text(output) {
+            tracing::debug!(
+                account = %account_id,
+                idx,
+                "skip files offload: protected bootstrap-like tool output"
+            );
+            continue;
         }
 
-        // Message content parts with huge input_text
-        if let Some(content) = item.get_mut("content").and_then(|c| c.as_array_mut()) {
-            for part in content.iter_mut() {
-                let pty = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if pty != "input_text" && pty != "text" && pty != "output_text" {
-                    continue;
+        let bytes = output.as_bytes().to_vec();
+        let filename = format!("tool-output-{idx}.txt");
+        match files_api::upload_cached(
+            client,
+            xai_base_url,
+            token,
+            account_id,
+            &filename,
+            bytes,
+            Some(DEFAULT_OFFLOAD_TTL_SECS),
+        )
+        .await
+        {
+            Ok(file_id) => {
+                // Neutral stub: do not mention attachment_search (Codex has no
+                // such tool → model invents shell hunts / retries forever).
+                let note = format!(
+                    "[large tool output offloaded to xAI file {file_id} to save multi-turn tokens; \
+                     truncated here. Re-run the same tool if you need the full content.]"
+                );
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("output".into(), Value::String(note));
                 }
-                let Some(text) = part.get("text").and_then(|t| t.as_str()) else {
-                    continue;
-                };
-                if text.len() < OFFLOAD_TEXT_MIN || text.starts_with("data:") {
-                    continue;
-                }
-                let bytes = text.as_bytes().to_vec();
-                let filename = format!("input-text-{idx}.txt");
-                match files_api::upload_cached(
-                    client,
-                    xai_base_url,
-                    token,
-                    account_id,
-                    &filename,
-                    bytes,
-                    Some(DEFAULT_OFFLOAD_TTL_SECS),
-                )
-                .await
-                {
-                    Ok(file_id) => {
-                        if let Some(obj) = part.as_object_mut() {
-                            obj.insert(
-                                "text".into(),
-                                Value::String(format!(
-                                    "[large text offloaded to file {file_id}]"
-                                )),
-                            );
-                        }
-                        pending_file_parts.push((
-                            idx,
-                            file_id,
-                            format!("offloaded input text from item {idx}"),
-                        ));
-                        stats.files_offloaded += 1;
+                pending_file_ids.push((idx, file_id));
+                stats.files_offloaded += 1;
+                stats.modified = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    account = %account_id,
+                    "files offload failed (will truncate instead): {err}"
+                );
+                if let Some(obj) = item.as_object_mut() {
+                    if let Some(s) = obj.get("output").and_then(|v| v.as_str()) {
+                        let stub = truncate_text(s, TRUNC_HEAD, TRUNC_TAIL);
+                        obj.insert("output".into(), Value::String(stub));
+                        stats.texts_truncated += 1;
                         stats.modified = true;
-                    }
-                    Err(err) => {
-                        tracing::warn!("files offload input_text failed: {err}");
-                        if let Some(obj) = part.as_object_mut() {
-                            if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
-                                obj.insert(
-                                    "text".into(),
-                                    Value::String(truncate_text(s, TRUNC_HEAD, TRUNC_TAIL)),
-                                );
-                                stats.texts_truncated += 1;
-                                stats.modified = true;
-                            }
-                        }
                     }
                 }
             }
         }
     }
 
-    // Attach input_file parts so the model can still retrieve full content.
-    // Insert as a synthetic user message after the last offloaded item for clarity.
-    if !pending_file_parts.is_empty() {
+    // Quietly attach file_ids for the Responses plane (no "go search" prompt).
+    if !pending_file_ids.is_empty() {
         let mut file_content = Vec::new();
         file_content.push(json!({
             "type": "input_text",
             "text": format!(
-                "The following {} large document(s) were offloaded to xAI Files to reduce multi-turn token usage. Use attachment_search / read them as needed:",
-                pending_file_parts.len()
+                "[GrokGo] {} large tool output(s) were replaced with short stubs above; \
+                 corresponding file_id attachment(s) follow for server-side retrieval only. \
+                 Do not shell-search for these files on disk.",
+                pending_file_ids.len()
             )
         }));
-        for (_idx, file_id, note) in &pending_file_parts {
+        for (_idx, file_id) in &pending_file_ids {
             file_content.push(json!({
                 "type": "input_file",
                 "file_id": file_id,
-            }));
-            file_content.push(json!({
-                "type": "input_text",
-                "text": note,
             }));
         }
         items.push(json!({
@@ -790,5 +1117,148 @@ mod tests {
         let stats = optimize_responses_payload(&mut body);
         assert!(stats.store_forced_false);
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn chat_token_budget_shrinks_bloated_tool_history() {
+        // Simulate Claude Code: many large tool results + huge max_tokens.
+        let big = "Y".repeat(20_000);
+        let mut messages = vec![json!({"role":"system","content":"sys"})];
+        for i in 0..40 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{i}"),
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": format!("{{\"path\":\"f{i}\"}}")}
+                }]
+            }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{i}"),
+                "content": big
+            }));
+        }
+        messages.push(json!({"role":"user","content":"continue implementing"}));
+        let mut body = json!({
+            "model": "grok-4.5",
+            "max_tokens": 64000,
+            "messages": messages,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "description": "D".repeat(2000),
+                    "parameters": {
+                        "type": "object",
+                        "title": "ReadParams",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "P".repeat(500),
+                                "examples": ["/tmp"]
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        let before = estimate_chat_tokens(&body);
+        assert!(before > CHAT_TOKEN_SOFT, "fixture must exceed soft budget, got {before}");
+        let stats = enforce_chat_context_budget(&mut body);
+        assert!(stats.modified);
+        assert!(stats.tokens_after < stats.tokens_before);
+        assert!(stats.tokens_after <= CHAT_TOKEN_HARD + 20_000); // heuristic slack
+        assert!(stats.texts_truncated >= 1);
+        let mt = body["max_tokens"].as_u64().unwrap();
+        assert!(mt <= CHAT_MAX_OUTPUT_TOKENS);
+        assert!(mt < 64000);
+    }
+
+    #[test]
+    fn chat_token_budget_noop_on_small_payload() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "max_tokens": 1024,
+            "messages": [{"role":"user","content":"hi"}]
+        });
+        let stats = enforce_chat_context_budget(&mut body);
+        assert_eq!(body["messages"][0]["content"], "hi");
+        assert!(stats.tokens_before < CHAT_TOKEN_SOFT);
+        assert_eq!(stats.texts_truncated, 0);
+    }
+
+    #[test]
+    fn tool_call_arguments_stub_stays_valid_json() {
+        let big_old = "X".repeat(8_000);
+        let big_new = "Y".repeat(8_000);
+        // Many prior tool turns so budget pruning kicks in, then a fat Edit.
+        let mut messages = vec![json!({"role":"system","content":"sys"})];
+        for i in 0..30 {
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": format!("old_{i}"),
+                "content": "Z".repeat(5_000)
+            }));
+        }
+        messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_edit",
+                "type": "function",
+                "function": {
+                    "name": "Edit",
+                    "arguments": serde_json::to_string(&json!({
+                        "file_path": "/tmp/a.rs",
+                        "old_string": big_old,
+                        "new_string": big_new
+                    })).unwrap()
+                }
+            }]
+        }));
+        let mut body = json!({
+            "model": "grok-4.5",
+            "max_tokens": 8192,
+            "messages": messages
+        });
+        let _ = enforce_chat_context_budget(&mut body);
+        // Find the Edit tool call and ensure arguments still parse as JSON object.
+        let msgs = body["messages"].as_array().unwrap();
+        let mut found = false;
+        for m in msgs {
+            if let Some(tcs) = m.get("tool_calls").and_then(|t| t.as_array()) {
+                for tc in tcs {
+                    if tc.pointer("/function/name").and_then(|n| n.as_str()) == Some("Edit") {
+                        let args = tc.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap();
+                        let parsed: Value = serde_json::from_str(args).expect("args must stay valid JSON");
+                        assert!(parsed.is_object(), "stub must be JSON object, got {parsed}");
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "expected Edit tool_call in messages");
+    }
+
+    #[test]
+    fn protects_codex_skills_bootstrap_from_offload() {
+        let skills = format!(
+            "<skills_instructions>\n## Skills\n{}",
+            "skill-entry\n".repeat(3_000)
+        );
+        assert!(skills.len() > OFFLOAD_TEXT_MIN);
+        assert!(is_protected_bootstrap_text(&skills));
+        assert!(is_protected_bootstrap_text(
+            "You are Codex, a coding agent based on GPT-5. You and the user share one workspace."
+        ));
+        assert!(is_protected_bootstrap_text(
+            "<permissions instructions>\nFilesystem sandboxing defines which files can be read"
+        ));
+        // Ordinary large tool dump should NOT be protected.
+        let tool_dump = "fn main() {}\n".repeat(4_000);
+        assert!(tool_dump.len() > OFFLOAD_TEXT_MIN);
+        assert!(!is_protected_bootstrap_text(&tool_dump));
     }
 }

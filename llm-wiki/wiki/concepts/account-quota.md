@@ -10,7 +10,13 @@ xAI 有 **两套几乎独立的用量体系**，UI 截图里的 “Weekly SuperG
 | 数据源 | `POST https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig` | 上游 `api.x.ai` 响应头 `x-ratelimit-*` |
 | 鉴权 | Grok Build / grok-cli OAuth access token（Bearer）即可；cookie 可选 | 同一 OAuth / API key |
 | 是否主动可查 | **是**（空 protobuf 请求） | 被动观察；可用 1 token probe 主动打一次 |
-| 当前 GrokGo | **未接** | 已接 `apply_rate_limit_headers`，且成功响应常 **没有 reset** |
+| 当前 GrokGo | **已接** `quota.rs` + 账号页刷新 / **15min 静默串行队列** | 已接 `apply_rate_limit_headers`；手动刷新也会轻量 `GET /models` 探针 |
+
+### 写入与串号防护（2026-07-15）
+
+- 网关热路径只 `patch_account_cache`（流量字段），**禁止**整账号覆盖把旧 `quota` 写回缓存。
+- `apply_account_update` 对 SuperGrok 快照按 `fetched_at` 取新；刷 B 不会把 A 的 75% 盖成 50%。
+- 全量 / 定时刷新均为 **单 worker 串行队列**（账号间隔 ~2s），不并行 fan-out。
 
 实测（2026-07-12，本机 OAuth 账号）：
 

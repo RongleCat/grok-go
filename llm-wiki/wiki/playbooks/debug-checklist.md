@@ -47,8 +47,8 @@
 ## Codex 读多文件/多图后 token 暴涨或任务强制停止
 
 1. 现象：跑一段时间停、重启同一会话又停，goal 也救不了 → 多半是会话 history 已塞满 base64/大 tool 输出
-2. 网关侧：`payload_optimize` 会去重/折叠历史图、截断大段 tool 输出、有图时 `store:false`；≥32KB 文本尝试 Files `file_id` 分流
-3. 日志里搜 `payload optimized` / `files offload` / `uploaded large blob`
+2. 网关侧：`payload_optimize` 会去重/折叠历史图、截断大段 tool 输出、有图时 `store:false`；**仅 ≥32KB 的 tool output** 才 Files `file_id` 分流（不会分流 skills/developer 正文）
+3. 日志里搜 `payload optimized` / `files offload` / `uploaded large blob`；若会话开头就大量 upload 且用户几乎没读文件 → 旧版误分流 bootstrap，应已修复
 4. 客户端已毒化的线程：建议 **新开会话**；旧 transcript 本地仍大
 5. 细节见 [[../concepts/payload-optimize]]
 
@@ -60,6 +60,15 @@
 4. 网关侧：`empty_completion_retry`（默认 true）对 empty + narration 静默重试一次；日志搜 `recovered premature agent stop` / `empty-completion-retry`
 5. 若仍停：确认 `emptyCompletionRetry` 未关；可手动发「继续」
 6. 细节见 [[../concepts/empty-completion-retry]]
+
+## Claude Code：`API Error: Connection closed mid-response`
+
+1. **根因优先**：不是“网关偶发断连”，而是 **上下文膨胀** → 大 prompt 长 SSE 被上游/代理掐断。Claude Code 每轮重放完整 tool 历史；仅靠 12MiB 字节预算裁不掉。
+2. 确认 `ANTHROPIC_BASE_URL=http://127.0.0.1:<actualPort>`（无 `/v1` 后缀）与 local token 一致
+3. `request_logs`：`/v1/messages` 是否 **status=200 且 input 连续 8–12 万+** 后出现 **0 tokens** / `stream aborted`
+4. 网关应已跑 `enforce_chat_context_budget`（日志 `chat context budget enforced`）；**重启 GrokGo** 加载
+5. 客户端 transcript 仍大时：`/compact` 或新开线程（网关只能砍上行，砍不掉本地 history）
+6. 相关：[[../concepts/payload-optimize]]、[[../queries/anthropic-claude-code-research]]
 
 ## 概览/账号页：`expected value at line 1 column 1`
 

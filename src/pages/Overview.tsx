@@ -3,6 +3,7 @@ import { api, type AppStatus, type HeatmapDay } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { CopyField } from "@/components/ui/copy-field";
 import { Dialog } from "@/components/ui/dialog";
 import { Heatmap } from "@/components/heatmap";
 import { formatNumber, formatUsd } from "@/lib/utils";
@@ -11,6 +12,8 @@ import { PageLoading } from "@/components/page-loading";
 import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { useToast } from "@/components/ui/toast";
 import { Copy, Download, Eye, EyeOff, RefreshCw } from "lucide-react";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 type CcSwitchTarget = "codex" | "claude";
 
@@ -32,10 +35,8 @@ function TokenStat({
   accent?: "default" | "emerald";
 }) {
   return (
-    <div className="min-w-0 rounded-lg bg-neutral-50 px-3 py-2.5">
-      <div className="text-[11px] font-medium uppercase tracking-wide text-neutral-400">
-        {label}
-      </div>
+    <div className="min-w-0">
+      <div className="text-xs text-neutral-500">{label}</div>
       <div
         className={
           accent === "emerald"
@@ -217,9 +218,9 @@ export function OverviewPage() {
                     {formatNumber(totalTokens)}
                   </div>
                 </div>
-                <div className="rounded-full bg-neutral-100 px-2.5 py-1 text-xs font-medium tabular-nums text-neutral-600">
+                <Badge variant="outline" className="tabular-nums">
                   {t.overview.est} {formatUsd(status.today.estimatedCostUsd)}
-                </div>
+                </Badge>
               </div>
               <div className="mt-2.5 grid grid-cols-3 gap-2">
                 <TokenStat label={t.overview.tokenIn} value={status.today.inputTokens} />
@@ -246,61 +247,49 @@ export function OverviewPage() {
               {importing ? t.overview.importCcSwitchImporting : t.overview.importCcSwitch}
             </Button>
           </CardHeader>
-          <CardContent className="space-y-2">
-            {/* API + MCP on one row */}
-            <div className="grid gap-2 sm:grid-cols-2">
-              {(
-                [
-                  [t.overview.baseUrl, status.baseUrl],
-                  [t.overview.mcp, status.mcpUrl],
-                ] as const
-              ).map(([label, value]) => (
-                <div key={label} className="min-w-0 rounded-md border border-neutral-200 p-2.5">
-                  <div className="mb-1 text-xs font-medium text-neutral-500">{label}</div>
-                  <div className="flex items-center justify-between gap-2">
-                    <code className="min-w-0 truncate text-sm" title={value}>
-                      {value}
-                    </code>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="shrink-0"
-                      title={t.common.copy}
-                      onClick={() => copy(value)}
-                    >
-                      <Copy className="h-4 w-4" />
-                    </Button>
-                  </div>
-                </div>
-              ))}
+          <CardContent className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <CopyField
+                label={t.overview.baseUrl}
+                value={status.baseUrl}
+                copyLabel={t.common.copy}
+                onCopy={() => copy(status.baseUrl)}
+              />
+              <CopyField
+                label={t.overview.mcp}
+                value={status.mcpUrl}
+                copyLabel={t.common.copy}
+                onCopy={() => copy(status.mcpUrl)}
+              />
             </div>
-            {/* Local token — full width row */}
-            <div className="rounded-md border border-neutral-200 p-2.5">
-              <div className="mb-1 text-xs font-medium text-neutral-500">
-                {t.overview.localToken}
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <code className="min-w-0 truncate text-sm">
-                  {showToken ? status.localToken : maskToken(status.localToken)}
-                </code>
-                <div className="flex shrink-0 items-center gap-0.5">
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    title={showToken ? t.settings.hideToken : t.settings.showToken}
-                    onClick={() => setShowToken((v) => !v)}
-                  >
-                    {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    title={t.common.copy}
-                    onClick={() => copy(status.localToken)}
-                  >
-                    <Copy className="h-4 w-4" />
-                  </Button>
-                </div>
+            <div className="space-y-1.5">
+              <Label>{t.overview.localToken}</Label>
+              <div className="flex items-center gap-2">
+                <Input
+                  readOnly
+                  className="min-w-0 flex-1 font-mono text-xs"
+                  value={showToken ? status.localToken : maskToken(status.localToken)}
+                />
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="outline"
+                  className="h-9 w-9 shrink-0"
+                  title={showToken ? t.settings.hideToken : t.settings.showToken}
+                  onClick={() => setShowToken((v) => !v)}
+                >
+                  {showToken ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                </Button>
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="outline"
+                  className="h-9 w-9 shrink-0"
+                  title={t.common.copy}
+                  onClick={() => copy(status.localToken)}
+                >
+                  <Copy className="h-4 w-4" />
+                </Button>
               </div>
             </div>
             {status.lanEnabled && status.lanAddress ? (
@@ -330,36 +319,38 @@ export function OverviewPage() {
         onClose={importing ? undefined : () => setCcSwitchOpen(false)}
       >
         <div className="space-y-2">
-          <button
+          <Button
             type="button"
+            variant="outline"
             disabled={importing}
+            className="h-auto w-full flex-col items-start gap-0.5 px-3 py-3 text-left whitespace-normal"
             onClick={() => importCcSwitch("codex")}
-            className="flex w-full flex-col items-start gap-0.5 rounded-lg border border-neutral-200 px-3 py-3 text-left transition-colors hover:border-neutral-300 hover:bg-neutral-50 disabled:pointer-events-none disabled:opacity-60"
           >
             <span className="text-sm font-medium text-neutral-900">
               {t.overview.importCcSwitchCodex}
             </span>
             {t.overview.importCcSwitchCodexDesc ? (
-              <span className="text-xs text-neutral-500">
+              <span className="text-xs font-normal text-neutral-500">
                 {t.overview.importCcSwitchCodexDesc}
               </span>
             ) : null}
-          </button>
-          <button
+          </Button>
+          <Button
             type="button"
+            variant="outline"
             disabled={importing}
+            className="h-auto w-full flex-col items-start gap-0.5 px-3 py-3 text-left whitespace-normal"
             onClick={() => importCcSwitch("claude")}
-            className="flex w-full flex-col items-start gap-0.5 rounded-lg border border-neutral-200 px-3 py-3 text-left transition-colors hover:border-neutral-300 hover:bg-neutral-50 disabled:pointer-events-none disabled:opacity-60"
           >
             <span className="text-sm font-medium text-neutral-900">
               {t.overview.importCcSwitchClaude}
             </span>
             {t.overview.importCcSwitchClaudeDesc ? (
-              <span className="text-xs text-neutral-500">
+              <span className="text-xs font-normal text-neutral-500">
                 {t.overview.importCcSwitchClaudeDesc}
               </span>
             ) : null}
-          </button>
+          </Button>
           <div className="flex justify-end pt-1">
             <Button
               type="button"

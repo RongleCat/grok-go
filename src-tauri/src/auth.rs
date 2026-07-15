@@ -813,14 +813,20 @@ pub fn clear_expired_cooldowns_in_store(store: &mut crate::config::AuthStore) ->
     changed
 }
 
-/// Force-clear cooldown on one account (user action).
+/// Clear cooldown / failure counters and set health to healthy.
+/// Does **not** change `enabled` (routing participation is separate).
+pub fn reset_account_health(account: &mut Account) {
+    account.cooldown_until = None;
+    account.consecutive_failures = 0;
+    account.last_upstream_error = None;
+    account.health = AccountHealth::Healthy;
+}
+
+/// Reset operational health on one account (user action).
 pub fn clear_account_cooldown(account_id: &str) -> AppResult<()> {
     let mut store = load_auth()?;
     if let Some(account) = store.accounts.iter_mut().find(|a| a.id == account_id) {
-        account.health = AccountHealth::Healthy;
-        account.cooldown_until = None;
-        account.consecutive_failures = 0;
-        account.last_upstream_error = None;
+        reset_account_health(account);
         save_auth(&store)?;
         Ok(())
     } else {

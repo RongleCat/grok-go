@@ -2,18 +2,26 @@
 
 ## 结论
 
-MCP 挂在 `http://127.0.0.1:<port>/mcp`，需 Bearer local token。工具目录在 `gateway/server.rs` 的 `mcp_tools_catalog_all()`，**参数以运行时 `tools/list` 为准**；`~/.grok-go/agents-guide.md` 是给人/Agent 读的同步摘要。
+MCP 挂在 `http://127.0.0.1:<port>/mcp`，需 Bearer local token。工具目录在 `gateway/server.rs` 的 `mcp_tools_catalog_all()`，**参数以运行时 `tools/list` 为准**；`~/.grok-go/agents-guide.md` 是给人/Agent 读的同步摘要（由 `integrations::agents_guide_file_body` 生成）。
+
+## Codex 强制分流（agents-guide）
+
+| 能力 | 优先路径 | 备注 |
+|---|---|---|
+| 文生图 / 图编辑 | Codex 内置 `imagegen` / `image_gen` | **不要**默认走 GrokGo MCP `image_*` |
+| `x_search`、`video_generate`、`video_edit` 等非图片 | GrokGo MCP | 先 `tools/list` 再 `tools/call`；禁止 web_search / Chrome / twitter241 顶替 |
+| 降级 | 仅 `/health` 或 MCP 明确失败 | 必须说明原因 |
 
 ## 工具清单
 
-| 工具 | 作用 | 必填 |
-|---|---|---|
-| `x_search` | 搜 X/Twitter | `query` |
-| `image_gen` | 文生图 | `prompt` |
-| `image_generate` | `image_gen` 别名 | `prompt` |
-| `image_edit` | 图编辑 | `prompt`, `image_url` |
-| `video_generate` | 文生/图生/多图参考视频 | `prompt`（+ 可选 image 字段） |
-| `video_edit` | 视频编辑 | `prompt`, `video_url` |
+| 工具 | 作用 | 必填 | agents-guide 归类 |
+|---|---|---|---|
+| `x_search` | 搜 X/Twitter | `query` | 优先 MCP |
+| `image_gen` | 文生图 | `prompt` | MCP 备选（非默认） |
+| `image_generate` | `image_gen` 别名 | `prompt` | MCP 备选（非默认） |
+| `image_edit` | 图编辑 | `prompt`, `image_url` | MCP 备选（非默认） |
+| `video_generate` | 文生/图生/多图参考视频 | `prompt`（+ 可选 image 字段） | 优先 MCP |
+| `video_edit` | 视频编辑 | `prompt`, `video_url` | 优先 MCP |
 
 ## 开关
 

@@ -6,6 +6,7 @@ import {
   KeyRound,
   RefreshCw,
   SearchX,
+  Settings2,
   Square,
   TimerOff,
   Trash2,
@@ -25,6 +26,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { ConfirmDialog, Dialog } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { PageBody, PageHeader, PageShell } from "@/components/page-shell";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
@@ -158,6 +160,7 @@ function AccountCard({
   labels,
   onToggleSelect,
   onSave,
+  onOpenConfig,
   onRemove,
   onClearCooldown,
   onRelogin,
@@ -170,7 +173,7 @@ function AccountCard({
   selected: boolean;
   labels: {
     enabled: string;
-    weight: string;
+    openConfig: string;
     loggedIn: string;
     notLoggedIn: string;
     health: (h: Account["health"]) => string;
@@ -184,7 +187,6 @@ function AccountCard({
     error: string;
     unusedQuota: string;
     unusedQuotaShort: string;
-    rateLimit: string;
     refreshQuota: string;
     refreshingQuota: string;
     relogin: string;
@@ -198,6 +200,7 @@ function AccountCard({
   };
   onToggleSelect: (id: string) => void;
   onSave: (account: Account) => void;
+  onOpenConfig: (account: Account) => void;
   onRemove: (id: string) => void;
   onClearCooldown: (id: string) => void;
   onRelogin: (id: string) => void;
@@ -230,9 +233,6 @@ function AccountCard({
   const name = account.email || account.name;
   const imgOk = supportsImage(account);
   const vidOk = supportsVideo(account);
-  const hasRateLimit =
-    account.rateLimitRemaining != null || account.rateLimitLimit != null;
-
   const healthVariant =
     account.health === "healthy"
       ? "success"
@@ -247,10 +247,12 @@ function AccountCard({
   return (
     <Card className={cn("overflow-hidden", selected && "ring-2 ring-neutral-900/15")}>
       <CardContent className="p-0">
-        <div className="grid grid-cols-1 gap-2 px-3 py-2.5 sm:grid-cols-[auto_minmax(0,1.2fr)_minmax(0,1fr)_auto] sm:items-center sm:gap-3">
-          <button
+        <div className="grid grid-cols-1 gap-2 px-3 py-2.5 sm:grid-cols-[auto_minmax(0,0.9fr)_minmax(0,1.5fr)_auto] sm:items-center sm:gap-3">
+          <Button
             type="button"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+            size="icon"
+            variant="outline"
+            className="h-8 w-8 shrink-0"
             title={selected ? "Unselect" : "Select"}
             aria-pressed={selected}
             onClick={() => onToggleSelect(account.id)}
@@ -260,7 +262,7 @@ function AccountCard({
             ) : (
               <Square className="h-4 w-4" />
             )}
-          </button>
+          </Button>
 
           {/* Identity */}
           <div className="flex min-w-0 items-center gap-2">
@@ -353,26 +355,6 @@ function AccountCard({
               />
             </div>
             <div className="flex min-h-5 flex-wrap items-center gap-1">
-              {/* API rate limit — updated on chat traffic and on quota refresh probe */}
-              {hasRateLimit ? (
-                <Tag
-                  title={`${labels.rateLimit}: ${
-                    account.rateLimitRemaining != null && account.rateLimitLimit != null
-                      ? `${account.rateLimitRemaining}/${account.rateLimitLimit}`
-                      : String(account.rateLimitRemaining ?? account.rateLimitLimit ?? "—")
-                  }${
-                    account.rateLimitResetAt
-                      ? ` · ${formatFullDateTime(account.rateLimitResetAt, locale)}`
-                      : ""
-                  }`}
-                  variant="success"
-                >
-                  API{" "}
-                  {account.rateLimitRemaining != null && account.rateLimitLimit != null
-                    ? `${account.rateLimitRemaining}/${account.rateLimitLimit}`
-                    : String(account.rateLimitRemaining ?? account.rateLimitLimit ?? "—")}
-                </Tag>
-              ) : null}
               {hasQuota ? (
                 <>
                   <Tag
@@ -403,13 +385,12 @@ function AccountCard({
                     </Tag>
                   ))}
                 </>
-              ) : !hasRateLimit ? (
+              ) : (
                 <Tag title={signedIn ? labels.unknown : labels.needLogin}>—</Tag>
-              ) : null}
+              )}
             </div>
           </div>
 
-          {/* Controls */}
           <div className="flex flex-wrap items-center justify-end gap-1.5 sm:flex-nowrap">
             <div className="flex h-8 items-center gap-1.5 rounded-md border border-neutral-200 px-2">
               <span className="select-none text-xs text-neutral-500">{labels.enabled}</span>
@@ -419,22 +400,14 @@ function AccountCard({
                 aria-label={labels.enabled}
               />
             </div>
-            <div className="flex h-8 items-center gap-1 rounded-md border border-neutral-200 px-1.5">
-              <span className="select-none text-xs text-neutral-500">{labels.weight}</span>
-              <Input
-                className="h-7 w-12 border-0 px-1 text-center text-xs shadow-none focus:ring-0"
-                type="number"
-                min={1}
-                value={account.weight}
-                aria-label={labels.weight}
-                onChange={(e) =>
-                  onSave({
-                    ...account,
-                    weight: Math.max(1, Number(e.target.value) || 1),
-                  })
-                }
-              />
-            </div>
+
+            <IconAction
+              title={labels.openConfig}
+              disabled={busy}
+              onClick={() => onOpenConfig(account)}
+            >
+              <Settings2 className="h-3.5 w-3.5" />
+            </IconAction>
 
             <IconAction
               title={quotaBusy ? labels.refreshingQuota : labels.refreshQuota}
@@ -452,9 +425,7 @@ function AccountCard({
               >
                 <TimerOff className="h-3.5 w-3.5" />
               </IconAction>
-            ) : (
-              <span className="hidden h-8 w-8 sm:inline-block" aria-hidden />
-            )}
+            ) : null}
 
             <IconAction
               title={busy ? labels.loggingIn : labels.relogin}
@@ -494,6 +465,9 @@ export function AccountsPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [importBusy, setImportBusy] = useState(false);
+  const [configAccountId, setConfigAccountId] = useState<string | null>(null);
+  const [configWeight, setConfigWeight] = useState("1");
+  const [configBusy, setConfigBusy] = useState(false);
   const [importOpts, setImportOpts] = useState<ImportAccountsOptions>({
     weight: 1,
     supportsImage: true,
@@ -553,10 +527,14 @@ export function AccountsPage() {
       const list = await refresh();
       if (!list || autoQuotaRef.current) return;
       autoQuotaRef.current = true;
-      const need = list.some((a) => a.accessToken && !a.quota);
-      if (!need) return;
+      // Only backfill missing snapshots on open; full refresh is sequential on the
+      // backend (and a silent timer also runs). Avoid blocking the UI on every visit.
+      const need = list.filter((a) => a.accessToken && !a.quota);
+      if (need.length === 0) return;
       setQuotaBusyAll(true);
       try {
+        // Backend drains one account at a time; we still use refresh-all so the
+        // shared queue stays ordered (no parallel fan-out).
         setAccounts(await api.refreshAllAccountQuotas());
       } catch (e) {
         toast(String(e), "warning");
@@ -938,7 +916,7 @@ export function AccountsPage() {
 
   const cardLabels = {
     enabled: t.common.enabled,
-    weight: t.common.weight,
+    openConfig: t.accounts.openConfig,
     loggedIn: t.accounts.loggedIn,
     notLoggedIn: t.accounts.notLoggedIn,
     health: (h: Account["health"]) => t.accounts.health[h] ?? h,
@@ -952,7 +930,6 @@ export function AccountsPage() {
     error: t.accounts.quotaError,
     unusedQuota: t.accounts.quotaUnused,
     unusedQuotaShort: t.accounts.quotaUnusedShort,
-    rateLimit: t.accounts.rateLimitHint,
     refreshQuota: t.accounts.refreshQuota,
     refreshingQuota: t.accounts.refreshingQuota,
     relogin: t.accounts.relogin,
@@ -964,6 +941,62 @@ export function AccountsPage() {
     videoOn: t.accounts.videoOn,
     videoOff: t.accounts.videoOff,
   };
+
+  const configAccount = useMemo(
+    () => accounts.find((a) => a.id === configAccountId) ?? null,
+    [accounts, configAccountId]
+  );
+
+  function openConfig(account: Account) {
+    setConfigAccountId(account.id);
+    setConfigWeight(String(account.weight ?? 1));
+  }
+
+  async function saveConfigWeight(): Promise<boolean> {
+    if (!configAccount) return false;
+    const w = Math.max(1, Number(configWeight) || 1);
+    if (w === configAccount.weight) {
+      setConfigWeight(String(configAccount.weight ?? 1));
+      return true;
+    }
+    setConfigBusy(true);
+    try {
+      const next = { ...configAccount, weight: w };
+      setAccounts(await api.upsertAccount(next));
+      setConfigWeight(String(next.weight));
+      toast(t.common.saved, "success");
+      return true;
+    } catch (e) {
+      toast(String(e), "error");
+      return false;
+    } finally {
+      setConfigBusy(false);
+    }
+  }
+
+  async function closeConfig() {
+    if (configAccount) {
+      const w = Math.max(1, Number(configWeight) || 1);
+      if (w !== configAccount.weight) {
+        const ok = await saveConfigWeight();
+        if (!ok) return;
+      }
+    }
+    setConfigAccountId(null);
+  }
+
+  async function resetConfigHealth() {
+    if (!configAccount) return;
+    setConfigBusy(true);
+    try {
+      setAccounts(await api.clearAccountCooldown(configAccount.id));
+      toast(t.accounts.resetHealthDone, "success");
+    } catch (e) {
+      toast(String(e), "error");
+    } finally {
+      setConfigBusy(false);
+    }
+  }
 
   return (
     <PageShell>
@@ -1049,7 +1082,7 @@ export function AccountsPage() {
 
       {/* Bulk actions */}
       {selected.size > 0 ? (
-        <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-white px-3 py-2">
           <span className="text-xs font-medium text-neutral-700">
             {t.accounts.bulkSelected.replace("{count}", String(selected.size))}
           </span>
@@ -1195,6 +1228,7 @@ export function AccountsPage() {
                 labels={cardLabels}
                 onToggleSelect={toggleSelect}
                 onSave={(a) => void save(a)}
+                onOpenConfig={openConfig}
                 onRemove={(id) => void remove(id)}
                 onClearCooldown={(id) => void clearCooldown(id)}
                 onRelogin={(id) => void login({ accountId: id })}
@@ -1204,6 +1238,130 @@ export function AccountsPage() {
           </div>
         )}
       </PageBody>
+
+      <Dialog
+        open={configAccount != null}
+        title={t.accounts.configTitle}
+        description={
+          configAccount
+            ? configAccount.email || configAccount.name
+            : undefined
+        }
+        className="max-w-md"
+        onClose={
+          configBusy
+            ? undefined
+            : () => {
+                void closeConfig();
+              }
+        }
+        footer={
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={configBusy}
+              onClick={() => setConfigAccountId(null)}
+            >
+              {t.common.cancel}
+            </Button>
+            <Button
+              type="button"
+              disabled={configBusy}
+              onClick={() => void closeConfig()}
+            >
+              {t.common.done}
+            </Button>
+          </div>
+        }
+      >
+        {configAccount ? (
+          <div className="space-y-3">
+            {/* 启用 */}
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-neutral-200 px-3 py-2.5">
+              <Label htmlFor="account-config-enabled" className="cursor-pointer">
+                {t.common.enabled}
+              </Label>
+              <Switch
+                id="account-config-enabled"
+                checked={configAccount.enabled}
+                disabled={configBusy}
+                onCheckedChange={(v) => {
+                  void save({ ...configAccount, enabled: v });
+                }}
+              />
+            </div>
+
+            {/* 权重 */}
+            <div className="space-y-2 rounded-lg border border-neutral-200 px-3 py-2.5">
+              <div className="flex items-baseline justify-between gap-2">
+                <Label htmlFor="account-config-weight">{t.common.weight}</Label>
+                <span className="text-xs text-neutral-400">{t.accounts.weightHint}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Input
+                  id="account-config-weight"
+                  className="h-9 w-28 text-center tabular-nums"
+                  type="number"
+                  min={1}
+                  value={configWeight}
+                  disabled={configBusy}
+                  onChange={(e) => setConfigWeight(e.target.value)}
+                  onBlur={() => {
+                    if (!configAccount) return;
+                    const w = Math.max(1, Number(configWeight) || 1);
+                    if (w !== configAccount.weight) void saveConfigWeight();
+                    else setConfigWeight(String(configAccount.weight ?? 1));
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.currentTarget.blur();
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="h-9"
+                  disabled={configBusy}
+                  onClick={() => void saveConfigWeight()}
+                >
+                  {t.common.save}
+                </Button>
+              </div>
+            </div>
+
+            {/* 健康 */}
+            <div className="space-y-2 rounded-lg border border-neutral-200 px-3 py-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <Label>{t.accounts.healthLabel}</Label>
+                <Badge
+                  variant={
+                    configAccount.health === "healthy"
+                      ? "success"
+                      : configAccount.health === "degraded"
+                        ? "warning"
+                        : "danger"
+                  }
+                >
+                  {t.accounts.health[configAccount.health] ?? configAccount.health}
+                </Badge>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="w-full"
+                disabled={configBusy}
+                onClick={() => void resetConfigHealth()}
+              >
+                {t.accounts.resetHealth}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+      </Dialog>
 
       <ConfirmDialog
         open={deleteConfirmOpen}

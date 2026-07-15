@@ -167,7 +167,7 @@ export function MappingPage() {
                 description={t.mapping.mappingsEmptyHint}
                 size="sm"
                 fill={false}
-                className="rounded-lg border border-dashed border-neutral-200 bg-neutral-50/50"
+                className="rounded-lg border border-dashed border-neutral-200"
               />
             ) : (
               mappingEntries.map(([k, v]) => (

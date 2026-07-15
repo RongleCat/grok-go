@@ -87,3 +87,55 @@ pub fn grok_build_restore_dir() -> AppResult<PathBuf> {
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
+
+/// OpenCode global config (`~/.config/opencode/opencode.json`).
+pub fn opencode_config_path() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|b| b.config_dir().join("opencode").join("opencode.json"))
+        .unwrap_or_else(|| PathBuf::from(".config/opencode/opencode.json"))
+}
+
+/// WorkBuddy / CodeBuddy user config home.
+/// Prefers `WORKBUDDY_CONFIG_DIR`, then `CODEBUDDY_CONFIG_DIR`, else `~/.workbuddy`.
+pub fn workbuddy_home() -> PathBuf {
+    if let Ok(p) = std::env::var("WORKBUDDY_CONFIG_DIR") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    if let Ok(p) = std::env::var("CODEBUDDY_CONFIG_DIR") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    directories::BaseDirs::new()
+        .map(|b| b.home_dir().join(".workbuddy"))
+        .unwrap_or_else(|| PathBuf::from(".workbuddy"))
+}
+
+pub fn workbuddy_models_path() -> PathBuf {
+    workbuddy_home().join("models.json")
+}
+
+/// WorkBuddy **user-editable** MCP config (`~/.workbuddy/mcp.json`).
+///
+/// The desktop "配置 MCP" UI edits this path. A sibling `.mcp.json` may exist as an
+/// auto-generated connector-proxy aggregate and must **not** be the inject target.
+pub fn workbuddy_mcp_path() -> PathBuf {
+    workbuddy_home().join("mcp.json")
+}
+
+/// WorkBuddy auto-generated / alternate MCP file (`~/.workbuddy/.mcp.json`).
+/// Used only to detect/cleanup stale GrokGo entries — not the primary inject path.
+pub fn workbuddy_mcp_dot_path() -> PathBuf {
+    workbuddy_home().join(".mcp.json")
+}
+
+/// Cursor global MCP config (`~/.cursor/mcp.json`).
+pub fn cursor_mcp_path() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|b| b.home_dir().join(".cursor").join("mcp.json"))
+        .unwrap_or_else(|| PathBuf::from(".cursor/mcp.json"))
+}

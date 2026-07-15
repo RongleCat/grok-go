@@ -1,5 +1,63 @@
 # Wiki 日志
 
+## 2026-07-15（WorkBuddy MCP 写入路径修正）
+
+- UI「配置 MCP」编辑的是 `~/.workbuddy/mcp.json`，不是自动生成的 `.mcp.json`（connector-proxy）。
+- 注入目标改为 `mcp.json`；type 用 `http`；顺带清理 `.mcp.json` 里残留的 grok-go。
+
+## 2026-07-15（集成：其他客户端 + MCP 页布局）
+
+- **其他客户端**标签：OpenCode（模型+MCP）、WorkBuddy（模型+MCP）、Cursor（MCP 注入 + BYOK 复制）。
+- **MCP 工具**标签：左侧工具管理 · 右侧客户端 MCP 片段卡片（内部滚动）；原客户端复制卡片迁入此列。
+- Cursor BYOK：Key/Base URL 在 secure storage，**不**做外部写入；只提供复制。
+- 后端：`set_opencode_*` / `set_workbuddy_*` / `set_cursor_mcp_inject`，merge 写入、备份到 `~/.grok-go/backups/`。
+
+## 2026-07-15（agents-guide 强制分流：图走 Codex / 其余走 GrokGo MCP）
+
+- 模板：`integrations::agents_guide_file_body` + `agents_guide_ref_block`（勿只改 `~/.grok-go/agents-guide.md` 手写文件）。
+- **图片**：优先 Codex 内置 `imagegen`/`image_gen`；MCP `image_*` 列为备选。
+- **x_search / 视频等**：必须 GrokGo MCP（`/mcp` + Bearer），先 `tools/list` 再 `tools/call`。
+- **禁止**因未注入 `mcp__grok-go__*` / 无原生 x_search / tool_search 失效就改用 web_search、Chrome、twitter241 或翻仓库猜参；仅 health/MCP 明确失败可降级并说明。
+
+## 2026-07-15（Files offload 死循环：勿分流 skills）
+
+- 会话 `019f65cb`：开场仅「嘿」却多次 `uploaded large blob` + `files-offload`。
+- **根因**：`offload_large_text_blobs` 把 Codex 注入的 `skills_instructions`（~39KB）等 message 文本上传并换成 stub，再注入 “Use attachment_search / read them” → 模型去盘上找 `input-text-*.txt`、乱调工具，叠写 `write_stdin` 类型错误后进入多轮空转。
+- **修复**：Files offload **只处理 tool output**；保护 bootstrap 文本检测；stub 改为中性「重跑工具取全文」，禁止 attachment_search 诱导。
+
+## 2026-07-15（CC Switch 导入：复制槽 + 同 model_provider）
+
+- Codex 会话绑 `model_provider` ID；写死 `grok-go` 会丢历史。
+- **正确做法**：复制新增 GrokGo 槽（如 `GrokGo · sub2api`），**不覆盖**用户当前服务商配置；副本 TOML 使用与 `~/.codex/config.toml` **相同的** `model_provider` id。
+- 再次导入只更新我们自己的副本行（notes/name 识别）。
+
+## 2026-07-15（grok-4.5 经代理体感慢：SSE 整段缓冲）
+
+- 数据：同模型 `responses` 平均 latency ~6.0s vs `grok-build` chat ~2.7s；responses 100k+ 上下文均值更高。
+- **根因 1（体感主因）**：Codex 路径 `emptyCompletionRetry` 曾对**所有**流式 `/responses` 整段缓冲 SSE，首字时间≈整段生成；Grok Build 为 `build_plane` 真流式。
+- **根因 2**：Codex 走 `api.x.ai` Responses，Build 走 `cli-chat-proxy` Chat；协议与上下文体积也不同。
+- **修复**：新增 `emptyCompletionStreamBuffer` 默认 **false**——流式默认透传；仅显式开启才缓冲。
+
+## 2026-07-15（账号配额：停止串扰 + 顺序刷新）
+
+- 网关热路径 `patch_account_cache` 不再用请求开始时的旧 quota 覆盖新近刷新结果（按 `fetched_at` 合并）。
+- 配额刷新串行、短超时；后台 silent 队列约 15 分钟一轮。
+
+## 2026-07-15（Claude Code：400 upstream error）
+
+- 会话 `6b1db793-…`：大 `Edit` 后下一轮 `/v1/messages` → 400；UI 只显示 `upstream error`。
+- **显示层**：xAI 错误体是 `{"code":"…","error":"<string>"}`，旧映射只读 `/error/message` → 落到默认 `"upstream error"`。已改为解析 string `error` + 日志/DB 记 raw upstream。
+- **根因（高概率）**：token 预算对 `tool_calls[].function.arguments` 做了**字符串中段截断**，破坏 JSON，xAI 整请求 400。已改为始终替换成**合法 JSON stub**（保留 key 预览）。
+- 需重启 GrokGo；已失败会话可「继续」。
+
+## 2026-07-14（Claude Code：Connection closed mid-response — 根因）
+
+- 会话 `3cfe2d8d-…`：input 涨到 **~116k** 后连续 3 次流式中断；`request_logs` HTTP 200 但 **0 tokens**。
+- **根因（不是“没补 message_stop”）**：Claude Code 每轮重放完整 tool 历史；原 `payload_optimize` 只有 **12–24MiB 字节预算**，文本 agent 环永远触达不到 → 不裁剪。大 prompt + 长 SSE 经 xAI/本地代理时中途被掐。
+- **根治**：`enforce_chat_context_budget`（软 80k / 硬 100k 估算 token）在 `/v1/messages` 路径裁剪历史 tool/user、压缩 tools schema、按剩余窗口 cap `max_tokens`。
+- **次要加固**（症状放大）：上游 SSE 读失败仍 `finish()` 发 `message_stop`，避免 Claude Code 只看到 Connection closed；0-token 流记 `error_summary`。
+- 运维：重启 GrokGo；已毒化会话仍建议 `/compact` 或新开（客户端 transcript 仍大）。
+
 ## 2026-07-14（关窗：托盘隐藏 / 二次确认退出）
 
 - **关闭时最小化到托盘 = 开**：关窗 `hide` + `skip_taskbar` + macOS `ActivationPolicy::Accessory`（去掉程序坞/任务栏图标，保留托盘）；托盘/菜单可 `Regular` 后再打开。

@@ -7,8 +7,13 @@
 //! This is independent of `api.x.ai` `x-ratelimit-*` RPM/TPM headers.
 
 use chrono::{DateTime, TimeZone, Utc};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use crate::auth::{apply_rate_limit_headers, ensure_fresh_token};
 use crate::config::{load_auth, load_config, Account};
@@ -18,6 +23,25 @@ use crate::http_client::build_http_client;
 const BILLING_URL: &str = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig";
 /// Empty protobuf message framed as gRPC-web (flags=0, length=0).
 const EMPTY_GRPC_WEB_FRAME: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00];
+
+/// SuperGrok billing probe timeout (was 25s — dominated "refresh is slow").
+const SUPERGROK_TIMEOUT: Duration = Duration::from_secs(12);
+/// Light GET /models for x-ratelimit headers.
+const RL_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Background full-cycle interval.
+const QUOTA_MAINTAIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// First background tick after app start.
+const QUOTA_MAINTAIN_INITIAL_DELAY: Duration = Duration::from_secs(90);
+/// Skip auto-refresh when snapshot is fresher than this.
+const QUOTA_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
+/// Pause between sequential queue items (avoid hammering grok.com).
+const QUOTA_QUEUE_GAP: Duration = Duration::from_secs(2);
+
+static QUOTA_MAINTAINER_STARTED: AtomicBool = AtomicBool::new(false);
+/// Single-flight worker: all manual + auto refreshes share one sequential queue.
+static QUOTA_QUEUE: Lazy<Arc<Mutex<QuotaQueueState>>> =
+    Lazy::new(|| Arc::new(Mutex::new(QuotaQueueState::default())));
+static QUOTA_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -78,14 +102,15 @@ fn sanitize_percent(v: f32) -> f32 {
     v.clamp(0.0, 200.0)
 }
 
+/// Pending account ids for sequential quota refresh (deduped FIFO).
+#[derive(Default)]
+struct QuotaQueueState {
+    pending: VecDeque<String>,
+}
+
 /// Refresh SuperGrok quota for one account and persist onto auth.json.
 pub async fn refresh_account_quota(account_id: &str) -> AppResult<Account> {
-    let config = load_config()?;
     let store = load_auth()?;
-    let exists = store.accounts.iter().any(|a| a.id == account_id);
-    if !exists {
-        return Err(AppError::msg("account not found"));
-    }
     let account = store
         .accounts
         .iter()
@@ -96,7 +121,9 @@ pub async fn refresh_account_quota(account_id: &str) -> AppResult<Account> {
             "account is not signed in (SSO cards must be converted to OAuth first)",
         ));
     }
-    refresh_account_quota_inner(&config, account_id).await?;
+    let config = load_config()?;
+    // Manual single-account: run immediately (still exclusive with queue worker via same mutex).
+    run_quota_job(&config, account_id, /*silent*/ false).await?;
     let store = load_auth()?;
     store
         .accounts
@@ -105,9 +132,9 @@ pub async fn refresh_account_quota(account_id: &str) -> AppResult<Account> {
         .ok_or_else(|| AppError::msg("account not found"))
 }
 
-/// Refresh every signed-in account. Per-account failures are stored on `quota.last_error`.
+/// Refresh every signed-in account **sequentially** (never fan-out parallel).
+/// Per-account failures are stored on `quota.last_error`.
 pub async fn refresh_all_account_quotas() -> AppResult<Vec<Account>> {
-    let config = load_config()?;
     let store = load_auth()?;
     let ids: Vec<String> = store
         .accounts
@@ -115,17 +142,134 @@ pub async fn refresh_all_account_quotas() -> AppResult<Vec<Account>> {
         .filter(|a| a.auth_kind == crate::config::AccountAuthKind::Oauth && a.is_credentialed())
         .map(|a| a.id.clone())
         .collect();
-
-    for id in ids {
-        // Ignore individual errors; each failure still writes last_error onto the account.
-        let _ = refresh_account_quota_inner(&config, &id).await;
+    let config = load_config()?;
+    for (i, id) in ids.iter().enumerate() {
+        let _ = run_quota_job(&config, id, /*silent*/ false).await;
+        if i + 1 < ids.len() {
+            tokio::time::sleep(QUOTA_QUEUE_GAP).await;
+        }
     }
     Ok(load_auth()?.accounts)
 }
 
-async fn refresh_account_quota_inner(config: &crate::config::AppConfig, account_id: &str) -> AppResult<()> {
-    // Clone one account only — never hold a full-store snapshot across `.await`
-    // (that was resurrecting deleted accounts when save_auth wrote the old list).
+/// Start background silent quota maintainer (once per process).
+pub fn start_quota_refresh_maintainer() {
+    if QUOTA_MAINTAINER_STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(
+            target: "quota",
+            interval_secs = QUOTA_MAINTAIN_INTERVAL.as_secs(),
+            "account quota maintainer started (sequential queue)"
+        );
+        tokio::time::sleep(QUOTA_MAINTAIN_INITIAL_DELAY).await;
+        loop {
+            if let Err(err) = enqueue_stale_accounts_and_drain(/*silent*/ true).await {
+                tracing::warn!(target: "quota", error = %err, "quota maintain tick failed");
+            }
+            tokio::time::sleep(QUOTA_MAINTAIN_INTERVAL).await;
+        }
+    });
+}
+
+/// Enqueue credentialed accounts with missing/stale quota, then drain one-by-one.
+async fn enqueue_stale_accounts_and_drain(silent: bool) -> AppResult<()> {
+    let store = load_auth()?;
+    let now = Utc::now();
+    let mut ids: Vec<String> = Vec::new();
+    for a in &store.accounts {
+        if a.auth_kind != crate::config::AccountAuthKind::Oauth || !a.is_credentialed() {
+            continue;
+        }
+        let stale = match a.quota.as_ref() {
+            None => true,
+            Some(q) => {
+                let age = now
+                    .signed_duration_since(q.fetched_at)
+                    .to_std()
+                    .unwrap_or(Duration::from_secs(u64::MAX));
+                age >= QUOTA_STALE_AFTER
+            }
+        };
+        if stale {
+            ids.push(a.id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return Ok(());
+    }
+    {
+        let mut q = QUOTA_QUEUE.lock().await;
+        for id in ids {
+            if !q.pending.iter().any(|x| x == &id) {
+                q.pending.push_back(id);
+            }
+        }
+    }
+    drain_quota_queue(silent).await;
+    Ok(())
+}
+
+async fn drain_quota_queue(silent: bool) {
+    // Single worker — never refresh all accounts in parallel.
+    if QUOTA_WORKER_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(err) => {
+            QUOTA_WORKER_RUNNING.store(false, Ordering::SeqCst);
+            tracing::warn!(target: "quota", error = %err, "quota worker: no config");
+            return;
+        }
+    };
+    loop {
+        let next_id: Option<String> = {
+            let mut q = QUOTA_QUEUE.lock().await;
+            q.pending.pop_front()
+        };
+        let Some(id) = next_id else {
+            // Released the worker flag before re-checking for races.
+            QUOTA_WORKER_RUNNING.store(false, Ordering::SeqCst);
+            let leftover = {
+                let q = QUOTA_QUEUE.lock().await;
+                q.pending.front().is_some()
+            };
+            if leftover
+                && QUOTA_WORKER_RUNNING
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                continue;
+            }
+            break;
+        };
+        let _ = run_quota_job(&config, &id, silent).await;
+        let more = {
+            let q = QUOTA_QUEUE.lock().await;
+            q.pending.front().is_some()
+        };
+        if more {
+            tokio::time::sleep(QUOTA_QUEUE_GAP).await;
+        }
+    }
+    QUOTA_WORKER_RUNNING.store(false, Ordering::SeqCst);
+}
+
+async fn run_quota_job(
+    config: &crate::config::AppConfig,
+    account_id: &str,
+    silent: bool,
+) -> AppResult<()> {
+    let started = std::time::Instant::now();
+    // Clone one account only — never hold a full-store snapshot across `.await`.
     let mut account = {
         let store = load_auth()?;
         store
@@ -134,6 +278,9 @@ async fn refresh_account_quota_inner(config: &crate::config::AppConfig, account_
             .find(|a| a.id == account_id)
             .ok_or_else(|| AppError::msg("account not found"))?
     };
+    if !account.is_credentialed() {
+        return Err(AppError::msg("account not signed in"));
+    }
 
     let token = match ensure_fresh_token(config, &mut account).await {
         Ok(t) => t,
@@ -144,38 +291,52 @@ async fn refresh_account_quota_inner(config: &crate::config::AppConfig, account_
         }
     };
 
-    // SuperGrok weekly credits (grok.com) — may be empty for never-used / free-tier cards.
-    let super_result = fetch_quota_snapshot(config, &token).await;
-    // API rate-limit headers (api.x.ai) — what routing actually consumes for chat.
-    // Manual "refresh quota" previously only hit SuperGrok, so RL stayed stale after imports.
-    probe_api_rate_limits(config, &mut account, &token).await;
+    // Persist token refresh side-effects without touching other accounts.
+    let _ = crate::config::apply_account_update(&account);
 
+    // SuperGrok first (what the UI progress bar shows) — persist immediately so the
+    // row updates even if the lighter RL probe is slow.
+    let super_result = fetch_quota_snapshot(config, &token).await;
+    match &super_result {
+        Ok(snap) => {
+            account.quota = Some(snap.clone());
+            let _ = crate::config::apply_account_update(&account);
+        }
+        Err(err) => {
+            if !silent {
+                tracing::warn!(
+                    target: "quota",
+                    account_id = %account_id,
+                    error = %err,
+                    "SuperGrok quota refresh failed"
+                );
+            }
+            stamp_quota_error(&mut account, err.to_string());
+            let _ = crate::config::apply_account_update(&account);
+        }
+    }
+
+    // API rate-limit headers (routing) — secondary; shorter timeout.
+    probe_api_rate_limits(config, &mut account, &token).await;
+    let _ = crate::config::apply_account_update(&account);
+
+    let elapsed_ms = started.elapsed().as_millis();
     match super_result {
         Ok(snap) => {
             tracing::info!(
+                target: "quota",
                 account_id = %account_id,
                 used = snap.used_percent,
                 remaining = snap.remaining_percent,
                 products = snap.products.len(),
                 rl_rem = ?account.rate_limit_remaining,
-                rl_lim = ?account.rate_limit_limit,
+                elapsed_ms,
+                silent,
                 "quota refresh ok"
             );
-            account.quota = Some(snap);
-            crate::config::apply_account_update(&account)?;
             Ok(())
         }
-        Err(err) => {
-            tracing::warn!(
-                account_id = %account_id,
-                error = %err,
-                rl_rem = ?account.rate_limit_remaining,
-                "SuperGrok quota refresh failed (RL probe may still have updated)"
-            );
-            stamp_quota_error(&mut account, err.to_string());
-            let _ = crate::config::apply_account_update(&account);
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 
@@ -195,7 +356,7 @@ async fn probe_api_rate_limits(config: &crate::config::AppConfig, account: &mut 
     };
     match client
         .get(&url)
-        .timeout(Duration::from_secs(15))
+        .timeout(RL_PROBE_TIMEOUT)
         .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/json")
         .send()
@@ -246,7 +407,7 @@ pub async fn fetch_quota_snapshot(
     let client = build_http_client(config)?;
     let resp = client
         .post(BILLING_URL)
-        .timeout(Duration::from_secs(25))
+        .timeout(SUPERGROK_TIMEOUT)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Content-Type", "application/grpc-web+proto")
         .header("x-grpc-web", "1")
@@ -254,6 +415,8 @@ pub async fn fetch_quota_snapshot(
         .header("Origin", "https://grok.com")
         .header("Referer", "https://grok.com/?_s=usage")
         .header("Accept", "*/*")
+        // Do not send cookies — multi-account must key solely on Bearer token.
+        .header("Cookie", "")
         .body(EMPTY_GRPC_WEB_FRAME.to_vec())
         .send()
         .await

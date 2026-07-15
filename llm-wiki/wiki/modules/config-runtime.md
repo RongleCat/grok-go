@@ -24,6 +24,8 @@
 | launch_on_startup | false |
 | minimize_to_tray | true |
 | xai_base_url | https://api.x.ai/v1 |
+| cli_chat_proxy_base_url | https://cli-chat-proxy.grok.com/v1 |
+| experimental_impersonate_grok_build | **false**（开则 Codex/OpenAI/Claude 仿冒 Grok Build 走 cli-chat-proxy） |
 | oauth_redirect_port | 56121 |
 | http_proxy_enabled | false |
 | app_icon | dark |

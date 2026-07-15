@@ -19,10 +19,19 @@ use crate::auth::{
 };
 use crate::config::{load_auth, load_config, resolve_model, AppConfig};
 use crate::error::{AppError, AppResult};
+use crate::gateway::build_plane_route::{
+    adapt_chat_body_for_build_plane, decide_plane, effective_client_source, PlaneDecision,
+};
 use crate::gateway::empty_completion::{
     build_empty_completion_retry_request, extract_completed_response_from_sse, is_responses_path,
     recovery_quality_score, should_retry_premature_agent_stop, synthesize_forced_tool_response,
     SSE_BUFFER_LIMIT,
+};
+
+// Public re-exports (API stability for external callers / tests).
+pub use crate::gateway::build_plane_route::{
+    collect_build_plane_passthrough_headers, is_grok_build_plane, resolve_upstream_base,
+    DEFAULT_GROK_CLIENT_VERSION,
 };
 use crate::gateway::image_bridge::{
     collect_image_gen_calls, fulfill_image_gen_call, inject_image_generation_calls,
@@ -138,144 +147,6 @@ pub async fn authorize_request(headers: &HeaderMap, config: &AppConfig) -> Resul
         .to_string(),
     )
         .into_response())
-}
-
-/// True when the client is Grok Build CLI (session / SuperGrok credits plane).
-///
-/// Markers from official docs: `X-XAI-Token-Auth: xai-grok-cli`,
-/// `x-grok-model-override`, and Grok CLI user-agents.
-pub fn is_grok_build_plane(headers: &HeaderMap) -> bool {
-    if let Some(v) = headers
-        .get("x-xai-token-auth")
-        .and_then(|v| v.to_str().ok())
-    {
-        let lower = v.to_ascii_lowercase();
-        if lower.contains("grok-cli") || lower.contains("xai-grok") {
-            return true;
-        }
-    }
-    if headers.get("x-grok-model-override").is_some() {
-        return true;
-    }
-    if let Some(ua) = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-    {
-        let lower = ua.to_ascii_lowercase();
-        if lower.contains("grok-cli")
-            || lower.contains("grok-build")
-            || lower.contains("xai-grok-shell")
-            || lower.contains("xai-grok")
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Pick upstream base: Grok Build → cli-chat-proxy; otherwise console API.
-pub fn resolve_upstream_base(config: &AppConfig, headers: &HeaderMap) -> String {
-    if is_grok_build_plane(headers) {
-        config.cli_chat_proxy_base_url.trim_end_matches('/').to_string()
-    } else {
-        config.xai_base_url.trim_end_matches('/').to_string()
-    }
-}
-
-/// Minimum cli-chat-proxy client version (426 Upgrade Required below this).
-const DEFAULT_GROK_CLIENT_VERSION: &str = "0.2.101";
-
-/// Whether a client header should be forwarded on the Grok Build / cli-chat-proxy plane.
-///
-/// Includes all `x-grok-*` / `x-xai-*` plus a few non-prefixed headers the official
-/// CLI sends (`User-Agent`, `x-email`, `x-models-etag`, tracing). Authorization is
-/// rewritten to a pool token and must never pass through.
-fn should_passthrough_build_header(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    // Hop-by-hop / rewritten by us.
-    if matches!(
-        lower.as_str(),
-        "authorization"
-            | "host"
-            | "content-length"
-            | "content-type"
-            | "accept"
-            | "connection"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailers"
-            | "upgrade"
-            | "cookie"
-            | "set-cookie"
-    ) {
-        return false;
-    }
-    lower.starts_with("x-grok-")
-        || lower.starts_with("x-xai-")
-        || matches!(
-            lower.as_str(),
-            "user-agent"
-                | "x-email"
-                | "x-models-etag"
-                | "x-authenticate"
-                | "accept-language"
-                | "x-request-id"
-                | "traceparent"
-                | "tracestate"
-                | "baggage"
-        )
-}
-
-/// Client headers that must reach cli-chat-proxy for native Grok Build behaviour.
-fn collect_build_plane_passthrough_headers(headers: &HeaderMap) -> Vec<(HeaderName, String)> {
-    let mut out = Vec::new();
-    for (name, value) in headers.iter() {
-        if !should_passthrough_build_header(name.as_str()) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            if !v.is_empty() {
-                out.push((name.clone(), v.to_string()));
-            }
-        }
-    }
-    // Ensure the canonical CLI marker is always present on the build plane.
-    if !out
-        .iter()
-        .any(|(n, _)| n.as_str().eq_ignore_ascii_case("x-xai-token-auth"))
-    {
-        out.push((
-            HeaderName::from_static("x-xai-token-auth"),
-            "xai-grok-cli".into(),
-        ));
-    }
-    // cli-chat-proxy rejects missing / outdated versions with 426.
-    // Prefer client value; fall back to a known-good default so curl / old clients work.
-    if !out
-        .iter()
-        .any(|(n, v)| {
-            n.as_str().eq_ignore_ascii_case("x-grok-client-version") && !v.trim().is_empty()
-        })
-    {
-        out.push((
-            HeaderName::from_static("x-grok-client-version"),
-            DEFAULT_GROK_CLIENT_VERSION.into(),
-        ));
-    }
-    // Sensible User-Agent when callers (curl / tests) omit it.
-    if !out
-        .iter()
-        .any(|(n, v)| n.as_str().eq_ignore_ascii_case("user-agent") && !v.trim().is_empty())
-    {
-        out.push((
-            HeaderName::from_static("user-agent"),
-            format!("xai-grok-shell/{DEFAULT_GROK_CLIENT_VERSION} (grok-build)"),
-        ));
-    }
-    out
 }
 
 pub async fn proxy_json(
@@ -413,16 +284,40 @@ async fn proxy_anthropic_messages_inner(
         }
     }
 
+    // Build-plane adapt when experimental impersonation / native markers force cli-chat-proxy.
+    let plane = decide_plane(&config, &headers, "/chat/completions");
+    if plane.build_plane {
+        let _ = adapt_chat_body_for_build_plane(&mut chat_body);
+    }
+
     let outbound_body = Bytes::from(serde_json::to_vec(&chat_body)?);
     let session_key = session_affinity::extract_session_key(&headers, Some(&chat_body));
     let http = ctx.client();
-    let upstream_base = config.xai_base_url.trim_end_matches('/');
+    let upstream_base = plane.upstream_base.clone();
     let url = format!("{upstream_base}/chat/completions");
+    let passthrough_headers = if plane.inject_build_headers {
+        collect_build_plane_passthrough_headers(&headers)
+    } else {
+        Vec::new()
+    };
+    let conv_header = headers
+        .get("x-grok-conv-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            session_key
+                .as_deref()
+                .and_then(session_affinity::stable_cache_key)
+        });
 
     let build_upstream = {
         let url = url.clone();
+        let passthrough_headers = passthrough_headers.clone();
+        let conv_header = conv_header.clone();
         move |client: &reqwest::Client, token: &str, body: Bytes| {
-            client
+            let mut req = client
                 .post(&url)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
@@ -433,13 +328,29 @@ async fn proxy_anthropic_messages_inner(
                     } else {
                         "application/json"
                     },
-                )
-                .body(body)
+                );
+            for (name, value) in &passthrough_headers {
+                if name.as_str().eq_ignore_ascii_case("x-grok-conv-id") {
+                    continue;
+                }
+                req = req.header(name.clone(), value.as_str());
+            }
+            if let Some(ref cid) = conv_header {
+                req = req.header("x-grok-conv-id", cid.as_str());
+            }
+            req.body(body)
         }
     };
 
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
+    if plane.experimental_impersonation {
+        tracing::info!(
+            target: "gateway",
+            upstream = %upstream_base,
+            "experimental Grok Build impersonation (Anthropic) → cli-chat-proxy"
+        );
+    }
     let (mut account, _token, upstream) = send_with_account_failover(
         &config,
         &http,
@@ -463,7 +374,7 @@ async fn proxy_anthropic_messages_inner(
 
     let latency_ms = started.elapsed().as_millis() as u64;
     let path = "/v1/messages";
-    let client_source = "anthropic-messages";
+    let client_source = effective_client_source(&plane, "anthropic-messages");
 
     if is_stream {
         if status.is_success() {
@@ -487,7 +398,7 @@ async fn proxy_anthropic_messages_inner(
             Some(resolved_model.clone()),
             status.as_u16(),
             latency_ms,
-            client_source.to_string(),
+            client_source.clone(),
             config.session_affinity,
             config.session_affinity_ttl_secs,
             account.id.clone(),
@@ -646,7 +557,7 @@ async fn proxy_anthropic_messages_inner(
             // Prefer raw upstream for diagnostics; fall back to mapped Anthropic body.
             Some(upstream_json.to_string())
         },
-        client_source,
+        &client_source,
         Some(mapping_reason),
     );
 
@@ -682,8 +593,14 @@ async fn proxy_json_inner(
     let mut client_wants_stream = false;
     // Capture session key before sanitize strips previous_response_id etc.
     let mut session_key: Option<String> = None;
-    // Detect Grok Build early — native plane must keep continuity + skip Codex-only guards.
-    let build_plane = is_grok_build_plane(&headers);
+    // Plane decision: native markers OR experimental impersonation flag.
+    let plane: PlaneDecision = decide_plane(&config, &headers, path);
+    let build_plane = plane.build_plane;
+    // Codex console-only guards (empty-completion, nuclear strip, stream buffer).
+    let apply_console_guards = plane.apply_codex_console_guards;
+    // Image tool bridge: run for non-native clients (console or experimental
+    // impersonation). Native Grok Build handles tools upstream.
+    let run_image_tool_bridge = !plane.native_build_client;
 
     if matches!(method, Method::POST | Method::PUT | Method::PATCH) && !outbound_body.is_empty() {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&outbound_body) {
@@ -748,13 +665,18 @@ async fn proxy_json_inner(
                 if sanitized.modified {
                     body_changed = true;
                 }
-                // Image tool loop needs a full JSON response; force non-stream upstream.
-                // Only for non-build (Codex) plane — Grok Build handles tools natively.
-                if !build_plane
+                // Image tool loop needs a full JSON response; force non-stream upstream
+                // when we will fulfill image tools server-side (non-native clients).
+                if run_image_tool_bridge
                     && has_image_gen_tools
                     && value.get("stream").and_then(|v| v.as_bool()) == Some(true)
                 {
                     value["stream"] = Value::Bool(false);
+                    body_changed = true;
+                }
+            }
+            if is_chat && build_plane {
+                if adapt_chat_body_for_build_plane(&mut value) {
                     body_changed = true;
                 }
             }
@@ -782,14 +704,17 @@ async fn proxy_json_inner(
     let custom_tool_names = Arc::new(custom_tool_names);
 
     let http = ctx.client();
-    let upstream_base = resolve_upstream_base(&config, &headers);
+    let upstream_base = plane.upstream_base.clone();
     let url = format!("{upstream_base}{path}");
-    let effective_source = if build_plane {
-        "grok-build"
-    } else {
-        client_source
-    };
-    if build_plane {
+    let effective_source = effective_client_source(&plane, client_source);
+    if plane.experimental_impersonation {
+        tracing::info!(
+            target: "gateway",
+            %path,
+            upstream = %upstream_base,
+            "experimental Grok Build impersonation → cli-chat-proxy"
+        );
+    } else if build_plane {
         tracing::debug!(
             target: "gateway",
             %path,
@@ -838,7 +763,7 @@ async fn proxy_json_inner(
             .and_then(session_affinity::stable_cache_key)
     });
 
-    let passthrough_headers = if build_plane {
+    let passthrough_headers = if plane.inject_build_headers {
         collect_build_plane_passthrough_headers(&headers)
     } else {
         Vec::new()
@@ -877,10 +802,8 @@ async fn proxy_json_inner(
     // Single-account happy path is unchanged (one pick + one send).
     // On account-scoped failures (401/403/429/5xx/transport), try other accounts
     // inside this request so the client does not see several hard failures in a row.
-    // Files offload targets console Files API (api.x.ai) — never enable on Grok Build
-    // plane where inference hits cli-chat-proxy (file_id would be wrong account/plane).
-    let allow_files_offload = !build_plane
-        && (path.contains("/responses") || path.contains("/chat/completions"));
+    // Files offload targets console Files API (api.x.ai) — never enable on build chat plane.
+    let allow_files_offload = plane.allow_files_offload;
     let (mut account, token, upstream) = send_with_account_failover(
         &config,
         &http,
@@ -924,7 +847,7 @@ async fn proxy_json_inner(
         // Grok Build always true-streams. Non-stream JSON empty recovery is separate.
         let guard_empty = config.empty_completion_retry
             && config.empty_completion_stream_buffer
-            && !build_plane
+            && apply_console_guards
             && is_responses_path(path)
             && status.is_success()
             && parsed_request.is_some();
@@ -968,7 +891,7 @@ async fn proxy_json_inner(
                 o,
                 c,
                 None,
-                effective_source,
+                &effective_source,
                 reason,
             );
             let mut response = Response::builder()
@@ -1024,7 +947,7 @@ async fn proxy_json_inner(
     // Retry once when xAI rejects opaque context or input item shapes (Codex multi-turn).
     // Skip nuclear strip on Grok Build plane: it removes prompt_cache_key / continuity
     // and forces a full re-tokenize (token blow-up + cache miss).
-    if !status.is_success() && !build_plane {
+    if !status.is_success() && apply_console_guards {
         let err_text = String::from_utf8_lossy(&bytes);
         if is_compaction_blob_error(&err_text) || is_model_input_error(&err_text) {
             if let Some(mut req_value) = parsed_request.clone() {
@@ -1113,10 +1036,10 @@ async fn proxy_json_inner(
         }
 
         // Reasoning-only / narration-only premature stop → silent retry so Codex keeps going.
-        // Disabled on Grok Build plane (native agent loop; retries would double SuperGrok spend).
+        // Disabled on build plane (native/experimental SuperGrok path; retries double spend).
         if status.is_success()
             && config.empty_completion_retry
-            && !build_plane
+            && apply_console_guards
             && is_responses_path(path)
             && should_retry_premature_agent_stop(&value, parsed_request.as_ref())
         {
@@ -1223,7 +1146,7 @@ async fn proxy_json_inner(
         output_tokens,
         cache_tokens,
         error_summary,
-        effective_source,
+        &effective_source,
         mapping_reason,
     );
 

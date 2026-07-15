@@ -1,5 +1,13 @@
 # Wiki 日志
 
+## 2026-07-16（实验：仿冒 Grok Build 双平面）
+
+- 配置：`experimentalImpersonateGrokBuild`（默认 false）；设置页「流量分配」开关。
+- 实现：`gateway/build_plane_route.rs` → `decide_plane`；`proxy` / Anthropic 路径共用。
+- 开关开：Codex Responses / OpenAI chat / Claude Messages 注入 Grok Build 头并走 `cli-chat-proxy`；媒体仍 `api.x.ai`。
+- 用量：`client_source=experimental-build`（媒体 `experimental-build-media`）。
+- 开源调研：CLIProxyAPI 有同类 OAuth→cli-chat-proxy 头；无完整可 vend 的转换库，本仓内实现。
+
 ## 2026-07-15（WorkBuddy MCP 写入路径修正）
 
 - UI「配置 MCP」编辑的是 `~/.workbuddy/mcp.json`，不是自动生成的 `.mcp.json`（connector-proxy）。

@@ -378,6 +378,8 @@ export const zhCN = {
     preferSoonestResetDesc: "快到期的优先用",
     accountMaxConcurrency: "单号并发上限",
     accountMaxConcurrencyDesc: "0 = 不限制",
+    experimentalImpersonateGrokBuild: "仿冒 Grok Build（实验）",
+    experimentalImpersonateGrokBuildDesc: "Codex / OpenAI / Claude 走 SuperGrok 面",
     ensureGateway: "确保网关运行",
     gatewayEnsured: "网关已运行",
     toastSaved: "已保存",

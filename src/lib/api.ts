@@ -68,6 +68,11 @@ export type AppConfig = {
   xaiBaseUrl: string;
   /** Grok Build native SuperGrok plane (cli-chat-proxy). */
   cliChatProxyBaseUrl?: string;
+  /**
+   * Experimental: force Codex / OpenAI / Claude Code onto cli-chat-proxy
+   * with Grok Build identity headers. Default false.
+   */
+  experimentalImpersonateGrokBuild?: boolean;
   oauthRedirectPort: number;
   /** When true, upstream xAI / OAuth requests use httpProxyUrl. Default false. */
   httpProxyEnabled: boolean;

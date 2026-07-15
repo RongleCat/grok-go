@@ -380,6 +380,8 @@ export const en: Dictionary = {
     preferSoonestResetDesc: "Use soon-to-reset first",
     accountMaxConcurrency: "Per-account concurrency",
     accountMaxConcurrencyDesc: "0 = unlimited",
+    experimentalImpersonateGrokBuild: "Impersonate Grok Build (experimental)",
+    experimentalImpersonateGrokBuildDesc: "Route Codex / OpenAI / Claude to SuperGrok plane",
     ensureGateway: "Ensure gateway running",
     gatewayEnsured: "Gateway is running",
     toastSaved: "Saved",

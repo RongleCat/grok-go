@@ -79,6 +79,11 @@ pub struct AppConfig {
     /// Do **not** point Grok Build at `xai_base_url` — that is the metered API path.
     #[serde(default = "default_cli_chat_proxy_base_url")]
     pub cli_chat_proxy_base_url: String,
+    /// Experimental: force Codex / OpenAI / Claude Code (non–Grok-Build clients) onto the
+    /// cli-chat-proxy SuperGrok chat plane with Grok Build identity headers.
+    /// Default **false** — stable console paths unchanged when off.
+    #[serde(default)]
+    pub experimental_impersonate_grok_build: bool,
     #[serde(default = "default_oauth_redirect_port")]
     pub oauth_redirect_port: u16,
     /// When true, upstream xAI/OAuth HTTP goes through `http_proxy_url`.
@@ -229,6 +234,7 @@ impl Default for AppConfig {
             xai_client_id: default_xai_client_id(),
             xai_base_url: default_xai_base_url(),
             cli_chat_proxy_base_url: default_cli_chat_proxy_base_url(),
+            experimental_impersonate_grok_build: false,
             oauth_redirect_port: default_oauth_redirect_port(),
             http_proxy_enabled: false,
             http_proxy_url: String::new(),
@@ -428,6 +434,13 @@ pub fn save_config(config: &AppConfig) -> AppResult<()> {
     write_json_atomic(&path, config)?;
     *CONFIG_CACHE.write() = Some(config.clone());
     Ok(())
+}
+
+/// Drop in-memory config/auth caches (tests that mutate config.json mid-process).
+#[cfg(test)]
+pub fn invalidate_caches_for_test() {
+    *CONFIG_CACHE.write() = None;
+    *AUTH_CACHE.write() = None;
 }
 
 pub fn load_auth() -> AppResult<AuthStore> {

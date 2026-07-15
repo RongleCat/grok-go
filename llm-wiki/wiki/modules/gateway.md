@@ -48,6 +48,19 @@
 - image tool 服务端闭环：`proxy::run_image_gen_tool_loop` + `image_bridge`
 - **reasoning-only 空完成恢复**：`empty_completion` + `proxy` 在返回客户端前静默重试一次（见 [[../concepts/empty-completion-retry]]）
 - 视频 job 记住账号：`job_affinity`
+- **双平面路由**：`gateway/build_plane_route.rs` 的 `decide_plane`（原生 Grok Build 标记 **或** 实验开关）
+
+## 双平面 / 实验仿冒 Grok Build
+
+| 条件 | 推理上游 | 媒体上游 | 日志 `client_source` |
+|---|---|---|---|
+| 客户端带 Grok Build 标记 | `cli_chat_proxy_base_url` | `xai_base_url`（图片/视频） | `grok-build` |
+| `experimentalImpersonateGrokBuild=true` 且无原生标记 | 同上（注入 `X-XAI-Token-Auth` 等） | 同上（cli-chat-proxy 无 media） | `experimental-build` / `experimental-build-media` |
+| 开关关 + 普通 Codex/OpenAI/Claude | `xai_base_url` | `xai_base_url` | 原协议标签 |
+
+- 默认 **关**；稳定 console 路径行为不变。
+- 仿冒开启时：Responses 保留 continuity；Chat 剥 `service_tier` 等；Anthropic 仍回写 Messages 形态。
+- Codex console 专用恢复（empty-completion / nuclear strip / files offload）仅在 **非 build 语义** 下启用。
 
 ## 相关页面
 
@@ -63,6 +76,7 @@
 
 - `src-tauri/src/gateway/server.rs`
 - `src-tauri/src/gateway/proxy.rs`
+- `src-tauri/src/gateway/build_plane_route.rs`
 - `src-tauri/src/gateway/empty_completion.rs`
 - `src-tauri/src/gateway/payload_optimize.rs`
 - `src-tauri/src/gateway/files_api.rs`

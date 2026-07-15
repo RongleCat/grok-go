@@ -93,7 +93,8 @@ pub async fn start_gateway(state: GatewayState) -> AppResult<SocketAddr> {
     Ok(addr)
 }
 
-fn build_router(state: GatewayState) -> Router {
+/// Build the gateway Axum router (also used by live integration tests).
+pub fn build_router(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))

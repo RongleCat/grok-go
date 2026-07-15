@@ -75,6 +75,12 @@ Authorization = "Bearer <localToken>"
 
 ## CC Switch 导入
 
+- **Codex 导入（复制槽，防会话丢失）**：
+  1. **不**改写用户当前 `is_current` 原服务商配置；
+  2. **复制新增**（或更新）一条 GrokGo 副本（显示名如 `GrokGo · sub2api`）；
+  3. 副本 TOML 的 `model_provider` **与当前 `~/.codex/config.toml` 相同（会话 `session_meta` 仍对得上）；
+  4. 无当前 provider 时回退 `GrokGo` / `grok-go`。
+- Claude 导入仍用独立 `GrokGo` 名（会话体系不同）。
 - 若 `auto_inject_codex_mcp` 为 true，或本机 `~/.codex/config.toml` 已注入 grok-go MCP：
   - provider 的 `config` TOML 会附带 `[mcp_servers.grok-go]`
   - 同时 upsert `mcp_servers` 表（`enabled_codex=1`）

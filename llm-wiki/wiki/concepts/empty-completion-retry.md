@@ -26,16 +26,18 @@ status=completed ∧ 无 error/incomplete
 
 ## 行为
 
-1. **流式**：缓冲 SSE（上限 24MB）→ 判定 → 恢复 → SSE 回放  
-2. **软重试 1 次**：`stream=false` + 钉死 shell 类 `tool_choice` + recovery nudge  
-3. **硬兜底**：注入合成 `function_call`，命令固定中性 probe：`echo grok-go-continue`  
-4. 日志：`injecting synthetic tool call to keep Codex loop alive`
+1. **非流式 JSON**：判定空完成 → 静默重试 1 次  
+2. **流式（默认）**：**真流式透传**（与 Grok Build 一致），**不**整段缓冲——否则 TTFT = 整段生成时间，体感极慢  
+3. **流式 + `emptyCompletionStreamBuffer=true`**：缓冲 SSE（上限 24MB）→ 判定 → 恢复 → SSE 回放（牺牲首字速度换 agent 续跑）  
+4. **软重试**：`stream=false` + 钉死 shell 类 `tool_choice` + recovery nudge  
+5. **硬兜底**：注入合成 `function_call`（`echo grok-go-continue`）
 
 ## 配置
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
-| `emptyCompletionRetry` | `true` | 关闭则完全透传上游空完成 |
+| `emptyCompletionRetry` | `true` | 非流式空完成恢复；流式还需下面开关 |
+| `emptyCompletionStreamBuffer` | **`false`** | 为 true 才缓冲整段 SSE 做流式恢复（会拖慢首字） |
 
 ## 相关页面
 

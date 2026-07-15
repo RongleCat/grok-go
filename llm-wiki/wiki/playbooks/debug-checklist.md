@@ -47,8 +47,8 @@
 ## Codex 读多文件/多图后 token 暴涨或任务强制停止
 
 1. 现象：跑一段时间停、重启同一会话又停，goal 也救不了 → 多半是会话 history 已塞满 base64/大 tool 输出
-2. 网关侧：`payload_optimize` 会去重/折叠历史图、截断大段 tool 输出、有图时 `store:false`；≥32KB 文本尝试 Files `file_id` 分流
-3. 日志里搜 `payload optimized` / `files offload` / `uploaded large blob`
+2. 网关侧：`payload_optimize` 会去重/折叠历史图、截断大段 tool 输出、有图时 `store:false`；**仅 ≥32KB 的 tool output** 才 Files `file_id` 分流（不会分流 skills/developer 正文）
+3. 日志里搜 `payload optimized` / `files offload` / `uploaded large blob`；若会话开头就大量 upload 且用户几乎没读文件 → 旧版误分流 bootstrap，应已修复
 4. 客户端已毒化的线程：建议 **新开会话**；旧 transcript 本地仍大
 5. 细节见 [[../concepts/payload-optimize]]
 

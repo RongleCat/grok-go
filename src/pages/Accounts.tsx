@@ -553,10 +553,14 @@ export function AccountsPage() {
       const list = await refresh();
       if (!list || autoQuotaRef.current) return;
       autoQuotaRef.current = true;
-      const need = list.some((a) => a.accessToken && !a.quota);
-      if (!need) return;
+      // Only backfill missing snapshots on open; full refresh is sequential on the
+      // backend (and a silent timer also runs). Avoid blocking the UI on every visit.
+      const need = list.filter((a) => a.accessToken && !a.quota);
+      if (need.length === 0) return;
       setQuotaBusyAll(true);
       try {
+        // Backend drains one account at a time; we still use refresh-all so the
+        // shared queue stays ordered (no parallel fan-out).
         setAccounts(await api.refreshAllAccountQuotas());
       } catch (e) {
         toast(String(e), "warning");

@@ -53,8 +53,14 @@ export type AppConfig = {
   /**
    * Silently retry once when /v1/responses returns reasoning-only empty
    * completion (no message/tool call). Prevents Codex mid-task stop. Default true.
+   * Stream recovery also needs emptyCompletionStreamBuffer.
    */
   emptyCompletionRetry?: boolean;
+  /**
+   * Buffer full SSE before forwarding so empty-completion can be retried on stream.
+   * Default false — buffering kills TTFT (why GrokGo Codex feels slower than Grok Build).
+   */
+  emptyCompletionStreamBuffer?: boolean;
   autoInjectCodexMcp: boolean;
   launchOnStartup: boolean;
   minimizeToTray: boolean;

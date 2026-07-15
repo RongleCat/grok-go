@@ -51,8 +51,20 @@ pub struct AppConfig {
     /// When true, `/v1/responses` silently retries once if upstream returns a
     /// reasoning-only empty completion (no message / tool call). Prevents Codex
     /// from ending the turn mid-task. Default true.
+    ///
+    /// Non-stream JSON always can recover. For **stream** requests, recovery only
+    /// runs when [`Self::empty_completion_stream_buffer`] is also true (must hold
+    /// the full SSE before the client sees `response.completed`).
     #[serde(default = "default_true")]
     pub empty_completion_retry: bool,
+    /// When true **and** `empty_completion_retry`, buffer the entire upstream SSE
+    /// for Codex `/responses` before forwarding (so premature-stop can be retried).
+    ///
+    /// **Default false**: buffering destroys TTFT — every token is held until the
+    /// model finishes, which is why Grok Build (true stream) feels much faster than
+    /// Codex-through-GrokGo. Enable only if you prefer agent-loop recovery over speed.
+    #[serde(default)]
+    pub empty_completion_stream_buffer: bool,
     pub auto_inject_codex_mcp: bool,
     pub launch_on_startup: bool,
     pub minimize_to_tray: bool,
@@ -208,6 +220,7 @@ impl Default for AppConfig {
             prefer_soonest_reset: false,
             account_max_concurrency: 6,
             empty_completion_retry: true,
+            empty_completion_stream_buffer: false,
             auto_inject_codex_mcp: false,
             launch_on_startup: false,
             minimize_to_tray: true,
@@ -483,6 +496,8 @@ where
 ///
 /// Concurrent proxy traffic may have fresher rate-limit / success timestamps on
 /// the live slot — those win over a stale snapshot that started before `await`.
+/// SuperGrok `quota` is merged by `fetched_at` so a gateway request that started
+/// before a manual quota refresh cannot wipe the newer percent.
 ///
 /// Returns `true` if the account was found and updated, `false` if it was gone
 /// (deleted) — callers should treat that as a no-op, not re-create the row.
@@ -499,6 +514,7 @@ pub fn apply_account_update(account: &Account) -> AppResult<bool> {
         let live_failures = slot.consecutive_failures;
         let live_health = slot.health.clone();
         let live_cooldown = slot.cooldown_until;
+        let live_quota = slot.quota.clone();
 
         *slot = account.clone();
 
@@ -520,6 +536,8 @@ pub fn apply_account_update(account: &Account) -> AppResult<bool> {
             }
             _ => {}
         }
+        // Prefer newer SuperGrok quota snapshots (never let stale request clones regress %).
+        slot.quota = merge_quota_prefer_fresher(live_quota, slot.quota.take());
         // Prefer newer success / failure markers from the hot path.
         match (live_success, slot.last_success_at) {
             (Some(l), Some(i)) if l > i => slot.last_success_at = Some(l),
@@ -552,6 +570,24 @@ pub fn apply_account_update(account: &Account) -> AppResult<bool> {
             "skip account update — id no longer in auth store (deleted)"
         );
         Ok(false)
+    }
+}
+
+/// Keep the SuperGrok snapshot with the newer `fetched_at`. Missing sides yield to the other.
+pub fn merge_quota_prefer_fresher(
+    live: Option<crate::quota::AccountQuotaSnapshot>,
+    incoming: Option<crate::quota::AccountQuotaSnapshot>,
+) -> Option<crate::quota::AccountQuotaSnapshot> {
+    match (live, incoming) {
+        (None, inc) => inc,
+        (live, None) => live,
+        (Some(l), Some(i)) => {
+            if l.fetched_at >= i.fetched_at {
+                Some(l)
+            } else {
+                Some(i)
+            }
+        }
     }
 }
 
@@ -744,11 +780,67 @@ fn atomic_tmp_path(path: &Path) -> PathBuf {
 
 /// Update an account in the in-memory cache only (no disk I/O).
 /// Use on the hot success path so every request does not rewrite auth.json.
+/// Hot-path cache patch used after each gateway request.
+///
+/// **Must not** full-replace the account: request-scoped clones often carry a
+/// stale `quota` from pick-time, and overwriting the cache made other accounts'
+/// later `load_auth`/`save_auth` persist the wrong SuperGrok %.
 pub fn patch_account_cache(account: &Account) {
     let mut guard = AUTH_CACHE.write();
     if let Some(store) = guard.as_mut() {
         if let Some(slot) = store.accounts.iter_mut().find(|a| a.id == account.id) {
-            *slot = account.clone();
+            // Traffic / auth fields only.
+            if account.access_token.is_some() {
+                slot.access_token = account.access_token.clone();
+            }
+            if account.refresh_token.is_some() {
+                slot.refresh_token = account.refresh_token.clone();
+            }
+            if account.expires_at.is_some() {
+                slot.expires_at = account.expires_at;
+            }
+            if account.last_refresh.is_some() {
+                slot.last_refresh = account.last_refresh;
+            }
+            // Hot path just observed headers — trust them when present.
+            if account.rate_limit_limit.is_some() {
+                slot.rate_limit_limit = account.rate_limit_limit;
+            }
+            if account.rate_limit_remaining.is_some() {
+                slot.rate_limit_remaining = account.rate_limit_remaining;
+            }
+            if account.rate_limit_reset_at.is_some() {
+                slot.rate_limit_reset_at = account.rate_limit_reset_at;
+            }
+            if account.last_success_at.is_some() {
+                match (slot.last_success_at, account.last_success_at) {
+                    (Some(l), Some(i)) if i >= l => slot.last_success_at = Some(i),
+                    (None, Some(i)) => slot.last_success_at = Some(i),
+                    _ => {}
+                }
+            }
+            if account.last_failure_at.is_some() {
+                match (slot.last_failure_at, account.last_failure_at) {
+                    (Some(l), Some(i)) if i >= l => {
+                        slot.last_failure_at = Some(i);
+                        slot.consecutive_failures = account.consecutive_failures;
+                        slot.last_upstream_error = account.last_upstream_error.clone();
+                    }
+                    (None, Some(i)) => {
+                        slot.last_failure_at = Some(i);
+                        slot.consecutive_failures = account.consecutive_failures;
+                        slot.last_upstream_error = account
+                            .last_upstream_error
+                            .clone()
+                            .or(slot.last_upstream_error.clone());
+                    }
+                    _ => {}
+                }
+            }
+            slot.health = account.health.clone();
+            slot.cooldown_until = account.cooldown_until;
+            // Quota: only accept if strictly fresher than cache.
+            slot.quota = merge_quota_prefer_fresher(slot.quota.clone(), account.quota.clone());
         }
     }
 }
@@ -992,5 +1084,60 @@ mod tests {
         let loaded2: AppConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded2.preferred_port, 9999);
         let _ = fs::remove_dir_all(dir);
+    }
+
+
+
+
+    #[test]
+    fn merge_quota_keeps_fresher_snapshot() {
+        use crate::quota::AccountQuotaSnapshot;
+        use chrono::{Duration, Utc};
+        let older = AccountQuotaSnapshot::from_used(50.0, None, None, vec![]);
+        let mut newer = AccountQuotaSnapshot::from_used(75.0, None, None, vec![]);
+        newer.fetched_at = older.fetched_at + Duration::seconds(30);
+        let merged = merge_quota_prefer_fresher(Some(newer.clone()), Some(older.clone()));
+        assert_eq!(merged.unwrap().used_percent, 75.0);
+        // Incoming fresher wins over live older.
+        let merged2 = merge_quota_prefer_fresher(Some(older), Some(newer.clone()));
+        assert_eq!(merged2.unwrap().used_percent, 75.0);
+        // None yields to the other side.
+        assert_eq!(
+            merge_quota_prefer_fresher(None, Some(newer.clone()))
+                .unwrap()
+                .used_percent,
+            75.0
+        );
+        let _ = Utc::now();
+    }
+
+    #[test]
+    fn patch_account_cache_does_not_regress_quota() {
+        use crate::quota::AccountQuotaSnapshot;
+        use chrono::Duration;
+        let mut a = Account::new("a");
+        a.id = "acc-a".into();
+        let fresh = AccountQuotaSnapshot::from_used(75.0, None, None, vec![]);
+        let mut stale = AccountQuotaSnapshot::from_used(50.0, None, None, vec![]);
+        stale.fetched_at = fresh.fetched_at - Duration::seconds(60);
+        a.quota = Some(fresh.clone());
+        {
+            let mut guard = AUTH_CACHE.write();
+            *guard = Some(AuthStore {
+                accounts: vec![a.clone()],
+            });
+        }
+        // Simulate gateway hot path with a stale clone (old 50%).
+        let mut hot = a.clone();
+        hot.quota = Some(stale);
+        hot.rate_limit_remaining = Some(100);
+        hot.rate_limit_limit = Some(200);
+        patch_account_cache(&hot);
+        let cached = AUTH_CACHE.read().clone().unwrap();
+        let slot = cached.accounts.iter().find(|x| x.id == "acc-a").unwrap();
+        assert_eq!(slot.quota.as_ref().unwrap().used_percent, 75.0);
+        assert_eq!(slot.rate_limit_remaining, Some(100));
+        // cleanup
+        *AUTH_CACHE.write() = None;
     }
 }

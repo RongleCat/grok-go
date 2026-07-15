@@ -11,10 +11,11 @@
 //!
 //! ## Strategies (from xAI docs + CPA / sub2api research)
 //!
-//! 1. **Files API offload**: large text blobs → `POST /v1/files` → `input_file`
-//!    `{ file_id }` so document content is processed via `attachment_search`
-//!    instead of sitting in every prompt (xAI: content does not reappear fully
-//!    in message history).
+//! 1. **Files API offload (tool outputs only)**: large `function_call_output`
+//!    blobs → `POST /v1/files` → short stub + optional `input_file` reference.
+//!    **Never** offload message `input_text` (Codex skills / developer bootstrap
+//!    often exceeds 32KB — stripping them and telling the model to
+//!    `attachment_search` causes agent death loops; see session `019f65cb`).
 //! 2. **Image dedupe / collapse**: identical `data:` URLs kept once; older
 //!    historical images beyond a budget become short text stubs.
 //! 3. **`store: false` when images present**: xAI warns that storing
@@ -474,8 +475,36 @@ fn cap_chat_max_tokens(body: &mut Value, input_est: u64) -> bool {
     false
 }
 
-/// After account selection: offload huge text blobs to xAI Files API and
-/// replace them with `input_file` references (+ short text stub).
+/// True when text is Codex/system bootstrap that must stay inline.
+///
+/// Offloading these (≥32KB skills lists, developer permissions, etc.) and
+/// injecting "use attachment_search" makes the model hunt for tools/files it
+/// cannot use, which turns into multi-turn death loops.
+pub fn is_protected_bootstrap_text(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<skills_instructions>",
+        "<permissions instructions>",
+        "<permissions_instructions>",
+        "<app-context>",
+        "<collaboration_mode>",
+        "<plugins_instructions>",
+        "<apps_instructions>",
+        "<environment_context>",
+        "<recommended_plugins>",
+        "You are Codex, a coding agent",
+        "AGENTS.md instructions for",
+        "# Codex Global Instructions",
+        "Filesystem sandboxing defines which files",
+    ];
+    let head = text.get(..512).unwrap_or(text);
+    MARKERS.iter().any(|m| head.contains(m) || text.contains(m))
+}
+
+/// After account selection: offload huge **tool outputs** to xAI Files API.
+///
+/// Only `function_call_output` / `custom_tool_call_output` are candidates.
+/// Message `input_text` (skills, developer prompts, user paste) is left alone —
+/// historical truncation handles old bloat without stripping live instructions.
 pub async fn offload_large_text_blobs(
     value: &mut Value,
     client: &reqwest::Client,
@@ -495,139 +524,93 @@ pub async fn offload_large_text_blobs(
         return Ok(stats);
     };
 
-    // Process from oldest so we free budget first; skip tiny blobs.
-    let mut pending_file_parts: Vec<(usize, String, String)> = Vec::new(); // (item_idx, file_id, note)
+    // (item_idx, file_id) — attach quietly; do NOT tell the agent to search.
+    let mut pending_file_ids: Vec<(usize, String)> = Vec::new();
 
     for (idx, item) in items.iter_mut().enumerate() {
-        // function_call_output.output (string)
         let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if ty == "function_call_output" || ty == "custom_tool_call_output" {
-            if let Some(output) = item.get("output").and_then(|v| v.as_str()) {
-                if output.len() >= OFFLOAD_TEXT_MIN && !output.starts_with("data:") {
-                    let bytes = output.as_bytes().to_vec();
-                    let filename = format!("tool-output-{idx}.txt");
-                    match files_api::upload_cached(
-                        client,
-                        xai_base_url,
-                        token,
-                        account_id,
-                        &filename,
-                        bytes,
-                        Some(DEFAULT_OFFLOAD_TTL_SECS),
-                    )
-                    .await
-                    {
-                        Ok(file_id) => {
-                            let note = format!(
-                                "[content offloaded to xAI file {file_id}; full text available via attachment_search / input_file]"
-                            );
-                            if let Some(obj) = item.as_object_mut() {
-                                obj.insert("output".into(), Value::String(note.clone()));
-                            }
-                            pending_file_parts.push((idx, file_id, note));
-                            stats.files_offloaded += 1;
-                            stats.modified = true;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                account = %account_id,
-                                "files offload failed (will truncate instead): {err}"
-                            );
-                            // Fallback truncate
-                            if let Some(obj) = item.as_object_mut() {
-                                if let Some(s) = obj.get("output").and_then(|v| v.as_str()) {
-                                    let stub = truncate_text(s, TRUNC_HEAD, TRUNC_TAIL);
-                                    obj.insert("output".into(), Value::String(stub));
-                                    stats.texts_truncated += 1;
-                                    stats.modified = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if ty != "function_call_output" && ty != "custom_tool_call_output" {
+            // Intentionally skip message content offload (skills / bootstrap /
+            // user messages). Session 019f65cb: skills_instructions ~39KB was
+            // uploaded every turn and the model was steered into a tool loop.
+            continue;
+        }
+        let Some(output) = item.get("output").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if output.len() < OFFLOAD_TEXT_MIN || output.starts_with("data:") {
+            continue;
+        }
+        // Defensive: never offload if a tool somehow echoed bootstrap text.
+        if is_protected_bootstrap_text(output) {
+            tracing::debug!(
+                account = %account_id,
+                idx,
+                "skip files offload: protected bootstrap-like tool output"
+            );
+            continue;
         }
 
-        // Message content parts with huge input_text
-        if let Some(content) = item.get_mut("content").and_then(|c| c.as_array_mut()) {
-            for part in content.iter_mut() {
-                let pty = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if pty != "input_text" && pty != "text" && pty != "output_text" {
-                    continue;
+        let bytes = output.as_bytes().to_vec();
+        let filename = format!("tool-output-{idx}.txt");
+        match files_api::upload_cached(
+            client,
+            xai_base_url,
+            token,
+            account_id,
+            &filename,
+            bytes,
+            Some(DEFAULT_OFFLOAD_TTL_SECS),
+        )
+        .await
+        {
+            Ok(file_id) => {
+                // Neutral stub: do not mention attachment_search (Codex has no
+                // such tool → model invents shell hunts / retries forever).
+                let note = format!(
+                    "[large tool output offloaded to xAI file {file_id} to save multi-turn tokens; \
+                     truncated here. Re-run the same tool if you need the full content.]"
+                );
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("output".into(), Value::String(note));
                 }
-                let Some(text) = part.get("text").and_then(|t| t.as_str()) else {
-                    continue;
-                };
-                if text.len() < OFFLOAD_TEXT_MIN || text.starts_with("data:") {
-                    continue;
-                }
-                let bytes = text.as_bytes().to_vec();
-                let filename = format!("input-text-{idx}.txt");
-                match files_api::upload_cached(
-                    client,
-                    xai_base_url,
-                    token,
-                    account_id,
-                    &filename,
-                    bytes,
-                    Some(DEFAULT_OFFLOAD_TTL_SECS),
-                )
-                .await
-                {
-                    Ok(file_id) => {
-                        if let Some(obj) = part.as_object_mut() {
-                            obj.insert(
-                                "text".into(),
-                                Value::String(format!(
-                                    "[large text offloaded to file {file_id}]"
-                                )),
-                            );
-                        }
-                        pending_file_parts.push((
-                            idx,
-                            file_id,
-                            format!("offloaded input text from item {idx}"),
-                        ));
-                        stats.files_offloaded += 1;
+                pending_file_ids.push((idx, file_id));
+                stats.files_offloaded += 1;
+                stats.modified = true;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    account = %account_id,
+                    "files offload failed (will truncate instead): {err}"
+                );
+                if let Some(obj) = item.as_object_mut() {
+                    if let Some(s) = obj.get("output").and_then(|v| v.as_str()) {
+                        let stub = truncate_text(s, TRUNC_HEAD, TRUNC_TAIL);
+                        obj.insert("output".into(), Value::String(stub));
+                        stats.texts_truncated += 1;
                         stats.modified = true;
-                    }
-                    Err(err) => {
-                        tracing::warn!("files offload input_text failed: {err}");
-                        if let Some(obj) = part.as_object_mut() {
-                            if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
-                                obj.insert(
-                                    "text".into(),
-                                    Value::String(truncate_text(s, TRUNC_HEAD, TRUNC_TAIL)),
-                                );
-                                stats.texts_truncated += 1;
-                                stats.modified = true;
-                            }
-                        }
                     }
                 }
             }
         }
     }
 
-    // Attach input_file parts so the model can still retrieve full content.
-    // Insert as a synthetic user message after the last offloaded item for clarity.
-    if !pending_file_parts.is_empty() {
+    // Quietly attach file_ids for the Responses plane (no "go search" prompt).
+    if !pending_file_ids.is_empty() {
         let mut file_content = Vec::new();
         file_content.push(json!({
             "type": "input_text",
             "text": format!(
-                "The following {} large document(s) were offloaded to xAI Files to reduce multi-turn token usage. Use attachment_search / read them as needed:",
-                pending_file_parts.len()
+                "[GrokGo] {} large tool output(s) were replaced with short stubs above; \
+                 corresponding file_id attachment(s) follow for server-side retrieval only. \
+                 Do not shell-search for these files on disk.",
+                pending_file_ids.len()
             )
         }));
-        for (_idx, file_id, note) in &pending_file_parts {
+        for (_idx, file_id) in &pending_file_ids {
             file_content.push(json!({
                 "type": "input_file",
                 "file_id": file_id,
-            }));
-            file_content.push(json!({
-                "type": "input_text",
-                "text": note,
             }));
         }
         items.push(json!({
@@ -1257,5 +1240,25 @@ mod tests {
             }
         }
         assert!(found, "expected Edit tool_call in messages");
+    }
+
+    #[test]
+    fn protects_codex_skills_bootstrap_from_offload() {
+        let skills = format!(
+            "<skills_instructions>\n## Skills\n{}",
+            "skill-entry\n".repeat(3_000)
+        );
+        assert!(skills.len() > OFFLOAD_TEXT_MIN);
+        assert!(is_protected_bootstrap_text(&skills));
+        assert!(is_protected_bootstrap_text(
+            "You are Codex, a coding agent based on GPT-5. You and the user share one workspace."
+        ));
+        assert!(is_protected_bootstrap_text(
+            "<permissions instructions>\nFilesystem sandboxing defines which files can be read"
+        ));
+        // Ordinary large tool dump should NOT be protected.
+        let tool_dump = "fn main() {}\n".repeat(4_000);
+        assert!(tool_dump.len() > OFFLOAD_TEXT_MIN);
+        assert!(!is_protected_bootstrap_text(&tool_dump));
     }
 }

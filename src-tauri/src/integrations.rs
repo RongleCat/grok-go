@@ -1,6 +1,6 @@
 use chrono::Utc;
 use once_cell::sync::Lazy;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -783,13 +783,8 @@ async fn try_refresh_probe_and_write_session(
             ))
         })?;
 
-    // Persist refreshed tokens back into GrokGo pool (best-effort).
-    if let Ok(mut pool) = crate::config::load_auth() {
-        if let Some(slot) = pool.accounts.iter_mut().find(|a| a.id == account.id) {
-            *slot = account.clone();
-            let _ = crate::config::save_auth(&pool);
-        }
-    }
+    // Persist refreshed tokens without full-store overwrite (preserves fresher quota).
+    let _ = crate::config::apply_account_update(&account);
 
     let access = account
         .access_token
@@ -1396,28 +1391,69 @@ fn import_cc_switch_provider_for_app(app_type: &str) -> AppResult<String> {
         ))
     })?;
 
-    let name = "GrokGo";
+    // Codex sessions key off `model_provider` id in config.toml / session_meta.
+    // Import must NOT overwrite the user's current provider row — copy a new GrokGo
+    // slot that reuses the same model_provider id so history stays continuous.
+    let active_codex = if app_type == "codex" {
+        read_active_codex_provider()
+    } else {
+        None
+    };
+    let (provider_key, source_display) = if app_type == "codex" {
+        match active_codex.as_ref() {
+            Some(a) => (a.id.clone(), a.display_name.clone()),
+            None => ("grok-go".into(), "GrokGo".into()),
+        }
+    } else {
+        ("grok-go".into(), "GrokGo".into())
+    };
+
+    // New/updated GrokGo *copy* display name — never steal the original provider's name.
+    let name = if app_type == "codex" && provider_key != "grok-go" {
+        format!("GrokGo · {source_display}")
+    } else {
+        "GrokGo".to_string()
+    };
+
+    let notes = if app_type == "claude" {
+        "由 GrokGo 同步（Claude Code / Anthropic Messages）".to_string()
+    } else if include_mcp {
+        format!("由 GrokGo 同步（含 MCP；复制槽；model_provider={provider_key}）")
+    } else {
+        format!("由 GrokGo 同步（复制槽；model_provider={provider_key}）")
+    };
+
+    let website_url = grokgo_provider_website_url(app_type, &config);
+    // Only touch *our* previous GrokGo import copies — never the live third-party row.
+    let existing: Option<CcSwitchProviderRow> = if app_type == "codex" {
+        find_our_codex_grokgo_copy(&conn, &provider_key)?
+    } else {
+        match find_existing_grokgo_provider_for_app(&conn, app_type)? {
+            Some((id, _)) => {
+                let display_name: String = conn
+                    .query_row(
+                        "SELECT name FROM providers WHERE id = ?1",
+                        params![id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| "GrokGo".into());
+                Some(CcSwitchProviderRow { id, display_name })
+            }
+            None => None,
+        }
+    };
+
     let settings = if app_type == "claude" {
         claude_provider_settings_config(&config)
     } else {
-        provider_settings_config(&config, include_mcp)
+        // Keep model_provider id = currently applied Codex provider (session key).
+        provider_settings_config_for_id(&config, include_mcp, &provider_key, &name)
     };
     let settings_text = serde_json::to_string(&settings)?;
     let now = Utc::now().timestamp_millis();
-    let notes = if app_type == "claude" {
-        "由 GrokGo 同步（Claude Code / Anthropic Messages）"
-    } else if include_mcp {
-        "由 GrokGo 同步（含 MCP）"
-    } else {
-        "由 GrokGo 同步"
-    };
 
-    // Prefer updating a *true* GrokGo provider for this app_type.
-    // Never hijack third-party Claude providers (DeepSeek / Kimi / …) just because
-    // they also ship `ANTHROPIC_BASE_URL` in settings_config.
-    let website_url = grokgo_provider_website_url(app_type, &config);
-    let existing = find_existing_grokgo_provider_for_app(&conn, app_type)?;
-    let (action_zh, provider_id) = if let Some((id, _created)) = existing {
+    let (action_zh, provider_id) = if let Some(row) = existing {
+        // Refresh our previous copy only.
         conn.execute(
             r#"
             UPDATE providers
@@ -1430,16 +1466,23 @@ fn import_cc_switch_provider_for_app(app_type: &str) -> AppResult<String> {
                 icon_color = NULL
             WHERE id = ?5 AND app_type = ?6
             "#,
-            params![name, settings_text, notes, website_url, id, app_type],
+            params![name, settings_text, notes, website_url, row.id, app_type],
         )
-        .map_err(|e| AppError::msg(format!("更新 CC Switch 中的 GrokGo 配置失败：{e}")))?;
-        let removed = remove_duplicate_grokgo_providers_for_app(&conn, app_type, &id).unwrap_or(0);
-        let mut action = "已更新".to_string();
+        .map_err(|e| AppError::msg(format!("更新 CC Switch 中的 GrokGo 副本失败：{e}")))?;
+        let removed = remove_duplicate_grokgo_providers_for_app(&conn, app_type, &row.id).unwrap_or(0);
+        let mut action = if app_type == "codex" && provider_key != "grok-go" {
+            format!(
+                "已更新 GrokGo 副本「{name}」（model_provider={provider_key} 与当前一致；未改动原服务商配置）"
+            )
+        } else {
+            "已更新".to_string()
+        };
         if removed > 0 {
-            action = format!("已更新（并清理了 {removed} 条重复的 GrokGo 配置）");
+            action = format!("{action}（并清理了 {removed} 条重复的 GrokGo 配置）");
         }
-        (action, id)
+        (action, row.id)
     } else {
+        // Always INSERT a new copy — do not overwrite is_current / third-party rows.
         let id = Uuid::new_v4().to_string();
         conn.execute(
             r#"
@@ -1452,7 +1495,14 @@ fn import_cc_switch_provider_for_app(app_type: &str) -> AppResult<String> {
             params![id, app_type, name, settings_text, website_url, now, notes],
         )
         .map_err(|e| AppError::msg(format!("写入 CC Switch 失败：{e}")))?;
-        ("已新增".to_string(), id)
+        let action = if app_type == "codex" && provider_key != "grok-go" {
+            format!(
+                "已复制新增「{name}」（model_provider={provider_key} 与当前一致；原服务商配置未改动）"
+            )
+        } else {
+            "已新增".to_string()
+        };
+        (action, id)
     };
 
     let mut mcp_part = String::new();
@@ -1500,7 +1550,11 @@ fn import_cc_switch_provider_for_app(app_type: &str) -> AppResult<String> {
             ""
         };
     Ok(format!(
-        "{action_zh} CC Switch 中的 GrokGo 配置。\n已挂载可用模型：grok-4.5 / grok-4.3；默认：{}。{}\n网关：http://{}:{}/v1。{}",
+        "{action_zh}\n\
+         请在 CC Switch 中切换到该副本（不要改原服务商）。\n\
+         model_provider = \"{provider_key}\"（与当前 Codex 会话标识一致）\n\
+         已挂载可用模型：grok-4.5 / grok-4.3；默认：{}。{}\n\
+         网关：http://{}:{}/v1。{}",
         import_model,
         reasoning_note,
         if config.lan_enabled {
@@ -1514,6 +1568,121 @@ fn import_cc_switch_provider_for_app(app_type: &str) -> AppResult<String> {
     .trim()
     .to_string()
         + &format!("\n（配置 id：{provider_id}）"))
+}
+
+/// Active Codex provider identity from `~/.codex/config.toml`.
+#[derive(Debug, Clone)]
+struct ActiveCodexProvider {
+    /// `model_provider = "…"` value (session_meta key).
+    id: String,
+    /// Prefer `[model_providers.<id>].name`, else the id itself.
+    display_name: String,
+}
+
+/// Target row in CC Switch `providers` table.
+#[derive(Debug, Clone)]
+struct CcSwitchProviderRow {
+    id: String,
+    display_name: String,
+}
+
+/// Read current Codex `model_provider` so import can preserve session continuity.
+fn read_active_codex_provider() -> Option<ActiveCodexProvider> {
+    let path = codex_config_path();
+    let raw = fs::read_to_string(&path).ok()?;
+    let doc = raw.parse::<toml_edit::DocumentMut>().ok()?;
+    let id = doc
+        .get("model_provider")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    if !is_safe_codex_provider_id(&id) {
+        return None;
+    }
+    let display_name = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table())
+        .and_then(|t| t.get(id.as_str()))
+        .and_then(|i| i.as_table())
+        .and_then(|t| t.get("name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(id.as_str())
+        .to_string();
+    Some(ActiveCodexProvider { id, display_name })
+}
+
+fn is_safe_codex_provider_id(id: &str) -> bool {
+    let t = id.trim();
+    if t.is_empty() || t.len() > 64 {
+        return false;
+    }
+    // Bare TOML keys + common CC Switch ids (alnum, -, _). Digits-only allowed (quoted in TOML).
+    t.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Find *our* previous GrokGo import copy for Codex (never the user's live provider).
+///
+/// Matches rows we wrote (`notes` / name prefix) that already carry `provider_key`
+/// as `model_provider`, so re-import updates the copy instead of creating unlimited clones.
+fn find_our_codex_grokgo_copy(
+    conn: &Connection,
+    provider_key: &str,
+) -> AppResult<Option<CcSwitchProviderRow>> {
+    let like_provider = format!("%model_provider = \"{provider_key}\"%");
+    let like_table = format!("%model_providers.{provider_key}%");
+    // Prefer an explicit GrokGo-owned row that already uses this model_provider id.
+    if let Some(row) = conn
+        .query_row(
+            r#"
+            SELECT id, name FROM providers
+            WHERE app_type = 'codex'
+              AND (
+                name = 'GrokGo'
+                OR name LIKE 'GrokGo · %'
+                OR notes LIKE '%由 GrokGo 同步%'
+                OR notes LIKE '%Imported from GrokGo%'
+              )
+              AND (
+                settings_config LIKE ?1
+                OR settings_config LIKE ?2
+                OR ?3 = 'grok-go'
+              )
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            params![like_provider, like_table, provider_key],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| AppError::msg(format!("查询 GrokGo 副本失败：{e}")))?
+    {
+        return Ok(Some(CcSwitchProviderRow {
+            id: row.0,
+            display_name: row.1,
+        }));
+    }
+
+    // Fallback: any legacy GrokGo row (will be rewritten to current provider_key).
+    if provider_key == "grok-go" {
+        if let Some((id, _)) = find_existing_grokgo_provider_for_app(conn, "codex")? {
+            let name: String = conn
+                .query_row(
+                    "SELECT name FROM providers WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| "GrokGo".into());
+            return Ok(Some(CcSwitchProviderRow {
+                id,
+                display_name: name,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Website URL written into CC Switch for GrokGo providers.
@@ -1795,6 +1964,19 @@ pub fn claude_code_settings_snippet(config: &AppConfig) -> String {
 }
 
 fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
+    provider_settings_config_for_id(config, include_mcp, "grok-go", "GrokGo")
+}
+
+/// Build CC Switch `settings_config` for Codex, using a specific provider id.
+///
+/// `provider_id` becomes both `model_provider = "…"` and the
+/// `[model_providers.<id>]` table key — this is what Codex stores on sessions.
+fn provider_settings_config_for_id(
+    config: &AppConfig,
+    include_mcp: bool,
+    provider_id: &str,
+    display_name: &str,
+) -> serde_json::Value {
     use crate::config::{cc_switch_import_default_model, xai_model_default_reasoning_effort};
     let host = if config.lan_enabled {
         local_lan_host()
@@ -1802,32 +1984,44 @@ fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json
         "127.0.0.1".into()
     };
     let base = format!("http://{}:{}/v1", host, config.actual_port);
-    // Only offer usable Codex models in the imported provider; clamp default
-    // if the app default is something not in the import list.
     let import_model = cc_switch_import_default_model(&config.default_model);
-    // Use provider id `grok-go` (not anonymous "custom") so CC Switch / Codex UI
-    // can list concrete models instead of a blank custom slot.
+    let pid = if is_safe_codex_provider_id(provider_id) {
+        provider_id.trim()
+    } else {
+        "grok-go"
+    };
+    let dname = {
+        let t = display_name.trim();
+        if t.is_empty() {
+            pid
+        } else {
+            t
+        }
+    };
+    // Quote TOML table keys that are not bare keys (e.g. digits-only "98").
+    let table_key = toml_provider_table_key(pid);
     let mut toml = format!(
-        "model_provider = \"grok-go\"\n\
+        "model_provider = \"{pid}\"\n\
          model = \"{import_model}\"\n"
     );
-    // Only emit when the default model accepts reasoning.effort (otherwise
-    // Codex may send an effort the upstream rejects).
     if let Some(effort) = xai_model_default_reasoning_effort(import_model) {
         toml.push_str(&format!("model_reasoning_effort = \"{effort}\"\n"));
     }
+    // Escape display name for TOML basic string.
+    let dname_esc = dname.replace('\\', "\\\\").replace('"', "\\\"");
     toml.push_str(&format!(
         "disable_response_storage = true\n\
          \n\
-         [model_providers.grok-go]\n\
-         name = \"GrokGo\"\n\
+         [model_providers.{table_key}]\n\
+         name = \"{dname_esc}\"\n\
          wire_api = \"responses\"\n\
          requires_openai_auth = true\n\
-         base_url = \"{}\"\n\
+         base_url = \"{base}\"\n\
          experimental_bearer_token = \"{}\"\n",
-        base, config.local_token
+        config.local_token
     ));
     if include_mcp {
+        // Keep a stable MCP server id so inject/remove paths stay consistent.
         let mcp_url = format!("http://{}:{}/mcp", host, config.actual_port);
         toml.push_str("\n[mcp_servers.grok-go]\n");
         toml.push_str(&format!("url = \"{mcp_url}\"\n"));
@@ -1846,6 +2040,23 @@ fn provider_settings_config(config: &AppConfig, include_mcp: bool) -> serde_json
             "models": codex_model_catalog_models(config)
         }
     })
+}
+
+/// TOML table key for `[model_providers.…]` — quote when not a bare key.
+fn toml_provider_table_key(id: &str) -> String {
+    let bare = id
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphabetic() || c == '_')
+        .unwrap_or(false)
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if bare {
+        id.to_string()
+    } else {
+        format!("\"{}\"", id.replace('"', ""))
+    }
 }
 
 /// Models shown in CC Switch / Codex picker after GrokGo import.
@@ -1923,10 +2134,14 @@ fn reasoning_effort_description(effort: &str) -> &'static str {
 }
 
 fn provider_export_json(config: &AppConfig, include_mcp: bool) -> serde_json::Value {
+    let (key, name) = match read_active_codex_provider() {
+        Some(a) => (a.id, a.display_name),
+        None => ("grok-go".into(), "GrokGo".into()),
+    };
     json!({
         "app_type": "codex",
-        "name": "GrokGo",
-        "settings_config": provider_settings_config(config, include_mcp)
+        "name": name,
+        "settings_config": provider_settings_config_for_id(config, include_mcp, &key, &name)
     })
 }
 
@@ -2060,6 +2275,38 @@ mod tests {
         assert!(toml.contains("model = \"grok-4.5\""));
         assert!(toml.contains("[model_providers.grok-go]"));
         assert!(!toml.contains("model_provider = \"custom\""));
+    }
+
+    #[test]
+    fn provider_settings_preserves_custom_provider_id() {
+        let cfg = AppConfig::default();
+        let settings =
+            provider_settings_config_for_id(&cfg, false, "sub2api", "Sub2API");
+        let toml = settings.get("config").and_then(|c| c.as_str()).unwrap_or("");
+        assert!(toml.contains("model_provider = \"sub2api\""));
+        assert!(toml.contains("[model_providers.sub2api]"));
+        assert!(toml.contains("name = \"Sub2API\""));
+        assert!(!toml.contains("model_provider = \"grok-go\""));
+    }
+
+    #[test]
+    fn provider_settings_quotes_numeric_provider_id() {
+        let cfg = AppConfig::default();
+        let settings = provider_settings_config_for_id(&cfg, true, "98", "98");
+        let toml = settings.get("config").and_then(|c| c.as_str()).unwrap_or("");
+        assert!(toml.contains("model_provider = \"98\""));
+        assert!(toml.contains("[model_providers.\"98\"]"));
+        assert!(toml.contains("[mcp_servers.grok-go]"));
+    }
+
+    #[test]
+    fn safe_provider_id_validation() {
+        assert!(is_safe_codex_provider_id("sub2api"));
+        assert!(is_safe_codex_provider_id("grok-go"));
+        assert!(is_safe_codex_provider_id("98"));
+        assert!(!is_safe_codex_provider_id(""));
+        assert!(!is_safe_codex_provider_id("bad id"));
+        assert!(!is_safe_codex_provider_id("a/b"));
     }
 
     #[test]

@@ -18,7 +18,8 @@
 | default_video_model | grok-imagine-video |
 | model_mappings | gpt-5.6/gpt-5.5 → grok-4.5 |
 | routing_strategy | weighted-round-robin |
-| empty_completion_retry | true（`/v1/responses` 对 reasoning-only 空完成静默重试一次） |
+| empty_completion_retry | true（非流式空完成恢复；流式见下项） |
+| empty_completion_stream_buffer | **false**（为 true 才整段缓冲 SSE 做流式空完成恢复；默认关以保 TTFT） |
 | auto_inject_codex_mcp | false |
 | launch_on_startup | false |
 | minimize_to_tray | true |

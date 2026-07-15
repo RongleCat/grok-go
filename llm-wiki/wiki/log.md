@@ -1,5 +1,29 @@
 # Wiki 日志
 
+## 2026-07-15（Files offload 死循环：勿分流 skills）
+
+- 会话 `019f65cb`：开场仅「嘿」却多次 `uploaded large blob` + `files-offload`。
+- **根因**：`offload_large_text_blobs` 把 Codex 注入的 `skills_instructions`（~39KB）等 message 文本上传并换成 stub，再注入 “Use attachment_search / read them” → 模型去盘上找 `input-text-*.txt`、乱调工具，叠写 `write_stdin` 类型错误后进入多轮空转。
+- **修复**：Files offload **只处理 tool output**；保护 bootstrap 文本检测；stub 改为中性「重跑工具取全文」，禁止 attachment_search 诱导。
+
+## 2026-07-15（CC Switch 导入：复制槽 + 同 model_provider）
+
+- Codex 会话绑 `model_provider` ID；写死 `grok-go` 会丢历史。
+- **正确做法**：复制新增 GrokGo 槽（如 `GrokGo · sub2api`），**不覆盖**用户当前服务商配置；副本 TOML 使用与 `~/.codex/config.toml` **相同的** `model_provider` id。
+- 再次导入只更新我们自己的副本行（notes/name 识别）。
+
+## 2026-07-15（grok-4.5 经代理体感慢：SSE 整段缓冲）
+
+- 数据：同模型 `responses` 平均 latency ~6.0s vs `grok-build` chat ~2.7s；responses 100k+ 上下文均值更高。
+- **根因 1（体感主因）**：Codex 路径 `emptyCompletionRetry` 曾对**所有**流式 `/responses` 整段缓冲 SSE，首字时间≈整段生成；Grok Build 为 `build_plane` 真流式。
+- **根因 2**：Codex 走 `api.x.ai` Responses，Build 走 `cli-chat-proxy` Chat；协议与上下文体积也不同。
+- **修复**：新增 `emptyCompletionStreamBuffer` 默认 **false**——流式默认透传；仅显式开启才缓冲。
+
+## 2026-07-15（账号配额：停止串扰 + 顺序刷新）
+
+- 网关热路径 `patch_account_cache` 不再用请求开始时的旧 quota 覆盖新近刷新结果（按 `fetched_at` 合并）。
+- 配额刷新串行、短超时；后台 silent 队列约 15 分钟一轮。
+
 ## 2026-07-15（Claude Code：400 upstream error）
 
 - 会话 `6b1db793-…`：大 `Edit` 后下一轮 `/v1/messages` → 400；UI 只显示 `upstream error`。

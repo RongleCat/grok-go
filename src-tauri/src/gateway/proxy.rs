@@ -919,16 +919,20 @@ async fn proxy_json_inner(
             let _ = replace_account_tokens(&account);
         }
 
-        // Responses streams: buffer → detect reasoning-only empty completion → retry once
-        // before the client sees `response.completed` (Codex ends the turn otherwise).
-        // Grok Build manages its own agent loop — extra silent retries double-bill SuperGrok
-        // credits and can desync the TUI stream state.
+        // Responses streams: only buffer SSE when emptyCompletionStreamBuffer is on.
+        // Default false — buffering holds every token until completion (kills TTFT);
+        // Grok Build always true-streams. Non-stream JSON empty recovery is separate.
         let guard_empty = config.empty_completion_retry
+            && config.empty_completion_stream_buffer
             && !build_plane
             && is_responses_path(path)
             && status.is_success()
             && parsed_request.is_some();
         if guard_empty {
+            tracing::debug!(
+                target: "gateway",
+                "buffering SSE for empty-completion recovery (emptyCompletionStreamBuffer=true)"
+            );
             let recovered = buffer_sse_and_recover_empty_completion(
                 upstream,
                 &http,

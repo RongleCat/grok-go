@@ -65,3 +65,6 @@ website/
 # SSO→OAuth converter local venv
 .venv-sso/
 
+
+# Local agent / IDE workspaces
+.claude/

@@ -1,5 +1,20 @@
 # Wiki 日志
 
+## 2026-07-15（Claude Code：400 upstream error）
+
+- 会话 `6b1db793-…`：大 `Edit` 后下一轮 `/v1/messages` → 400；UI 只显示 `upstream error`。
+- **显示层**：xAI 错误体是 `{"code":"…","error":"<string>"}`，旧映射只读 `/error/message` → 落到默认 `"upstream error"`。已改为解析 string `error` + 日志/DB 记 raw upstream。
+- **根因（高概率）**：token 预算对 `tool_calls[].function.arguments` 做了**字符串中段截断**，破坏 JSON，xAI 整请求 400。已改为始终替换成**合法 JSON stub**（保留 key 预览）。
+- 需重启 GrokGo；已失败会话可「继续」。
+
+## 2026-07-14（Claude Code：Connection closed mid-response — 根因）
+
+- 会话 `3cfe2d8d-…`：input 涨到 **~116k** 后连续 3 次流式中断；`request_logs` HTTP 200 但 **0 tokens**。
+- **根因（不是“没补 message_stop”）**：Claude Code 每轮重放完整 tool 历史；原 `payload_optimize` 只有 **12–24MiB 字节预算**，文本 agent 环永远触达不到 → 不裁剪。大 prompt + 长 SSE 经 xAI/本地代理时中途被掐。
+- **根治**：`enforce_chat_context_budget`（软 80k / 硬 100k 估算 token）在 `/v1/messages` 路径裁剪历史 tool/user、压缩 tools schema、按剩余窗口 cap `max_tokens`。
+- **次要加固**（症状放大）：上游 SSE 读失败仍 `finish()` 发 `message_stop`，避免 Claude Code 只看到 Connection closed；0-token 流记 `error_summary`。
+- 运维：重启 GrokGo；已毒化会话仍建议 `/compact` 或新开（客户端 transcript 仍大）。
+
 ## 2026-07-14（关窗：托盘隐藏 / 二次确认退出）
 
 - **关闭时最小化到托盘 = 开**：关窗 `hide` + `skip_taskbar` + macOS `ActivationPolicy::Accessory`（去掉程序坞/任务栏图标，保留托盘）；托盘/菜单可 `Regular` 后再打开。

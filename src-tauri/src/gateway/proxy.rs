@@ -363,7 +363,9 @@ async fn proxy_anthropic_messages_inner(
         anthropic_to_openai_chat, map_client_model, openai_chat_to_anthropic,
         openai_error_to_anthropic, OpenAiToAnthropicSse,
     };
-    use crate::gateway::payload_optimize::optimize_responses_payload;
+    use crate::gateway::payload_optimize::{
+        enforce_chat_context_budget, optimize_responses_payload,
+    };
     use futures_util::stream;
 
     let config = load_config()?;
@@ -385,10 +387,17 @@ async fn proxy_anthropic_messages_inner(
     let mut chat_body = converted.body;
     chat_body["model"] = Value::String(resolved_model.clone());
 
-    // Reuse multi-turn payload shrink (images / huge tool outputs).
+    // Byte-oriented multi-turn shrink (images / huge tool outputs) — rarely
+    // fires on text-only Claude Code loops (12MiB soft budget).
     let opt = optimize_responses_payload(&mut chat_body);
     if opt.modified {
         opt.log_summary("/v1/messages");
+    }
+    // Token-oriented budget: the actual root fix for mid-stream disconnects when
+    // Claude Code re-sends 100k+ tokens of tool history every turn.
+    let budget = enforce_chat_context_budget(&mut chat_body);
+    if budget.modified {
+        budget.log_summary("/v1/messages#token-budget");
     }
 
     let client_wants_stream = converted.stream
@@ -485,17 +494,46 @@ async fn proxy_anthropic_messages_inner(
         ));
         // Shared converter so we can push chunks then finish() after upstream closes
         // (covers providers that omit `data: [DONE]`).
+        //
+        // Critical: never forward upstream read errors as Body stream errors.
+        // Claude Code reports those as "Connection closed mid-response" because
+        // the HTTP body aborts before `message_stop`. On abort we stop the head
+        // stream and still run finish() to synthesize a clean SSE trailer.
         let converter = Arc::new(parking_lot::Mutex::new(OpenAiToAnthropicSse::new()));
         let tracker = usage_tracker.clone();
         let conv_push = converter.clone();
-        let head = upstream.bytes_stream().map(move |chunk| {
-            chunk
-                .map(|bytes| {
-                    tracker.note_chunk(&bytes);
-                    let mut c = conv_push.lock();
-                    Bytes::from(c.push(&bytes))
-                })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        let request_id_for_log = request_id.clone();
+        let head = stream::unfold(upstream.bytes_stream(), move |mut s| {
+            let tracker = tracker.clone();
+            let conv_push = conv_push.clone();
+            let request_id_for_log = request_id_for_log.clone();
+            async move {
+                loop {
+                    match s.next().await {
+                        Some(Ok(bytes)) => {
+                            tracker.note_chunk(&bytes);
+                            let out = conv_push.lock().push(&bytes);
+                            if out.is_empty() {
+                                continue;
+                            }
+                            return Some((
+                                Ok::<Bytes, std::io::Error>(Bytes::from(out)),
+                                s,
+                            ));
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(
+                                target: "gateway",
+                                request_id = %request_id_for_log,
+                                error = %e,
+                                "anthropic upstream SSE read failed; synthesizing message_stop"
+                            );
+                            return None;
+                        }
+                        None => return None,
+                    }
+                }
+            }
         });
         let conv_fin = converter.clone();
         let tail = stream::once(async move {
@@ -557,9 +595,20 @@ async fn proxy_anthropic_messages_inner(
             ),
         }
     } else {
+        let mapped = openai_error_to_anthropic(status.as_u16(), &upstream_json);
+        // Always log the raw upstream body — Claude only sees the Anthropic-shaped
+        // rewrite, and we previously lost xAI's real `error` string entirely.
+        tracing::warn!(
+            target: "gateway",
+            request_id = %request_id,
+            status = %status,
+            upstream = %upstream_json,
+            mapped = %mapped,
+            "anthropic path: upstream non-success"
+        );
         (
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            openai_error_to_anthropic(status.as_u16(), &upstream_json),
+            mapped,
         )
     };
 
@@ -594,7 +643,8 @@ async fn proxy_anthropic_messages_inner(
         if out_status.is_success() {
             None
         } else {
-            Some(out_value.to_string())
+            // Prefer raw upstream for diagnostics; fall back to mapped Anthropic body.
+            Some(upstream_json.to_string())
         },
         client_source,
         Some(mapping_reason),
@@ -2262,6 +2312,21 @@ impl StreamUsageTracker {
                 "stream prompt cache hit recorded"
             );
         }
+        // Zero usage on a successful stream usually means the body aborted before
+        // the final usage chunk (upstream drop, client cancel, or proxy cut).
+        // Surface this for Claude Code "Connection closed mid-response" triage.
+        let error_summary = if self.status_code < 400 && input == 0 && output == 0 {
+            tracing::warn!(
+                target: "gateway",
+                request_id = %self.request_id,
+                endpoint = %self.endpoint,
+                client_source = %self.client_source,
+                "stream finished with 0 tokens (likely aborted mid-response)"
+            );
+            Some("stream aborted before usage (0 tokens)".to_string())
+        } else {
+            None
+        };
         log_request(
             &self.request_id,
             self.account_id.clone(),
@@ -2274,7 +2339,7 @@ impl StreamUsageTracker {
             input,
             output,
             cache,
-            None,
+            error_summary,
             &self.client_source,
             None,
         );

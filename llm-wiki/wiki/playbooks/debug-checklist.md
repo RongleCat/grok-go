@@ -61,6 +61,15 @@
 5. 若仍停：确认 `emptyCompletionRetry` 未关；可手动发「继续」
 6. 细节见 [[../concepts/empty-completion-retry]]
 
+## Claude Code：`API Error: Connection closed mid-response`
+
+1. **根因优先**：不是“网关偶发断连”，而是 **上下文膨胀** → 大 prompt 长 SSE 被上游/代理掐断。Claude Code 每轮重放完整 tool 历史；仅靠 12MiB 字节预算裁不掉。
+2. 确认 `ANTHROPIC_BASE_URL=http://127.0.0.1:<actualPort>`（无 `/v1` 后缀）与 local token 一致
+3. `request_logs`：`/v1/messages` 是否 **status=200 且 input 连续 8–12 万+** 后出现 **0 tokens** / `stream aborted`
+4. 网关应已跑 `enforce_chat_context_budget`（日志 `chat context budget enforced`）；**重启 GrokGo** 加载
+5. 客户端 transcript 仍大时：`/compact` 或新开线程（网关只能砍上行，砍不掉本地 history）
+6. 相关：[[../concepts/payload-optimize]]、[[../queries/anthropic-claude-code-research]]
+
 ## 概览/账号页：`expected value at line 1 column 1`
 
 1. 这是 `config.json` / `auth.json` JSON 解析失败（常见：空文件、写一半崩溃、Windows 记事本 BOM）

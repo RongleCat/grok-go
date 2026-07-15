@@ -33,6 +33,9 @@ pub struct OpenAiToAnthropicSse {
     /// True after `message_delta` (finish_reason) was emitted.
     saw_message_delta: bool,
     finished: bool,
+    /// Latest usage from upstream (may arrive on a trailing usage-only chunk).
+    last_input_tokens: u64,
+    last_output_tokens: u64,
 }
 
 impl OpenAiToAnthropicSse {
@@ -83,7 +86,10 @@ impl OpenAiToAnthropicSse {
                                 "stop_reason": "end_turn",
                                 "stop_sequence": null
                             },
-                            "usage": { "output_tokens": 0 }
+                            "usage": {
+                                "input_tokens": self.last_input_tokens,
+                                "output_tokens": self.last_output_tokens
+                            }
                         }),
                     ));
                     self.saw_message_delta = true;
@@ -122,7 +128,10 @@ impl OpenAiToAnthropicSse {
                                 "stop_reason": "end_turn",
                                 "stop_sequence": null
                             },
-                            "usage": { "output_tokens": 0 }
+                            "usage": {
+                                "input_tokens": self.last_input_tokens,
+                                "output_tokens": self.last_output_tokens
+                            }
                         }),
                     ));
                     self.saw_message_delta = true;
@@ -334,11 +343,17 @@ impl OpenAiToAnthropicSse {
                 let input_tokens = usage
                     .and_then(|u| u.get("prompt_tokens"))
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                    .unwrap_or(self.last_input_tokens);
                 let output_tokens = usage
                     .and_then(|u| u.get("completion_tokens"))
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                    .unwrap_or(self.last_output_tokens);
+                if input_tokens > 0 {
+                    self.last_input_tokens = input_tokens;
+                }
+                if output_tokens > 0 {
+                    self.last_output_tokens = output_tokens;
+                }
                 out.extend_from_slice(&encode_event(
                     "message_delta",
                     &json!({
@@ -348,8 +363,8 @@ impl OpenAiToAnthropicSse {
                             "stop_sequence": null
                         },
                         "usage": {
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens
+                            "input_tokens": self.last_input_tokens,
+                            "output_tokens": self.last_output_tokens
                         }
                     }),
                 ));
@@ -357,6 +372,7 @@ impl OpenAiToAnthropicSse {
             }
         } else if let Some(usage) = chunk.get("usage") {
             // Final usage-only chunk (OpenAI stream_options.include_usage).
+            // xAI often sends this *after* finish_reason; store for finish()/logs.
             let input_tokens = usage
                 .get("prompt_tokens")
                 .and_then(|v| v.as_u64())
@@ -365,10 +381,15 @@ impl OpenAiToAnthropicSse {
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            if self.has_message_start && self.current.is_none() {
-                // Only emit if we already closed blocks; otherwise wait for finish_reason path.
-                let _ = (input_tokens, output_tokens);
+            if input_tokens > 0 {
+                self.last_input_tokens = input_tokens;
             }
+            if output_tokens > 0 {
+                self.last_output_tokens = output_tokens;
+            }
+            // If finish_reason already closed the message with zero usage, we cannot
+            // emit a second message_delta safely; values remain for finish() fallback.
+            let _ = (input_tokens, output_tokens);
         }
 
         out
@@ -516,5 +537,59 @@ mod tests {
         assert!(out.contains("input_json_delta"));
         assert!(out.contains("tool_use")); // stop_reason
         assert!(out.contains("\"stop_reason\":\"tool_use\"") || out.contains("tool_use"));
+    }
+
+    #[test]
+    fn finish_synthesizes_stop_after_partial_stream() {
+        // Upstream abort mid-thinking: Claude Code needs message_stop, not a hard body error.
+        let mut s = OpenAiToAnthropicSse::new();
+        let mut out = String::new();
+        out.push_str(&String::from_utf8_lossy(&s.push(
+            sse_data(json!({
+                "id": "chatcmpl-abort",
+                "model": "grok-4.5",
+                "choices": [{"index": 0, "delta": {
+                    "role": "assistant",
+                    "reasoning_content": "partial"
+                }}]
+            }))
+            .as_bytes(),
+        )));
+        // No finish_reason / [DONE] — simulate upstream drop then finish().
+        out.push_str(&String::from_utf8_lossy(&s.finish()));
+
+        assert!(out.contains("event: message_start"));
+        assert!(out.contains("thinking_delta"));
+        assert!(out.contains("content_block_stop"));
+        assert!(out.contains("event: message_delta"));
+        assert!(out.contains("event: message_stop"));
+        assert!(out.contains("end_turn"));
+    }
+
+    #[test]
+    fn stores_usage_only_chunk_for_finish() {
+        let mut s = OpenAiToAnthropicSse::new();
+        let _ = s.push(
+            sse_data(json!({
+                "id": "c2",
+                "model": "grok-4.5",
+                "choices": [{"index": 0, "delta": {"content": "x"}}]
+            }))
+            .as_bytes(),
+        );
+        // Usage arrives without choices (include_usage trailing chunk), then abort.
+        let _ = s.push(
+            sse_data(json!({
+                "id": "c2",
+                "model": "grok-4.5",
+                "choices": [],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3}
+            }))
+            .as_bytes(),
+        );
+        let out = String::from_utf8_lossy(&s.finish()).into_owned();
+        assert!(out.contains("\"input_tokens\":12") || out.contains("\"input_tokens\": 12"));
+        assert!(out.contains("\"output_tokens\":3") || out.contains("\"output_tokens\": 3"));
+        assert!(out.contains("message_stop"));
     }
 }

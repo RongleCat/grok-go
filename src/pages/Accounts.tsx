@@ -248,9 +248,11 @@ function AccountCard({
     <Card className={cn("overflow-hidden", selected && "ring-2 ring-neutral-900/15")}>
       <CardContent className="p-0">
         <div className="grid grid-cols-1 gap-2 px-3 py-2.5 sm:grid-cols-[auto_minmax(0,0.9fr)_minmax(0,1.5fr)_auto] sm:items-center sm:gap-3">
-          <button
+          <Button
             type="button"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+            size="icon"
+            variant="outline"
+            className="h-8 w-8 shrink-0"
             title={selected ? "Unselect" : "Select"}
             aria-pressed={selected}
             onClick={() => onToggleSelect(account.id)}
@@ -260,7 +262,7 @@ function AccountCard({
             ) : (
               <Square className="h-4 w-4" />
             )}
-          </button>
+          </Button>
 
           {/* Identity */}
           <div className="flex min-w-0 items-center gap-2">
@@ -1080,7 +1082,7 @@ export function AccountsPage() {
 
       {/* Bulk actions */}
       {selected.size > 0 ? (
-        <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-neutral-50 px-3 py-2">
+        <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-lg border border-neutral-200 bg-white px-3 py-2">
           <span className="text-xs font-medium text-neutral-700">
             {t.accounts.bulkSelected.replace("{count}", String(selected.size))}
           </span>

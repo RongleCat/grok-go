@@ -9,7 +9,8 @@ use crate::error::{AppError, AppResult};
 use crate::gateway::server::{start_gateway, GatewayState};
 use crate::integrations::{
     import_cc_switch_claude_provider, import_cc_switch_provider, inject_codex_agents_guide,
-    integration_status, set_codex_mcp_inject,
+    integration_status, set_codex_mcp_inject, set_cursor_mcp_inject, set_opencode_mcp_inject,
+    set_opencode_model_inject, set_workbuddy_mcp_inject, set_workbuddy_model_inject,
     set_grok_build_inject as set_grok_build_inject_impl,
     restore_grok_build_backup as restore_grok_build_backup_impl, IntegrationStatus,
 };
@@ -723,4 +724,29 @@ pub fn import_claude_to_cc_switch() -> AppResult<String> {
 #[tauri::command]
 pub fn export_provider_snippet() -> AppResult<String> {
     Ok(integration_status()?.provider_snippet)
+}
+
+#[tauri::command]
+pub fn set_opencode_model_inject_cmd(enabled: bool) -> AppResult<IntegrationStatus> {
+    set_opencode_model_inject(enabled)
+}
+
+#[tauri::command]
+pub fn set_opencode_mcp_inject_cmd(enabled: bool) -> AppResult<IntegrationStatus> {
+    set_opencode_mcp_inject(enabled)
+}
+
+#[tauri::command]
+pub fn set_workbuddy_model_inject_cmd(enabled: bool) -> AppResult<IntegrationStatus> {
+    set_workbuddy_model_inject(enabled)
+}
+
+#[tauri::command]
+pub fn set_workbuddy_mcp_inject_cmd(enabled: bool) -> AppResult<IntegrationStatus> {
+    set_workbuddy_mcp_inject(enabled)
+}
+
+#[tauri::command]
+pub fn set_cursor_mcp_inject_cmd(enabled: bool) -> AppResult<IntegrationStatus> {
+    set_cursor_mcp_inject(enabled)
 }

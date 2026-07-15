@@ -22,10 +22,15 @@ Authorization = "Bearer <localToken>"
 
 ## Codex Agents Guide
 
-- 完整指引写到：`~/.grok-go/agents-guide.md`（随软件维护，勿手改）
-- `~/.codex/AGENTS.md` 只插一段带标记的短引用：
+- 完整指引写到：`~/.grok-go/agents-guide.md`（随软件维护，勿手改；模板在 `integrations::agents_guide_file_body`）
+- `~/.codex/AGENTS.md` 只插一段带标记的短引用（`agents_guide_ref_block`，内含强制分流摘要）：
   - 标记：`<!-- grok-go:agents-guide:start -->` … `end`
   - 锚点：`grok-go:agents-guide-ref`
+- **强制分流**（guide + 短引用同步）：
+  - **图片**：优先 Codex 内置 `imagegen` / `image_gen`；不要默认走 GrokGo MCP 的 `image_gen` / `image_generate` / `image_edit`
+  - **其余已启用能力**（尤其 `x_search`、`video_generate`、`video_edit`）：必须优先 GrokGo MCP（`http://127.0.0.1:<port>/mcp` + Bearer local token；先 `tools/list` 再 `tools/call`）
+  - **禁止**因未注入 `mcp__grok-go__*`、无原生 `x_search`、`tool_search` 失效就改用 `web_search` / Chrome / twitter241 / 翻仓库猜参
+  - **仅当** `/health` 或 MCP 明确失败时可降级，并说明原因；参数以 `tools/list` 与 agents-guide 为准
 - 仓库根 `AGENTS.md` 也可能含同样标记（工作区级）
 
 ## CC Switch
@@ -90,10 +95,57 @@ Authorization = "Bearer <localToken>"
   - 其余 xAI 文本 id（4.20 固定变体 / multi-agent / build）不进导入列表
 - provider `config` TOML：`model` 钳制到上述列表，并含 `model_reasoning_effort = "medium"`
 
+## 其他客户端（OpenCode / WorkBuddy / Cursor）
+
+集成页「其他客户端」标签：一键 merge 写入配置（**不**整文件替换）。
+
+| 客户端 | 模型 | MCP | 路径 |
+|--------|------|-----|------|
+| **OpenCode** | 写入 `provider.grok-go` + `model` | 写入 `mcp.grok-go` remote | `~/.config/opencode/opencode.json` |
+| **WorkBuddy** | merge `models.json`（object 格式） | merge **用户** `mcp.json` | `~/.workbuddy/models.json`；MCP：**`~/.workbuddy/mcp.json`**（UI「配置 MCP」路径；勿写自动生成的 `.mcp.json` connector-proxy） |
+| **Cursor** | **不**自动写（BYOK Key 在 secure storage） | merge `mcpServers.grok-go` | `~/.cursor/mcp.json`；UI 提供 Base URL / Token / model 复制 |
+
+### OpenCode 形状
+
+```json
+{
+  "model": "grok-go/grok-4.5",
+  "provider": {
+    "grok-go": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "GrokGo",
+      "options": { "baseURL": "http://127.0.0.1:<port>/v1", "apiKey": "<localToken>" },
+      "models": { "grok-4.5": { "name": "grok-4.5" }, "grok-4.3": { "name": "grok-4.3" } }
+    }
+  },
+  "mcp": {
+    "grok-go": {
+      "type": "remote",
+      "url": "http://127.0.0.1:<port>/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": { "Authorization": "Bearer <localToken>" }
+    }
+  }
+}
+```
+
+### WorkBuddy 形状
+
+- 模型：`url` 必须是完整 Chat Completions 路径（`…/v1/chat/completions`）
+- MCP：`mcpServers.grok-go`（streamable-http + headers）
+
+### Cursor BYOK
+
+- 官方**不支持**脚本写 API Key / Base URL（secure storage）
+- 集成页只提供复制字段；MCP 可一键注入
+
 ## UI 入口
 
 - 页面：`src/pages/Integrations.tsx`
-- commands：`get_integrations`、`set_mcp_inject`、`inject_agents_guide`、`set_grok_build_inject`、`restore_grok_build_backup`、`import_to_cc_switch`
+  - **MCP 工具**标签：左侧工具开关 · 右侧客户端 MCP 片段卡片（内部滚动）
+  - **其他客户端**标签：OpenCode / WorkBuddy / Cursor 注入
+- commands：`get_integrations`、`set_mcp_inject`、`inject_agents_guide`、`set_grok_build_inject`、`restore_grok_build_backup`、`import_to_cc_switch`、`set_opencode_*`、`set_workbuddy_*`、`set_cursor_mcp_inject_cmd`
 
 ## 相关页面
 

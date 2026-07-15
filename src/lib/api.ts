@@ -240,6 +240,21 @@ export type IntegrationStatus = {
   grokBuildSnippet: string;
   /** Claude Code env JSON for CC Switch / ~/.claude/settings.json */
   claudeCodeSnippet: string;
+  /** OpenCode: provider + model written to opencode.json */
+  opencodeModelInjected: boolean;
+  opencodeMcpInjected: boolean;
+  opencodeConfigPath: string;
+  /** WorkBuddy: models.json + MCP */
+  workbuddyModelInjected: boolean;
+  workbuddyMcpInjected: boolean;
+  workbuddyModelsPath: string;
+  workbuddyMcpPath: string;
+  /** Cursor: MCP only (BYOK is copy-only) */
+  cursorMcpInjected: boolean;
+  cursorMcpPath: string;
+  cursorByokBaseUrl: string;
+  cursorByokToken: string;
+  cursorByokModel: string;
 };
 
 export type ModelOptions = {
@@ -297,4 +312,14 @@ export const api = {
   importToCcSwitch: () => invoke<string>("import_to_cc_switch"),
   importClaudeToCcSwitch: () => invoke<string>("import_claude_to_cc_switch"),
   exportProviderSnippet: () => invoke<string>("export_provider_snippet"),
+  setOpencodeModelInject: (enabled: boolean) =>
+    invoke<IntegrationStatus>("set_opencode_model_inject_cmd", { enabled }),
+  setOpencodeMcpInject: (enabled: boolean) =>
+    invoke<IntegrationStatus>("set_opencode_mcp_inject_cmd", { enabled }),
+  setWorkbuddyModelInject: (enabled: boolean) =>
+    invoke<IntegrationStatus>("set_workbuddy_model_inject_cmd", { enabled }),
+  setWorkbuddyMcpInject: (enabled: boolean) =>
+    invoke<IntegrationStatus>("set_workbuddy_mcp_inject_cmd", { enabled }),
+  setCursorMcpInject: (enabled: boolean) =>
+    invoke<IntegrationStatus>("set_cursor_mcp_inject_cmd", { enabled }),
 };

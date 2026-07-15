@@ -1,5 +1,24 @@
 # Wiki 日志
 
+## 2026-07-15（WorkBuddy MCP 写入路径修正）
+
+- UI「配置 MCP」编辑的是 `~/.workbuddy/mcp.json`，不是自动生成的 `.mcp.json`（connector-proxy）。
+- 注入目标改为 `mcp.json`；type 用 `http`；顺带清理 `.mcp.json` 里残留的 grok-go。
+
+## 2026-07-15（集成：其他客户端 + MCP 页布局）
+
+- **其他客户端**标签：OpenCode（模型+MCP）、WorkBuddy（模型+MCP）、Cursor（MCP 注入 + BYOK 复制）。
+- **MCP 工具**标签：左侧工具管理 · 右侧客户端 MCP 片段卡片（内部滚动）；原客户端复制卡片迁入此列。
+- Cursor BYOK：Key/Base URL 在 secure storage，**不**做外部写入；只提供复制。
+- 后端：`set_opencode_*` / `set_workbuddy_*` / `set_cursor_mcp_inject`，merge 写入、备份到 `~/.grok-go/backups/`。
+
+## 2026-07-15（agents-guide 强制分流：图走 Codex / 其余走 GrokGo MCP）
+
+- 模板：`integrations::agents_guide_file_body` + `agents_guide_ref_block`（勿只改 `~/.grok-go/agents-guide.md` 手写文件）。
+- **图片**：优先 Codex 内置 `imagegen`/`image_gen`；MCP `image_*` 列为备选。
+- **x_search / 视频等**：必须 GrokGo MCP（`/mcp` + Bearer），先 `tools/list` 再 `tools/call`。
+- **禁止**因未注入 `mcp__grok-go__*` / 无原生 x_search / tool_search 失效就改用 web_search、Chrome、twitter241 或翻仓库猜参；仅 health/MCP 明确失败可降级并说明。
+
 ## 2026-07-15（Files offload 死循环：勿分流 skills）
 
 - 会话 `019f65cb`：开场仅「嘿」却多次 `uploaded large blob` + `files-offload`。

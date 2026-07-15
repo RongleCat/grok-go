@@ -225,6 +225,11 @@ pub fn run() {
             commands::import_to_cc_switch,
             commands::import_claude_to_cc_switch,
             commands::export_provider_snippet,
+            commands::set_opencode_model_inject_cmd,
+            commands::set_opencode_mcp_inject_cmd,
+            commands::set_workbuddy_model_inject_cmd,
+            commands::set_workbuddy_mcp_inject_cmd,
+            commands::set_cursor_mcp_inject_cmd,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

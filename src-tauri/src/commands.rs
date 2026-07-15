@@ -77,7 +77,8 @@ pub async fn get_status(gateway: State<'_, GatewayState>) -> AppResult<AppStatus
         healthy_accounts: auth
             .accounts
             .iter()
-            .filter(|a| a.enabled && a.is_credentialed() && a.health != crate::config::AccountHealth::Disabled)
+            .filter(|a| a.enabled && a.is_credentialed())
+            .filter(|a| a.health != crate::config::AccountHealth::Cooldown)
             .count(),
         lan_address: if config.lan_enabled { Some(host) } else { None },
         today,

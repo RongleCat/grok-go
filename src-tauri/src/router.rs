@@ -155,11 +155,12 @@ pub fn pick_account_decision_cap(
         .filter(|a| !exclude.iter().any(|id| id == &a.id))
         .collect();
 
+    // `enabled` alone gates participation. `health` is operational only:
+    // cooldown blocks until expiry; legacy `Disabled` no longer excludes if enabled.
     let mut candidates: Vec<&Account> = logged_in
         .iter()
         .copied()
         .filter(|a| match a.health {
-            AccountHealth::Disabled => false,
             AccountHealth::Cooldown => a.cooldown_until.map(|t| t <= now).unwrap_or(true),
             _ => true,
         })
@@ -425,7 +426,6 @@ pub fn routable_account_count_cap(store: &AuthStore, capability: MediaCapability
         .filter(|a| a.is_credentialed())
         .filter(|a| capability.matches(a))
         .filter(|a| match a.health {
-            AccountHealth::Disabled => false,
             AccountHealth::Cooldown => a.cooldown_until.map(|t| t <= now).unwrap_or(true),
             _ => true,
         })
@@ -502,11 +502,12 @@ pub fn remove_accounts(account_ids: &[String]) -> AppResult<usize> {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchAccountPatch {
+    /// Participation in routing only — does **not** change `health`.
     pub enabled: Option<bool>,
     pub weight: Option<u32>,
     pub supports_image: Option<bool>,
     pub supports_video: Option<bool>,
-    /// When true, clear cooldown/failures on selected accounts.
+    /// When true, reset operational health (cooldown / failures / degraded / legacy disabled).
     pub clear_cooldown: Option<bool>,
 }
 
@@ -521,13 +522,10 @@ pub fn batch_update_accounts(account_ids: &[String], patch: BatchAccountPatch) -
         if !account_ids.iter().any(|id| id == &account.id) {
             continue;
         }
+        // Enable/disable is only `enabled` — never couple to `health`.
+        // Operational health (healthy / degraded / cooldown) is reset separately.
         if let Some(v) = patch.enabled {
             account.enabled = v;
-            if !v {
-                account.health = AccountHealth::Disabled;
-            } else if account.health == AccountHealth::Disabled {
-                account.health = AccountHealth::Healthy;
-            }
         }
         if let Some(w) = patch.weight {
             account.weight = w.max(1);
@@ -539,13 +537,7 @@ pub fn batch_update_accounts(account_ids: &[String], patch: BatchAccountPatch) -
             account.supports_video = v;
         }
         if patch.clear_cooldown.unwrap_or(false) {
-            account.cooldown_until = None;
-            account.consecutive_failures = 0;
-            account.last_upstream_error = None;
-            if account.health == AccountHealth::Cooldown || account.health == AccountHealth::Degraded
-            {
-                account.health = AccountHealth::Healthy;
-            }
+            crate::auth::reset_account_health(account);
         }
         n += 1;
     }

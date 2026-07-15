@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-16
+
+> 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
+>
+> **Highlight:** multi-client inject (OpenCode / WorkBuddy / Cursor), gateway hardening, account enable≠health, agents-guide routing.
+
+### Added
+
+- **Integrations → Other clients**: one-click inject for **OpenCode** (provider + MCP), **WorkBuddy** (models + MCP), **Cursor** (MCP + BYOK Base URL / API Key / Model copy fields).
+- **Accounts**: per-account config dialog (weight, reset health); enable/disable only toggles `enabled` (no longer writes `health=Disabled`).
+- **CopyField** UI primitive: read-only `Input` + copy `Button` for endpoints/tokens across Overview and Integrations.
+- **Agents guide routing rules** (generated `~/.grok-go/agents-guide.md` + Codex `AGENTS.md` short ref): prefer Codex native `imagegen`/`image_gen` for images; other enabled tools (esp. `x_search`, video) must use GrokGo MCP (`tools/list` then `tools/call`); forbid web_search / Chrome / twitter241 fallbacks unless health/MCP clearly fails.
+
+### Fixed
+
+- **Claude Code streams / 400s**: token-aware context budget for `/v1/messages`; SSE `message_stop` on upstream abort; oversized tool_call args stubbed as valid JSON; raw xAI error strings surfaced.
+- **Codex TTFT**: default `emptyCompletionStreamBuffer=false` so `/v1/responses` streams tokens immediately.
+- **Codex skills death loop**: Files offload only `function_call_output` blobs — no longer offloads `skills_instructions` into attachment_search stubs Codex cannot use.
+- **CC Switch Codex import**: copy a GrokGo slot reusing the active `model_provider` id (keeps session history continuous).
+- **SuperGrok quota cross-talk**: merge snapshots by `fetched_at`; sequential refresh with background maintainer queue.
+
+### Changed
+
+- **Integrations / Overview UI**: drop ad-hoc gray copy boxes; Grok Build tab uses standard list rows; MCP tool toggles use divide-y rows; concise UI copy rule documented in repo `AGENTS.md`.
+- Account cards: remove static API rate badge; SuperGrok quota column wider.
+
+**中文 · 新增**
+
+- **其他客户端一键注入**：OpenCode / WorkBuddy / Cursor（Cursor 另提供 BYOK 字段复制）。
+- **账号配置弹窗**：权重、重置健康；启用只改 `enabled`。
+- **agents-guide 强制分流**：生图走 Codex 内置；搜索/视频走 GrokGo MCP；禁止随意降级。
+
+**中文 · 修复**
+
+- Claude Code 长会话裁剪与断流补全；Codex 真流式与 skills Files-offload 死循环；CC Switch 导入不丢会话；配额串号与串行刷新。
+
+**中文 · 变更**
+
+- 集成/概览控件改用标准 Input/Button；UI 文案与账号模型说明精简。
+
 ## [0.1.7] - 2026-07-14
 
 > 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
@@ -240,7 +280,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Product renamed from Grok Proxy to GrokGo
 - Config home moved to `~/.grok-go`
 
-[Unreleased]: https://github.com/RongleCat/grok-go/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/RongleCat/grok-go/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/RongleCat/grok-go/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/RongleCat/grok-go/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/RongleCat/grok-go/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/RongleCat/grok-go/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/RongleCat/grok-go/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/RongleCat/grok-go/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/RongleCat/grok-go/compare/v0.1.1...v0.1.2

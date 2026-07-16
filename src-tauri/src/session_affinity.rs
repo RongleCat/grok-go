@@ -3,14 +3,14 @@
 //! In-memory only (process lifetime). Failures invalidate the binding so the
 //! next turn can rebalance without user action.
 
+use axum::http::HeaderMap;
+use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-
-use axum::http::HeaderMap;
 
 static BINDINGS: Lazy<RwLock<HashMap<String, AffinityEntry>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -248,11 +248,104 @@ pub fn ensure_prompt_cache_key(body: &mut Value, session_key: &str) -> bool {
     true
 }
 
+/// Account-scoped continuity fields that must **not** follow a failover to another
+/// pool account (cli-chat-proxy / api.x.ai both bind response chains per principal).
+///
+/// Call when `send_with_account_failover` retries on a **different** account.
+/// Keeps `prompt_cache_key` / `prompt_cache_retention` — they are client-stable
+/// labels and help re-warm prefix cache on the new account without replaying a
+/// foreign `previous_response_id`.
+pub fn strip_account_scoped_continuity(body: &mut Value) -> bool {
+    let Some(obj) = body.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in [
+        "previous_response_id",
+        // Console-only store chains (if present).
+        "context_management",
+    ] {
+        if obj.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Prepare outbound body for account attempt `attempt` (0-based).
+/// On failover (`attempt > 0`), strip account-scoped continuity so we never
+/// send account A's `previous_response_id` to account B.
+pub fn body_for_failover_attempt(body: &Bytes, attempt: usize) -> Bytes {
+    if attempt == 0 || body.is_empty() {
+        return body.clone();
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return body.clone();
+    };
+    if !strip_account_scoped_continuity(&mut value) {
+        return body.clone();
+    }
+    Bytes::from(serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn strip_removes_previous_response_id_keeps_cache_key() {
+        let mut v = json!({
+            "previous_response_id": "resp_from_account_a",
+            "prompt_cache_key": "thread-stable",
+            "prompt_cache_retention": "24h",
+            "input": []
+        });
+        assert!(strip_account_scoped_continuity(&mut v));
+        assert!(v.get("previous_response_id").is_none());
+        assert_eq!(
+            v.get("prompt_cache_key").and_then(|x| x.as_str()),
+            Some("thread-stable")
+        );
+        assert_eq!(
+            v.get("prompt_cache_retention").and_then(|x| x.as_str()),
+            Some("24h")
+        );
+    }
+
+    #[test]
+    fn body_for_failover_attempt_only_strips_after_first() {
+        let raw = Bytes::from(
+            serde_json::to_vec(&json!({
+                "previous_response_id": "resp_a",
+                "prompt_cache_key": "k1"
+            }))
+            .unwrap(),
+        );
+        let a0 = body_for_failover_attempt(&raw, 0);
+        assert_eq!(a0, raw);
+        let a1 = body_for_failover_attempt(&raw, 1);
+        let v: Value = serde_json::from_slice(&a1).unwrap();
+        assert!(v.get("previous_response_id").is_none());
+        assert_eq!(v.get("prompt_cache_key").and_then(|x| x.as_str()), Some("k1"));
+    }
+
+    #[test]
+    fn extract_prefers_prompt_cache_key() {
+        let body = json!({"prompt_cache_key": "codex-thread-9", "previous_response_id": "resp_x"});
+        let k = extract_session_key(&HeaderMap::new(), Some(&body)).unwrap();
+        assert_eq!(k, "codex-thread-9");
+    }
+
+    #[test]
+    fn extract_falls_back_to_grok_conv_header() {
+        let mut h = HeaderMap::new();
+        h.insert("x-grok-conv-id", HeaderValue::from_static("cli-conv-1"));
+        let k = extract_session_key(&h, Some(&json!({}))).unwrap();
+        assert!(k.starts_with("hdr:"));
+        assert!(stable_cache_key(&k).as_deref() == Some("cli-conv-1"));
+    }
 
     #[test]
     fn extracts_prompt_cache_key_first() {

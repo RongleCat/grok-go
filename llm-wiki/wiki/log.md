@@ -8,6 +8,12 @@
 - 用量：`client_source=experimental-build`（媒体 `experimental-build-media`）。
 - 开源调研：CLIProxyAPI 有同类 OAuth→cli-chat-proxy 头；无完整可 vend 的转换库，本仓内实现。
 
+## 2026-07-16（多账号 failover：剥 previous_response_id）
+
+- `session_affinity::strip_account_scoped_continuity` / `body_for_failover_attempt`
+- 换号（attempt>0）或 sticky 绑定号 ≠ 本次选号时，去掉 `previous_response_id`，保留 `prompt_cache_key`
+- 防仿冒 Build / console 跨 principal 续链 4xx 与 cache 错乱
+
 ## 2026-07-16（续跑对齐 Grok Build：透明重采 → 软恢复 → 硬兜底）
 
 - Phase A：原请求 `stream=false` 透明 resample ×2（保留 continuity，无 nudge）

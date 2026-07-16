@@ -2017,13 +2017,35 @@ where
             replace_account_tokens(&account)?;
         }
 
+        // Account-scoped continuity (previous_response_id): strip when this pick is
+        // not the session's bound principal — covers (a) in-request failover
+        // attempt>0 and (b) sticky miss because bound account is cooldown/disabled.
+        let sticky_mismatch = session_key
+            .and_then(|k| session_affinity::lookup(k))
+            .map(|bound| bound != account.id)
+            .unwrap_or(false);
+        let force_strip = attempt > 0 || sticky_mismatch;
+        let attempt_body = if force_strip {
+            let stripped = session_affinity::body_for_failover_attempt(&body, 1);
+            if stripped.as_ref() != body.as_ref() {
+                tracing::info!(
+                    account = %account.id,
+                    attempt,
+                    sticky_mismatch,
+                    "stripped account-scoped continuity (multi-account rebalance)"
+                );
+            }
+            stripped
+        } else {
+            body.clone()
+        };
+
         // Per-account Files offload: only when body is heavy enough to matter.
         // Failures fall back to already-truncated sync optimize (never block the turn).
         // Only attempt Files API offload when body is large enough that a 32k+
         // text blob could exist (cheap gate before JSON parse + uploads).
-        let send_body = if allow_files_offload && body.len() >= OFFLOAD_TEXT_MIN {
-
-            match serde_json::from_slice::<Value>(&body) {
+        let send_body = if allow_files_offload && attempt_body.len() >= OFFLOAD_TEXT_MIN {
+            match serde_json::from_slice::<Value>(&attempt_body) {
                 Ok(mut value) => {
                     match offload_large_text_blobs(
                         &mut value,
@@ -2038,10 +2060,11 @@ where
                             if stats.modified {
                                 stats.log_summary("files-offload");
                                 Bytes::from(
-                                    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()),
+                                    serde_json::to_vec(&value)
+                                        .unwrap_or_else(|_| attempt_body.to_vec()),
                                 )
                             } else {
-                                body.clone()
+                                attempt_body.clone()
                             }
                         }
                         Err(err) => {
@@ -2049,14 +2072,14 @@ where
                                 account = %account.id,
                                 "files offload skipped: {err}"
                             );
-                            body.clone()
+                            attempt_body.clone()
                         }
                     }
                 }
-                Err(_) => body.clone(),
+                Err(_) => attempt_body.clone(),
             }
         } else {
-            body.clone()
+            attempt_body
         };
 
         let mut upstream = build_upstream(http, &token, send_body.clone()).send().await;

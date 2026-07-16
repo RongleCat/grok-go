@@ -29,6 +29,7 @@
 - 401 会先 **同账号 refresh 再重发一次**，仍失败才换号
 - 429 会读 `Retry-After` 等头，进入本地 cooldown
 - 成功路径尽量只 patch 内存 cache，减少每次写 `auth.json`
+- **换号 / sticky 不匹配时**：剥离 body 里的 `previous_response_id`（账号态 response 链），保留 `prompt_cache_key`（客户端稳定标签，可在新号上重暖 cache）。避免把 A 的 id 打到 B（console 与 **仿冒 cli-chat-proxy** 均适用）
 
 ## 错误信息语义
 

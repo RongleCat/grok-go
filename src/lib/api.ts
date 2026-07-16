@@ -69,8 +69,9 @@ export type AppConfig = {
   /** Grok Build native SuperGrok plane (cli-chat-proxy). */
   cliChatProxyBaseUrl?: string;
   /**
-   * Experimental: force Codex / OpenAI / Claude Code onto cli-chat-proxy
-   * with Grok Build identity headers. Default false.
+   * Chat channel for Codex / OpenAI / Claude.
+   * false/undefined (default) = API / api.x.ai; true = Grok Build / cli-chat-proxy.
+   * Field name kept for config compatibility; UI: Settings → 渠道选择.
    */
   experimentalImpersonateGrokBuild?: boolean;
   /** Anthropic Messages path: hide | passthrough | summary. Default hide. */

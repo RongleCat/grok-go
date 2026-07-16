@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Inbox, Settings2 } from "lucide-react";
 import { api, type Account, type AppConfig, type LogStoreStats, type RequestLog } from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -18,8 +25,14 @@ import { useI18n } from "@/i18n/context";
 import { useToast } from "@/components/ui/toast";
 
 const PAGE_SIZE = 50;
+/** Cap in-memory / scroll-list rows (newest-first contiguous window). */
+const MAX_LOADED = 200;
 const ROW_HEIGHT = 56;
 const OVERSCAN = 8;
+/** Poll newest page while Logs page is open. */
+const POLL_MS = 4000;
+/** Within this scroll offset, treat as “following latest” (stay at top). */
+const STICK_TOP_PX = ROW_HEIGHT;
 
 function formatMs(ms: number | null | undefined): string {
   if (ms == null || Number.isNaN(ms)) return "—";
@@ -144,6 +157,11 @@ export function LogsPage() {
   const [viewportH, setViewportH] = useState(400);
   const listRef = useRef<HTMLDivElement>(null);
   const loadingMore = useRef(false);
+  const pollInFlight = useRef(false);
+  const logsRef = useRef<RequestLog[]>([]);
+  /** After prepend poll: null = no adjust; number = absolute scrollTop to apply. */
+  const pendingScrollTop = useRef<number | null>(null);
+  logsRef.current = logs;
 
   const [manageOpen, setManageOpen] = useState(false);
   const [stats, setStats] = useState<LogStoreStats | null>(null);
@@ -167,12 +185,28 @@ export function LogsPage() {
 
   const loadPage = useCallback(async (offset: number, replace: boolean) => {
     if (loadingMore.current) return;
+    if (!replace && offset >= MAX_LOADED) {
+      setHasMore(false);
+      return;
+    }
     loadingMore.current = true;
-    setLoading(true);
+    if (replace) setLoading(true);
     try {
-      const page = await api.getRecentLogs(PAGE_SIZE, offset);
-      setLogs((prev) => (replace ? page : [...prev, ...page]));
-      setHasMore(page.length >= PAGE_SIZE);
+      const limit = replace
+        ? PAGE_SIZE
+        : Math.min(PAGE_SIZE, Math.max(0, MAX_LOADED - offset));
+      if (!replace && limit <= 0) {
+        setHasMore(false);
+        return;
+      }
+      const page = await api.getRecentLogs(limit, offset);
+      setLogs((prev) => {
+        if (replace) return page.slice(0, MAX_LOADED);
+        const seen = new Set(prev.map((l) => l.requestId));
+        const extra = page.filter((l) => !seen.has(l.requestId));
+        return [...prev, ...extra].slice(0, MAX_LOADED);
+      });
+      setHasMore(page.length >= limit && offset + page.length < MAX_LOADED);
       setError("");
       if (replace) {
         setScrollTop(0);
@@ -188,7 +222,88 @@ export function LogsPage() {
     }
   }, []);
 
-  async function refresh() {
+  /**
+   * Silent poll of the newest page. Prepends new rows without jumping the
+   * viewport when the user has scrolled down (scrollTop compensation).
+   * When near top, stay pinned so latest traffic is visible.
+   */
+  const pollLatest = useCallback(async () => {
+    if (pollInFlight.current || loadingMore.current) return;
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+      return;
+    }
+    pollInFlight.current = true;
+    try {
+      const page = await api.getRecentLogs(PAGE_SIZE, 0);
+      const prev = logsRef.current;
+      const prevById = new Map(prev.map((l) => [l.requestId, l]));
+      let added = 0;
+      for (const row of page) {
+        if (!prevById.has(row.requestId)) added += 1;
+      }
+      const pageIds = new Set(page.map((l) => l.requestId));
+      const tail = prev.filter((l) => !pageIds.has(l.requestId));
+      let next = [...page, ...tail];
+      let truncated = false;
+      if (next.length > MAX_LOADED) {
+        next = next.slice(0, MAX_LOADED);
+        truncated = true;
+      }
+
+      // Skip setState if nothing meaningful changed (same ids + key fields).
+      let changed = added > 0 || truncated || next.length !== prev.length;
+      if (!changed) {
+        for (let i = 0; i < page.length; i++) {
+          const a = page[i];
+          const b = prevById.get(a.requestId);
+          if (
+            !b ||
+            a.statusCode !== b.statusCode ||
+            a.latencyMs !== b.latencyMs ||
+            a.firstTokenMs !== b.firstTokenMs ||
+            a.inputTokens !== b.inputTokens ||
+            a.outputTokens !== b.outputTokens ||
+            a.cacheTokens !== b.cacheTokens
+          ) {
+            changed = true;
+            break;
+          }
+        }
+      }
+      if (!changed) return;
+
+      const el = listRef.current;
+      const stickTop = !el || el.scrollTop <= STICK_TOP_PX;
+      const prevScroll = el?.scrollTop ?? 0;
+      if (stickTop) {
+        pendingScrollTop.current = 0;
+      } else if (added > 0) {
+        // Keep the same rows under the user's eyes after prepend.
+        pendingScrollTop.current = prevScroll + added * ROW_HEIGHT;
+      } else {
+        pendingScrollTop.current = null;
+      }
+
+      setLogs(next);
+      if (truncated) setHasMore(true);
+    } catch {
+      /* silent — manual refresh still surfaces errors */
+    } finally {
+      pollInFlight.current = false;
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    const target = pendingScrollTop.current;
+    if (target == null) return;
+    pendingScrollTop.current = null;
+    const box = listRef.current;
+    if (!box) return;
+    box.scrollTop = target;
+    setScrollTop(target);
+  }, [logs]);
+
+  const refresh = useCallback(async () => {
     setHasMore(true);
     resetScroll();
     try {
@@ -198,7 +313,7 @@ export function LogsPage() {
       /* non-fatal for logs */
     }
     await loadPage(0, true);
-  }
+  }, [loadPage, resetScroll]);
 
   async function loadManage() {
     try {
@@ -216,7 +331,22 @@ export function LogsPage() {
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [refresh]);
+
+  // Live tail while this page is mounted; pause when tab hidden.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void pollLatest();
+    }, POLL_MS);
+    const onVis = () => {
+      if (document.visibilityState === "visible") void pollLatest();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [pollLatest]);
 
   useEffect(() => {
     if (manageOpen) void loadManage();
@@ -237,8 +367,8 @@ export function LogsPage() {
     const el = e.currentTarget;
     setScrollTop(el.scrollTop);
     const nearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - ROW_HEIGHT * 4;
-    if (nearBottom && hasMore && !loadingMore.current) {
-      loadPage(logs.length, false);
+    if (nearBottom && hasMore && !loadingMore.current && logs.length < MAX_LOADED) {
+      void loadPage(logs.length, false);
     }
   }
 

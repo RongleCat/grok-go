@@ -35,11 +35,12 @@
 3. [Screenshots](#screenshots)
 4. [Install & first run](#install--first-run)
 5. [Connect Codex / clients](#connect-codex--clients)
-6. [API endpoints](#api-endpoints)
-7. [Config paths](#config-paths)
-8. [macOS “damaged” / Gatekeeper](#macos-damaged--gatekeeper)
-9. [Develop & build](#develop--build)
-10. [Docs & contributing](#docs--contributing)
+6. [Channel selection (important)](#channel-selection-important)
+7. [API endpoints](#api-endpoints)
+8. [Config paths](#config-paths)
+9. [macOS “damaged” / Gatekeeper](#macos-damaged--gatekeeper)
+10. [Develop & build](#develop--build)
+11. [Docs & contributing](#docs--contributing)
 
 ---
 

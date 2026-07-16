@@ -1,5 +1,24 @@
 # Wiki 日志
 
+## 2026-07-16（v0.1.9 发布准备）
+
+- README / README_EN：渠道选择（默认 API，推荐）；Grok Build 可选且有账号受限风险、二次确认
+- CHANGELOG `[0.1.9]`：API 默认、日志管理、真 SSE 恢复、Build 面 opt-in
+- 发版：`./scripts/release-tag.sh 0.1.9` → push tag 触发 CI
+
+## 2026-07-16（日志页实时尾随 + 滚动稳定）
+
+- Logs 页挂载时每 4s 静默拉最新一页；隐藏标签页暂停
+- 内存窗口最多 200 条（虚拟列表仍只渲可见行）
+- 贴顶：新日志出现后保持在顶；已下滚：按新增行数补偿 scrollTop，视口内容不跳
+
+## 2026-07-16（API 渠道为默认；Grok Build 需二次确认）
+
+- 配置 `experimentalImpersonateGrokBuild` 默认 **false**（字段名保留兼容）= API / `api.x.ai`
+- 设置页：「渠道选择」分段器 API | Grok Build（默认 API）；选 Grok Build 需确认（账号受限风险）
+- 缺字段反序列化 / `AppConfig::default` 均为 API 平面；显式 `true` 的已有 config 仍走会话面
+- 产品默认：Codex / OpenAI / Claude → `api.x.ai`；可选 opt-in → cli-chat-proxy；媒体始终 api.x.ai
+
 ## 2026-07-16（Codex agent 真 SSE + 续跑）
 
 - 去掉「有 tools 就 force stream=false」

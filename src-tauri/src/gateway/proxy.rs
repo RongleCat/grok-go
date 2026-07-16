@@ -394,7 +394,7 @@ async fn proxy_anthropic_messages_inner(
         tracing::info!(
             target: "gateway",
             upstream = %upstream_base,
-            "experimental Grok Build impersonation (Anthropic) → cli-chat-proxy"
+            "Grok Build session plane (Anthropic) → cli-chat-proxy"
         );
     }
     let (mut account, _token, upstream) = send_with_account_failover(
@@ -904,7 +904,7 @@ async fn proxy_json_inner(
             target: "gateway",
             %path,
             upstream = %upstream_base,
-            "experimental Grok Build impersonation → cli-chat-proxy"
+            "Grok Build session plane → cli-chat-proxy"
         );
     } else if build_plane {
         tracing::debug!(
@@ -2996,6 +2996,8 @@ mod build_plane_tests {
         let mut cfg = AppConfig::default();
         cfg.xai_base_url = "https://api.x.ai/v1".into();
         cfg.cli_chat_proxy_base_url = "https://cli-chat-proxy.grok.com/v1".into();
+        // Default = API channel: plain clients stay on console api.x.ai.
+        assert!(!cfg.experimental_impersonate_grok_build);
         let mut h = HeaderMap::new();
         h.insert("x-xai-token-auth", HeaderValue::from_static("xai-grok-cli"));
         assert_eq!(
@@ -3004,6 +3006,16 @@ mod build_plane_tests {
         );
         let plain = HeaderMap::new();
         assert_eq!(resolve_upstream_base(&cfg, &plain), "https://api.x.ai/v1");
+        // Opt-in Grok Build session plane: plain clients use cli-chat-proxy.
+        cfg.experimental_impersonate_grok_build = true;
+        assert_eq!(
+            resolve_upstream_base(&cfg, &plain),
+            "https://cli-chat-proxy.grok.com/v1"
+        );
+        assert_eq!(
+            resolve_upstream_base(&cfg, &h),
+            "https://cli-chat-proxy.grok.com/v1"
+        );
     }
 
     #[test]

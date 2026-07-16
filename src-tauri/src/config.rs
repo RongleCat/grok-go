@@ -79,9 +79,11 @@ pub struct AppConfig {
     /// Do **not** point Grok Build at `xai_base_url` — that is the metered API path.
     #[serde(default = "default_cli_chat_proxy_base_url")]
     pub cli_chat_proxy_base_url: String,
-    /// Experimental: force Codex / OpenAI / Claude Code (non–Grok-Build clients) onto the
-    /// cli-chat-proxy SuperGrok chat plane with Grok Build identity headers.
-    /// Default **false** — stable console paths unchanged when off.
+    /// Optional chat plane for non–Grok-Build clients (Codex / OpenAI / Claude Code):
+    /// route to cli-chat-proxy SuperGrok with Grok Build identity headers.
+    /// Default **false** (metered console `api.x.ai` / API channel). Set **true** for
+    /// Grok Build session plane — may risk account restriction on SuperGrok path.
+    /// Field name kept for config.json compatibility.
     #[serde(default)]
     pub experimental_impersonate_grok_build: bool,
     /// Anthropic Messages path: how to surface model reasoning.

@@ -84,6 +84,7 @@ export function SettingsPage() {
   const [error, setError] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [restartOpen, setRestartOpen] = useState(false);
+  const [channelConfirmOpen, setChannelConfirmOpen] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const [exportSections, setExportSections] = useState<BackupSections>(defaultSections);
@@ -810,22 +811,30 @@ export function SettingsPage() {
                     <p className="mt-1 text-xs text-neutral-500">{t.settings.accountMaxConcurrencyDesc}</p>
                   ) : null}
                 </div>
-                <div className="flex items-center justify-between gap-3 rounded-md border border-neutral-200 px-3 py-2 md:col-span-2">
-                  <div className="min-w-0">
-                    <div className="text-sm font-medium">
-                      {t.settings.experimentalImpersonateGrokBuild}
-                    </div>
-                    {t.settings.experimentalImpersonateGrokBuildDesc ? (
-                      <div className="text-xs text-neutral-500">
-                        {t.settings.experimentalImpersonateGrokBuildDesc}
-                      </div>
-                    ) : null}
-                  </div>
-                  <Switch
-                    checked={Boolean(config.experimentalImpersonateGrokBuild)}
-                    onCheckedChange={(v) =>
-                      void applyPatch({ experimentalImpersonateGrokBuild: v })
+                <div className="md:col-span-2">
+                  <Label>{t.settings.chatChannel}</Label>
+                  <Tabs
+                    className="mt-1 w-full max-w-sm [&>button]:flex-1"
+                    value={
+                      config.experimentalImpersonateGrokBuild
+                        ? "grok-build"
+                        : "api"
                     }
+                    onChange={(id) => {
+                      if (id === "grok-build") {
+                        if (config.experimentalImpersonateGrokBuild) return;
+                        setChannelConfirmOpen(true);
+                        return;
+                      }
+                      void applyPatch({ experimentalImpersonateGrokBuild: false });
+                    }}
+                    items={[
+                      { id: "api", label: t.settings.chatChannelApi },
+                      {
+                        id: "grok-build",
+                        label: t.settings.chatChannelGrokBuild,
+                      },
+                    ]}
                   />
                 </div>
                 <div className="md:col-span-2">
@@ -910,6 +919,19 @@ export function SettingsPage() {
         onCancel={() => setRestartOpen(false)}
         onConfirm={() => {
           void relaunch().catch((e) => toast(String(e), "error"));
+        }}
+      />
+
+      <ConfirmDialog
+        open={channelConfirmOpen}
+        title={t.settings.chatChannelGrokBuildConfirmTitle}
+        description={t.settings.chatChannelGrokBuildConfirmDesc}
+        cancelLabel={t.common.cancel}
+        confirmLabel={t.settings.chatChannelGrokBuildConfirm}
+        onCancel={() => setChannelConfirmOpen(false)}
+        onConfirm={() => {
+          setChannelConfirmOpen(false);
+          void applyPatch({ experimentalImpersonateGrokBuild: true });
         }}
       />
 

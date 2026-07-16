@@ -1,13 +1,15 @@
-//! Experimental Grok Build plane routing: pure decision + header/body adapt helpers.
+//! Grok Build / SuperGrok plane routing: pure decision + header/body adapt helpers.
 //!
-//! When `AppConfig::experimental_impersonate_grok_build` is **off** (default),
-//! behaviour matches pre-feature dual-plane detection (native Grok Build markers
-//! → cli-chat-proxy; everyone else → console `api.x.ai`).
+//! When `AppConfig::experimental_impersonate_grok_build` is **off** (**default**),
+//! only native Grok Build markers → cli-chat-proxy; everyone else → console
+//! `api.x.ai` (API channel).
 //!
-//! When **on**, non–Grok-Build clients (Codex / OpenAI / Claude Code) are forced
-//! onto the SuperGrok / cli-chat-proxy chat plane with required identity headers.
-//! Media (images/videos) stays on the console API — cli-chat-proxy does not host
-//! those routes (official `xai-org/grok-build` sampling vs media split).
+//! When **on** (Grok Build session plane), non–Grok-Build clients (Codex /
+//! OpenAI / Claude Code) use SuperGrok / cli-chat-proxy with Grok Build identity
+//! headers. Prefer opt-in: SuperGrok path may risk account restriction.
+//!
+//! Media (images/videos) always stays on the console API — cli-chat-proxy does
+//! not host those routes (official `xai-org/grok-build` sampling vs media split).
 //!
 //! ## Wire source of truth
 //! Aligned with open-source **https://github.com/xai-org/grok-build**:
@@ -551,6 +553,27 @@ mod tests {
         c.cli_chat_proxy_base_url = "https://cli-chat-proxy.grok.com/v1".into();
         c.experimental_impersonate_grok_build = experimental;
         c
+    }
+
+    #[test]
+    fn default_config_uses_api_channel() {
+        assert!(!AppConfig::default().experimental_impersonate_grok_build);
+        // Round-trip default JSON: field present false. Omit key → serde default false.
+        let mut value = serde_json::to_value(AppConfig::default()).expect("to_value");
+        assert_eq!(
+            value.get("experimentalImpersonateGrokBuild"),
+            Some(&serde_json::json!(false))
+        );
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("experimentalImpersonateGrokBuild");
+        let omit_key: AppConfig = serde_json::from_value(value).expect("omit field defaults off");
+        assert!(!omit_key.experimental_impersonate_grok_build);
+        let d = decide_plane(&AppConfig::default(), &HeaderMap::new(), "/responses");
+        assert!(!d.build_plane);
+        assert!(!d.experimental_impersonation);
+        assert_eq!(d.upstream_base, "https://api.x.ai/v1");
     }
 
     #[test]

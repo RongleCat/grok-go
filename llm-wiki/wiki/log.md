@@ -1,5 +1,12 @@
 # Wiki 日志
 
+## 2026-07-16（Codex agent 真 SSE + 续跑）
+
+- 去掉「有 tools 就 force stream=false」
+- 新路径：真流式透传 delta，**暂扣** `response.completed`；结束后若 premature stop 再 multi-phase 非流式续跑，成功则下发 recovered SSE，否则冲刷原 completed
+- image_gen bridge 仍强制非流式；`emptyCompletionStreamBuffer` 全量缓冲路径不变
+- 辅助：`split_sse_hold_completed` / `sse_frame_is_response_completed`
+
 ## 2026-07-16（请求日志管理 + 首字/耗时）
 
 - UI：日志页「管理」弹窗 — 条数/磁盘、保留天数、最大条数、立即按策略清理、按 1/7/30 天清除、按日期区间清除、全部清空

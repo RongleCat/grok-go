@@ -8,6 +8,13 @@
 - 用量：`client_source=experimental-build`（媒体 `experimental-build-media`）。
 - 开源调研：CLIProxyAPI 有同类 OAuth→cli-chat-proxy 头；无完整可 vend 的转换库，本仓内实现。
 
+## 2026-07-16（续跑对齐 Grok Build：透明重采 → 软恢复 → 硬兜底）
+
+- Phase A：原请求 `stream=false` 透明 resample ×2（保留 continuity，无 nudge）
+- Phase B：钉 shell tool_choice + nudge ×1（build 面保留 `prompt_cache_key`）
+- Phase C：合成 `function_call` 保 Codex loop
+- 日志：`classify_premature_stop` → ReasoningOnly / NoToolNonFinal
+
 ## 2026-07-16（Codex 会话 019f6852 提前终止：experimental-build 关掉了 empty-completion）
 
 - 现象：任务做到「参考 PDF 是图片」后 `task_complete`，`last_agent_message=null`，最后一回合仅 reasoning、无 tool call。

@@ -24,9 +24,10 @@ use crate::gateway::build_plane_route::{
     effective_client_source, BuildPlaneHeaderContext, PlaneDecision,
 };
 use crate::gateway::empty_completion::{
-    build_empty_completion_retry_request, extract_completed_response_from_sse, is_responses_path,
-    recovery_quality_score, should_retry_premature_agent_stop, synthesize_forced_tool_response,
-    SSE_BUFFER_LIMIT,
+    build_soft_recovery_request, build_transparent_resample_request, classify_premature_stop,
+    extract_completed_response_from_sse, is_responses_path, recovery_quality_score,
+    should_retry_premature_agent_stop, synthesize_forced_tool_response, SoftRecoveryOpts,
+    SOFT_RECOVERY_MAX, SSE_BUFFER_LIMIT, TRANSPARENT_RESAMPLE_MAX,
 };
 
 // Public re-exports (API stability for external callers / tests).
@@ -1099,6 +1100,7 @@ async fn proxy_json_inner(
                     &build_upstream,
                     req_template,
                     &value,
+                    /*preserve_cache_keys*/ build_plane,
                 )
                 .await
                 {
@@ -1382,12 +1384,20 @@ where
     if let Some(completed) = extract_completed_response_from_sse(&sse) {
         usage_source = completed;
         if should_retry_premature_agent_stop(&usage_source, Some(original_request)) {
+            // Prefer keeping cache keys when the original agent turn already set them
+            // (common on experimental-build after adapt_responses_body_for_build_plane).
+            let preserve = original_request
+                .get("prompt_cache_key")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
             match retry_empty_completion_once(
                 http,
                 token,
                 build_upstream,
                 original_request,
                 &usage_source,
+                preserve,
             )
             .await
             {
@@ -1425,84 +1435,126 @@ where
     })
 }
 
-/// Up to two silent non-stream recovery attempts for premature agent stops.
+/// Multi-phase silent recovery for premature agent stops (Grok Build–aligned).
 ///
-/// One attempt is not always enough: empty → narration-only still ends Codex.
+/// 1. **Transparent resample** (`TRANSPARENT_RESAMPLE_MAX`) — same request body,
+///    `stream=false`, keep continuity fields (Build empty-response policy).
+/// 2. **Soft recovery** (`SOFT_RECOVERY_MAX`) — pin shell `tool_choice` + nudge.
+/// 3. **Hard recovery** — synthesize a neutral `function_call` for Codex.
+///
 /// Returns `Ok(Some(value))` when a non-premature payload is obtained, or when
-/// a partial recovery is *better* than the original empty (e.g. message > pure
-/// reasoning). `Ok(None)` only when nothing improved.
+/// a partial recovery is *better* than the original empty. `Ok(None)` only when
+/// nothing improved.
 async fn retry_empty_completion_once<F>(
     http: &reqwest::Client,
     token: &str,
     build_upstream: &F,
     original_request: &Value,
     empty_response: &Value,
+    preserve_cache_keys: bool,
 ) -> AppResult<Option<Value>>
 where
     F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
 {
-    // One soft retry (pinned tool_choice); if still narration, inject a synthetic call.
-    // Two soft retries burned ~5s without producing tools (see session 019f5eaf).
-    const MAX_ATTEMPTS: u32 = 1;
-    let mut seed = empty_response.clone();
+    let kind = classify_premature_stop(empty_response, Some(original_request));
+    tracing::warn!(
+        ?kind,
+        preserve_cache_keys,
+        transparent_max = TRANSPARENT_RESAMPLE_MAX,
+        soft_max = SOFT_RECOVERY_MAX,
+        "starting multi-phase premature-stop recovery"
+    );
+
     let mut best = empty_response.clone();
     let mut best_score = recovery_quality_score(&best);
-    for attempt in 1..=MAX_ATTEMPTS {
-        let retry_req = build_empty_completion_retry_request(original_request, &seed);
-        let retry_body = Bytes::from(serde_json::to_vec(&retry_req)?);
-        let resp = build_upstream(http, token, retry_body)
-            .send()
-            .await
-            .map_err(|e| AppError::msg(format!("empty-completion retry send: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                attempt,
-                %status,
-                body = %body.chars().take(240).collect::<String>(),
-                "empty-completion retry upstream non-success"
-            );
-            // Keep best partial if we already improved over pure empty.
-            break;
-        }
-        let content_type = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let bytes = resp.bytes().await?;
-        let value = if content_type.contains("text/event-stream") || content_type.contains("stream")
-        {
-            let text = String::from_utf8_lossy(&bytes);
-            extract_completed_response_from_sse(&text).ok_or_else(|| {
-                AppError::msg("empty-completion retry stream missing response.completed")
-            })?
-        } else {
-            serde_json::from_slice::<Value>(&bytes)?
-        };
-        let score = recovery_quality_score(&value);
-        if score > best_score {
-            best = value.clone();
-            best_score = score;
-        }
-        if !should_retry_premature_agent_stop(&value, Some(original_request)) {
-            if attempt > 1 {
-                tracing::warn!(attempt, "premature agent stop cleared after multi-retry");
+    let mut seed = empty_response.clone();
+
+    // ── Phase A: transparent resample (Build-style) ──────────────────────
+    for attempt in 1..=TRANSPARENT_RESAMPLE_MAX {
+        let retry_req = build_transparent_resample_request(original_request);
+        match send_recovery_sample(http, token, build_upstream, &retry_req).await {
+            Ok(value) => {
+                let score = recovery_quality_score(&value);
+                if score > best_score {
+                    best = value.clone();
+                    best_score = score;
+                }
+                if !should_retry_premature_agent_stop(&value, Some(original_request)) {
+                    tracing::warn!(
+                        phase = "transparent",
+                        attempt,
+                        ?kind,
+                        "premature agent stop cleared via transparent resample"
+                    );
+                    return Ok(Some(value));
+                }
+                tracing::warn!(
+                    phase = "transparent",
+                    attempt,
+                    max = TRANSPARENT_RESAMPLE_MAX,
+                    score,
+                    "transparent resample still empty/narration"
+                );
+                seed = value;
             }
-            return Ok(Some(value));
+            Err(err) => {
+                tracing::warn!(
+                    phase = "transparent",
+                    attempt,
+                    error = %err,
+                    "transparent resample upstream failed"
+                );
+                break;
+            }
         }
-        tracing::warn!(
-            attempt,
-            max = MAX_ATTEMPTS,
-            score,
-            "recovery attempt still empty/narration; retrying if budget remains"
-        );
-        seed = value;
     }
-    // Soft retries (even with tool_choice pin) often still return narration.
-    // Hard guarantee: inject a real function_call so Codex keeps the turn alive.
+
+    // ── Phase B: soft recovery (tool_choice pin + nudge) ─────────────────
+    for attempt in 1..=SOFT_RECOVERY_MAX {
+        let retry_req = build_soft_recovery_request(
+            original_request,
+            &seed,
+            SoftRecoveryOpts {
+                preserve_cache_keys,
+            },
+        );
+        match send_recovery_sample(http, token, build_upstream, &retry_req).await {
+            Ok(value) => {
+                let score = recovery_quality_score(&value);
+                if score > best_score {
+                    best = value.clone();
+                    best_score = score;
+                }
+                if !should_retry_premature_agent_stop(&value, Some(original_request)) {
+                    tracing::warn!(
+                        phase = "soft",
+                        attempt,
+                        "premature agent stop cleared via soft recovery"
+                    );
+                    return Ok(Some(value));
+                }
+                tracing::warn!(
+                    phase = "soft",
+                    attempt,
+                    max = SOFT_RECOVERY_MAX,
+                    score,
+                    "soft recovery still empty/narration"
+                );
+                seed = value;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    phase = "soft",
+                    attempt,
+                    error = %err,
+                    "soft recovery upstream failed"
+                );
+                break;
+            }
+        }
+    }
+
+    // ── Phase C: hard recovery (synthetic tool call) ─────────────────────
     if let Some(forced) = synthesize_forced_tool_response(original_request, &best) {
         tracing::warn!(
             best_score,
@@ -1520,6 +1572,46 @@ where
         return Ok(Some(best));
     }
     Ok(None)
+}
+
+/// Send one non-stream recovery sample and parse JSON or SSE completed payload.
+async fn send_recovery_sample<F>(
+    http: &reqwest::Client,
+    token: &str,
+    build_upstream: &F,
+    retry_req: &Value,
+) -> AppResult<Value>
+where
+    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
+{
+    let retry_body = Bytes::from(serde_json::to_vec(retry_req)?);
+    let resp = build_upstream(http, token, retry_body)
+        .send()
+        .await
+        .map_err(|e| AppError::msg(format!("empty-completion retry send: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::msg(format!(
+            "empty-completion retry upstream {status}: {}",
+            body.chars().take(240).collect::<String>()
+        )));
+    }
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp.bytes().await?;
+    if content_type.contains("text/event-stream") || content_type.contains("stream") {
+        let text = String::from_utf8_lossy(&bytes);
+        extract_completed_response_from_sse(&text).ok_or_else(|| {
+            AppError::msg("empty-completion retry stream missing response.completed")
+        })
+    } else {
+        Ok(serde_json::from_slice::<Value>(&bytes)?)
+    }
 }
 
 /// Last-resort request: only plain user/assistant text messages.

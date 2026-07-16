@@ -5,10 +5,28 @@
 //! - response is `completed` with **no tool call**
 //! - response is **not** a clear final answer (question / long text / delivery)
 //!
-//! Covers both pure reasoning-only empties and short status-only messages.
-//! Soft retry + synthetic shell probe keep the Codex agent loop alive.
+//! Multi-phase recovery (aligned with open-source Grok Build sampling):
+//! 1. **Transparent resample** — same request, `stream=false` (Build-style empty retry)
+//! 2. **Soft recovery** — pin shell `tool_choice` + recovery nudge
+//! 3. **Hard recovery** — synthesize a neutral `function_call` so Codex keeps looping
+//!
+//! Native Grok Build TUI never uses this module (it owns its own agent loop).
 
 use serde_json::{json, Value};
+
+/// Grok Build–style empty classification (logging + phase selection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrematureStopKind {
+    /// No message/tool — only reasoning (Build `EmptyReason::ReasoningOnly`).
+    ReasoningOnly,
+    /// Tools on request, completed without tool call, message not a clear final.
+    NoToolNonFinal,
+}
+
+/// How many transparent resamples before soft recovery (Build-style budget).
+pub const TRANSPARENT_RESAMPLE_MAX: u32 = 2;
+/// Soft recovery attempts (tool_choice pin + nudge) after transparent budget.
+pub const SOFT_RECOVERY_MAX: u32 = 1;
 
 /// User-visible recovery instruction injected on retry.
 pub const EMPTY_COMPLETION_NUDGE: &str = "\
@@ -93,8 +111,21 @@ pub fn is_tool_less_non_final_stop(response: &Value, request: Option<&Value>) ->
 
 /// Unified gate: reasoning-only empty **or** tools present + no tool call + non-final.
 pub fn should_retry_premature_agent_stop(response: &Value, request: Option<&Value>) -> bool {
-    is_reasoning_only_empty_completion(response)
-        || is_tool_less_non_final_stop(response, request)
+    classify_premature_stop(response, request).is_some()
+}
+
+/// Classify why a completed response should be recovered (Build-aligned labels).
+pub fn classify_premature_stop(
+    response: &Value,
+    request: Option<&Value>,
+) -> Option<PrematureStopKind> {
+    if is_reasoning_only_empty_completion(response) {
+        return Some(PrematureStopKind::ReasoningOnly);
+    }
+    if is_tool_less_non_final_stop(response, request) {
+        return Some(PrematureStopKind::NoToolNonFinal);
+    }
+    None
 }
 
 /// Backward-compatible alias used in older docs/tests naming.
@@ -304,7 +335,37 @@ pub fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
     last
 }
 
-/// Build a one-shot non-stream retry request with continuity + recovery nudge.
+/// Phase A — Grok Build–style transparent resample.
+///
+/// Same body as the original turn except `stream=false`. Keeps
+/// `previous_response_id` / `prompt_cache_*` so cli-chat-proxy prefix cache
+/// stays warm. No tool_choice coercion and no nudge text.
+pub fn build_transparent_resample_request(original: &Value) -> Value {
+    let mut retry = original.clone();
+    if let Some(obj) = retry.as_object_mut() {
+        obj.insert("stream".into(), json!(false));
+    }
+    retry
+}
+
+/// Options for Phase B soft recovery.
+#[derive(Debug, Clone, Copy)]
+pub struct SoftRecoveryOpts {
+    /// Keep `prompt_cache_key` / `prompt_cache_retention` (build plane).
+    /// `previous_response_id` is still dropped when we inject synthetic input
+    /// (mixed store + new items confuses upstream).
+    pub preserve_cache_keys: bool,
+}
+
+impl Default for SoftRecoveryOpts {
+    fn default() -> Self {
+        Self {
+            preserve_cache_keys: false,
+        }
+    }
+}
+
+/// Phase B — soft recovery: pin shell tool_choice + recovery nudge.
 ///
 /// When the original request exposes tools, pin `tool_choice` to a concrete shell
 /// function (or `"required"`) so the recovery sample cannot end as pure
@@ -313,11 +374,26 @@ pub fn build_empty_completion_retry_request(
     original: &Value,
     empty_response: &Value,
 ) -> Value {
+    build_soft_recovery_request(original, empty_response, SoftRecoveryOpts::default())
+}
+
+/// Soft recovery with cache-key control (experimental build plane).
+pub fn build_soft_recovery_request(
+    original: &Value,
+    empty_response: &Value,
+    opts: SoftRecoveryOpts,
+) -> Value {
     let mut retry = original.clone();
     if let Some(obj) = retry.as_object_mut() {
         obj.insert("stream".into(), json!(false));
-        // Avoid sticky incomplete chains that may re-bias toward empty stops.
+        // Synthetic input invalidates server-side previous_response_id chains.
         obj.remove("previous_response_id");
+        if !opts.preserve_cache_keys {
+            // Console path: drop cache keys so the nudge is not mixed with a
+            // stale prefix from a failed completed turn.
+            obj.remove("prompt_cache_key");
+            obj.remove("prompt_cache_retention");
+        }
         if let Some(name) = pick_shell_tool_name(original) {
             // Pin the tool — plain "required" is often ignored by upstream Grok.
             obj.insert(
@@ -764,11 +840,56 @@ data: {"type":"response.completed","response":{"id":"r1","status":"completed","o
     }
 
     #[test]
+    fn transparent_resample_keeps_continuity_forces_non_stream() {
+        let original = json!({
+            "model": "grok-4.5",
+            "stream": true,
+            "previous_response_id": "resp_old",
+            "prompt_cache_key": "thread-1",
+            "prompt_cache_retention": "24h",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "build the pdf"}]}
+            ],
+            "tools": [{"type": "function", "name": "exec_command"}]
+        });
+        let retry = build_transparent_resample_request(&original);
+        assert_eq!(retry.get("stream").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            retry.get("previous_response_id").and_then(|v| v.as_str()),
+            Some("resp_old")
+        );
+        assert_eq!(
+            retry.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some("thread-1")
+        );
+        assert!(retry.get("tool_choice").is_none());
+        // No injected nudge messages.
+        let input = retry.get("input").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(input.len(), 1);
+    }
+
+    #[test]
+    fn classify_matches_build_reasoning_only_label() {
+        let v = json!({
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "summary": [{"text": "I need to view the reference PDF pages"}]
+            }]
+        });
+        assert_eq!(
+            classify_premature_stop(&v, Some(&tools_req())),
+            Some(PrematureStopKind::ReasoningOnly)
+        );
+    }
+
+    #[test]
     fn retry_request_appends_nudge_forces_tool_choice_and_prior_narration() {
         let original = json!({
             "model": "grok-4.5",
             "stream": true,
             "previous_response_id": "resp_old",
+            "prompt_cache_key": "thread-1",
             "input": [
                 {"role": "user", "content": [{"type": "input_text", "text": "build the pdf"}]}
             ],
@@ -792,6 +913,8 @@ data: {"type":"response.completed","response":{"id":"r1","status":"completed","o
             Some("exec_command")
         );
         assert!(retry.get("previous_response_id").is_none());
+        // Default soft path drops cache keys (console).
+        assert!(retry.get("prompt_cache_key").is_none());
         let input = retry.get("input").and_then(|v| v.as_array()).unwrap();
         let joined = input
             .iter()
@@ -802,6 +925,20 @@ data: {"type":"response.completed","response":{"id":"r1","status":"completed","o
         assert!(joined.contains("view pages"));
         assert!(joined.contains("先对照参考 PDF"));
         assert!(joined.contains("narration only"));
+
+        // Build plane soft path keeps prompt_cache_key.
+        let soft = build_soft_recovery_request(
+            &original,
+            &empty,
+            SoftRecoveryOpts {
+                preserve_cache_keys: true,
+            },
+        );
+        assert_eq!(
+            soft.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some("thread-1")
+        );
+        assert!(soft.get("previous_response_id").is_none());
     }
 
     #[test]

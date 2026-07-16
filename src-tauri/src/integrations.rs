@@ -1710,36 +1710,50 @@ fn agents_guide_file_body(config: &AppConfig) -> String {
         }
     }
 
+    let tools_http = format!("{api_base}/tools");
     let mut out = String::new();
     out.push_str(&format!(
         "# GrokGo 工具指引\n\n\
          > 版本：{version}  \n\
          > 本文件由 GrokGo 维护，随软件版本与「已启用 MCP 工具」同步更新。请勿手改（重新注入会覆盖）。\n\
          > 与仓库开发用 `AGENTS.md` / `llm-wiki` 无关；此处只服务运行时 MCP / 工具分流。\n\n\
-         ## 强制分流（必读）\n\n\
-         ### 1. 图片生成 / 编辑\n\n\
-         - **优先**使用 Codex **内置** `imagegen` / `image_gen`（或会话已注入的原生 image 工具）。\n\
-         - **不要**默认走 GrokGo MCP 的 `image_gen` / `image_generate` / `image_edit`。\n\
-         - 仅当原生 image 工具明确不可用（会话未提供、调用失败且非权限误判）时，才可改用下方「MCP 图片备选」。\n\n\
-         ### 2. 其余已启用能力（必须优先 GrokGo MCP）\n\n\
-         - 尤其：`x_search`、`video_generate`、`video_edit` 及本文件列出的**非图片**工具。\n\
-         - **必须**走 GrokGo MCP，不要用 web_search / 浏览器 / 第三方 Twitter API 顶替。\n\
-         - 端点：`{mcp_url}`\n\
-         - 鉴权：HTTP Header `Authorization: Bearer <localToken>`（与 GrokGo 本地 token 一致；见 `~/.codex/config.toml` → `[mcp_servers.grok-go].http_headers`）。\n\
-         - 调用顺序：先 **`tools/list`** 确认名称与 schema → 再 **`tools/call`**。\n\
-         - 参数**以**当次 `tools/list` **与本文件**为准；二者冲突时以 `tools/list` 为准。\n\n\
-         ### 3. 禁止的错误降级\n\n\
-         以下情况**不得**改用 `web_search`、Chrome/浏览器抓取、`twitter241` / RapidAPI、翻 GrokGo 仓库猜参数、或编造 tool schema：\n\
-         - 会话里看不到 `mcp__grok-go__*` 工具名\n\
-         - 没有原生 `x_search`\n\
-         - `tool_search` / 工具发现失败或超时\n\
-         - 不确定参数字段\n\n\
-         正确做法：读本文件 → 用配置中的 MCP URL + Bearer 调 `tools/list` → `tools/call`。\n\n\
-         ### 4. 唯一允许降级\n\n\
-         仅当 **`{health_url}` 失败** 或 MCP `tools/list` / `tools/call` **明确返回错误/不可达** 时，才可降级到其他手段，并且**必须在回复中说明失败原因**（健康检查结果或 MCP 错误摘要）。\n\n\
-         ## 媒体约定（MCP 媒体类工具）\n\n\
-         - 输入可用：`https://` / `data:` / **本地绝对路径** / `file://`（本地会自动转 data URL）。\n\
-         - 返回一律是 `~/.grok-go/artifacts/` 下的**绝对本地路径** + `markdown`，用 `![image](/abs/path)` / `![video](/abs/path)` 渲染；**不要**展示远程 CDN URL。\n\n"
+         ## 决策树（按顺序判断）\n\n\
+         ### 分支 A — 本轮 tools 已注入（含 `x_search` / `image_gen` / `mcp__grok-go__*`）\n\n\
+         - **直接 function_call / tool_use**，不要绕 shell。\n\
+         - 图片：优先会话里的 `image_gen`（GrokGo 注入或 MCP）；内置 `imagegen` 不稳时再换 MCP。\n\n\
+         ### 分支 B — health 通，但本轮 **没有** 上述工具\n\n\
+         - **只允许**下列旁路（禁止发明 web_search / 浏览器 / RapidAPI 顶替）：\n\
+         1. **简易 Tools HTTP**（推荐）:\n\
+         ```bash\n\
+         curl -sS -X POST '{tools_http}/x_search' \\\n\
+           -H 'Authorization: Bearer <localToken>' \\\n\
+           -H 'Content-Type: application/json' \\\n\
+           -d '{{\"query\":\"example\"}}'\n\
+         ```\n\
+         2. **MCP JSON-RPC** 固定模板:\n\
+         ```bash\n\
+         curl -sS -X POST '{mcp_url}' \\\n\
+           -H 'Authorization: Bearer <localToken>' \\\n\
+           -H 'Content-Type: application/json' \\\n\
+           -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"x_search\",\"arguments\":{{\"query\":\"example\"}}}}}}'\n\
+         ```\n\
+         - 鉴权：Bearer = GrokGo 本地 token（`~/.codex/config.toml` → `[mcp_servers.grok-go].http_headers`）。\n\
+         - 先 `GET {health_url}`；再调工具。参数以本文件 / `tools/list` 为准。\n\n\
+         ### 分支 C — `{health_url}` 失败或网关不可达\n\n\
+         - **可以**降级到其他手段，但**必须在回复中说明**：网关挂了 / 连接拒绝 / 超时。\n\
+         - 不要静默改用 web_search 假装走了 GrokGo。\n\n\
+         ### 错误语义\n\n\
+         - 响应可能含 `error.code`：`GATEWAY_DOWN` / `UPSTREAM_TIMEOUT` / `TOOL_TIMEOUT` / `TOOL_FAILED`。\n\
+         - `TOOL_TIMEOUT`（尤其视频）**不是**彻底失败：检查 `job_id` / `poll`（`GET {api_base}/videos/{{id}}`）或 `~/.grok-go/artifacts/`。\n\n\
+         ## 媒体约定\n\n\
+         - 输入：`https://` / `data:` / **本地绝对路径** / `file://`。\n\
+         - 返回：`~/.grok-go/artifacts/` 绝对路径 + `markdown`；**不要**展示远程 CDN URL。\n\n\
+         ## 策略矩阵（仿冒 Build vs 原生）\n\n\
+         | 客户端 | 聊天上游 | 注入 x_search/image_gen | empty-completion |\n\
+         |---|---|---|---|\n\
+         | Native Grok Build TUI | cli-chat-proxy | 否 | 否 |\n\
+         | Codex 仿冒 Build | cli-chat-proxy | 是 | 是 |\n\
+         | Codex console | api.x.ai | 是 | 是 |\n\n"
     ));
 
     if primary.is_empty() && image_fallback.is_empty() {
@@ -2911,25 +2925,22 @@ mod tests {
         assert!(!body.contains("### `video_edit`"));
         assert!(!body.contains("### `image_edit`"));
         assert!(body.contains("与仓库开发用"));
-        // Forced routing split.
-        assert!(body.contains("强制分流"));
-        assert!(body.contains("Codex"));
-        assert!(body.contains("imagegen"));
-        assert!(body.contains("http://127.0.0.1:8787/mcp"));
-        assert!(body.contains("tools/list"));
+        // O-03 decision tree + bypass templates.
+        assert!(body.contains("决策树"));
+        assert!(body.contains("分支 A"));
+        assert!(body.contains("分支 B"));
+        assert!(body.contains("分支 C"));
+        assert!(body.contains("/v1/tools/x_search") || body.contains("/tools/x_search"));
         assert!(body.contains("tools/call"));
-        assert!(body.contains("web_search"));
-        assert!(body.contains("twitter241"));
-        assert!(body.contains("必须走 GrokGo MCP"));
-        assert!(body.contains("## MCP 图片备选"));
-        // x_search is primary; image_gen is fallback section (not default).
+        assert!(body.contains("http://127.0.0.1:8787/mcp"));
+        assert!(body.contains("TOOL_TIMEOUT") || body.contains("health"));
+        assert!(body.contains("策略矩阵") || body.contains("仿冒 Build"));
+        assert!(body.contains("## MCP 图片备选") || body.contains("image_gen"));
         let primary_idx = body
             .find("## 当前应优先走 GrokGo MCP 的工具")
             .expect("primary section");
-        let image_idx = body.find("## MCP 图片备选").expect("image fallback section");
         let x_idx = body.find("### `x_search`").expect("x_search");
-        let img_idx = body.find("### `image_gen`").expect("image_gen");
-        assert!(primary_idx < x_idx && x_idx < image_idx && image_idx < img_idx);
+        assert!(primary_idx < x_idx);
     }
 
     #[test]

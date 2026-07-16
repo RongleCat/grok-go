@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -44,8 +44,12 @@ use crate::gateway::payload_optimize::{
 };
 use crate::gateway::sanitize::{
     is_compaction_blob_error, is_model_input_error, rewrite_responses_payload,
-    rewrite_sse_data_line, sanitize_responses_request, sanitize_responses_request_ex,
-    strip_opaque_context,
+    rewrite_sse_data_line, sanitize_responses_request, sanitize_responses_request_opts,
+    SanitizeOpts, strip_opaque_context,
+};
+use crate::gateway::tool_surface::{
+    plane_label, precheck_vision_in_body, short_account_tag, HDR_ACCOUNT, HDR_CACHE_MODE,
+    HDR_PLANE, HDR_THINKING, HDR_TRUNCATED, HDR_UPSTREAM_MS,
 };
 use crate::http_client::build_http_client;
 use crate::concurrency::AccountPermit;
@@ -221,10 +225,19 @@ pub async fn proxy_anthropic_count_tokens(
         }
     };
     let input_tokens = crate::gateway::anthropic::estimate_token_count(&value);
-    Json(json!({
-        "input_tokens": input_tokens
-    }))
-    .into_response()
+    let mut response = (
+        StatusCode::OK,
+        Json(json!({
+            "input_tokens": input_tokens
+        })),
+    )
+        .into_response();
+    // O-15: honest estimate label for Claude Code preflight.
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-grokgo-token-count-mode"),
+        axum::http::HeaderValue::from_static("estimate"),
+    );
+    response
 }
 
 async fn proxy_anthropic_messages_inner(
@@ -233,8 +246,8 @@ async fn proxy_anthropic_messages_inner(
     body: Bytes,
 ) -> AppResult<Response> {
     use crate::gateway::anthropic::{
-        anthropic_to_openai_chat, map_client_model, openai_chat_to_anthropic,
-        openai_error_to_anthropic, OpenAiToAnthropicSse,
+        anthropic_to_openai_chat, map_client_model, openai_chat_to_anthropic_with_thinking,
+        openai_error_to_anthropic, OpenAiToAnthropicSse, ThinkingMode,
     };
     use crate::gateway::payload_optimize::{
         enforce_chat_context_budget, optimize_responses_payload,
@@ -260,6 +273,16 @@ async fn proxy_anthropic_messages_inner(
     let mut chat_body = converted.body;
     chat_body["model"] = Value::String(resolved_model.clone());
 
+    // O-12: reject tiny vision probes with actionable error before upstream 400.
+    if let Err(msg) = precheck_vision_in_body(&chat_body) {
+        let body = crate::gateway::anthropic::anthropic_error_body("invalid_request_error", msg);
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+            .unwrap_or_else(|_| Response::new(Body::empty())));
+    }
+
     // Byte-oriented multi-turn shrink (images / huge tool outputs) — rarely
     // fires on text-only Claude Code loops (12MiB soft budget).
     let opt = optimize_responses_payload(&mut chat_body);
@@ -272,6 +295,8 @@ async fn proxy_anthropic_messages_inner(
     if budget.modified {
         budget.log_summary("/v1/messages#token-budget");
     }
+    let truncated = budget.modified || opt.modified;
+    let thinking_mode = ThinkingMode::parse(&config.anthropic_thinking_mode);
 
     let client_wants_stream = converted.stream
         || headers
@@ -415,7 +440,9 @@ async fn proxy_anthropic_messages_inner(
         // Claude Code reports those as "Connection closed mid-response" because
         // the HTTP body aborts before `message_stop`. On abort we stop the head
         // stream and still run finish() to synthesize a clean SSE trailer.
-        let converter = Arc::new(parking_lot::Mutex::new(OpenAiToAnthropicSse::new()));
+        let converter = Arc::new(parking_lot::Mutex::new(
+            OpenAiToAnthropicSse::with_thinking_mode(thinking_mode),
+        ));
         let tracker = usage_tracker.clone();
         let conv_push = converter.clone();
         let request_id_for_log = request_id.clone();
@@ -471,10 +498,19 @@ async fn proxy_anthropic_messages_inner(
                 }
             }
         }
+        insert_observability_headers(
+            response.headers_mut(),
+            plane_label(plane.build_plane, plane.experimental_impersonation, false),
+            &account.id,
+            latency_ms,
+            truncated,
+            &config.anthropic_thinking_mode,
+        );
         tracing::debug!(
             target: "gateway",
             %mapping_reason,
             model = %resolved_model,
+            thinking = %config.anthropic_thinking_mode,
             "anthropic messages stream started"
         );
         return Ok(response);
@@ -500,7 +536,7 @@ async fn proxy_anthropic_messages_inner(
     });
 
     let (out_status, out_value) = if status.is_success() {
-        match openai_chat_to_anthropic(&upstream_json) {
+        match openai_chat_to_anthropic_with_thinking(&upstream_json, thinking_mode) {
             Ok(v) => (StatusCode::OK, v),
             Err(err) => (
                 StatusCode::BAD_GATEWAY,
@@ -572,7 +608,50 @@ async fn proxy_anthropic_messages_inner(
         .body(Body::from(serde_json::to_vec(&out_value)?))
         .unwrap_or_else(|_| Response::new(Body::empty()));
     copy_safe_headers(upstream_headers, response.headers_mut());
+    insert_observability_headers(
+        response.headers_mut(),
+        plane_label(plane.build_plane, plane.experimental_impersonation, false),
+        &account.id,
+        started.elapsed().as_millis() as u64,
+        truncated,
+        &config.anthropic_thinking_mode,
+    );
+    // O-16: cache_control is not full Anthropic semantics on this path.
+    if let Ok(hv) = HeaderValue::from_str("upstream-prefix-only") {
+        response.headers_mut().insert(
+            HeaderName::from_static(HDR_CACHE_MODE),
+            hv,
+        );
+    }
     Ok(response)
+}
+
+fn insert_observability_headers(
+    headers: &mut axum::http::HeaderMap,
+    plane: &str,
+    account_id: &str,
+    upstream_ms: u64,
+    truncated: bool,
+    thinking_mode: &str,
+) {
+    if let Ok(hv) = HeaderValue::from_str(plane) {
+        headers.insert(HeaderName::from_static(HDR_PLANE), hv);
+    }
+    if let Ok(hv) = HeaderValue::from_str(&short_account_tag(account_id)) {
+        headers.insert(HeaderName::from_static(HDR_ACCOUNT), hv);
+    }
+    if let Ok(hv) = HeaderValue::from_str(&upstream_ms.to_string()) {
+        headers.insert(HeaderName::from_static(HDR_UPSTREAM_MS), hv);
+    }
+    if truncated {
+        headers.insert(
+            HeaderName::from_static(HDR_TRUNCATED),
+            HeaderValue::from_static("1"),
+        );
+    }
+    if let Ok(hv) = HeaderValue::from_str(thinking_mode) {
+        headers.insert(HeaderName::from_static(HDR_THINKING), hv);
+    }
 }
 
 async fn proxy_json_inner(
@@ -664,9 +743,17 @@ async fn proxy_json_inner(
                 || path.ends_with("/responses/compact");
             let is_chat = path.contains("/chat/completions");
             if is_responses {
-                // Build plane: keep previous_response_id / prompt_cache_retention for
-                // cli-chat-proxy continuity. Codex console path still strips them.
-                let sanitized = sanitize_responses_request_ex(&mut value, build_plane);
+                // Continuity and tool inject are independent:
+                // - native Build: preserve, no inject
+                // - experimental Build: preserve + compact Codex tools
+                // - console: strip continuity + full inject
+                let sanitized = sanitize_responses_request_opts(
+                    &mut value,
+                    SanitizeOpts {
+                        preserve_native_continuity: build_plane,
+                        inject_codex_compat_tools: plane.inject_codex_compat_tools,
+                    },
+                );
                 custom_tool_names = sanitized.custom_tool_names;
                 has_image_gen_tools = sanitized.has_image_gen_tools;
                 if sanitized.modified {
@@ -989,6 +1076,14 @@ async fn proxy_json_inner(
         let body = Body::from_stream(stream);
         let mut response = Response::builder().status(status).body(body).unwrap_or_else(|_| Response::new(Body::empty()));
         copy_safe_headers(upstream_headers, response.headers_mut());
+        insert_observability_headers(
+            response.headers_mut(),
+            plane_label(plane.build_plane, plane.experimental_impersonation, plane.media_path),
+            &account.id,
+            latency_ms,
+            false,
+            "",
+        );
         return Ok(response);
     }
 
@@ -1234,6 +1329,14 @@ async fn proxy_json_inner(
         .body(Body::from(bytes))
         .unwrap_or_else(|_| Response::new(Body::empty()));
     copy_safe_headers(upstream_headers, response.headers_mut());
+    insert_observability_headers(
+        response.headers_mut(),
+        plane_label(plane.build_plane, plane.experimental_impersonation, plane.media_path),
+        &account.id,
+        started.elapsed().as_millis() as u64,
+        false,
+        "",
+    );
     Ok(response)
 }
 

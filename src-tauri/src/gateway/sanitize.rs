@@ -34,6 +34,39 @@ pub struct SanitizeResult {
     pub has_image_gen_tools: bool,
 }
 
+/// Options for Responses sanitize (continuity vs tool injection are independent).
+#[derive(Debug, Clone, Copy)]
+pub struct SanitizeOpts {
+    /// Keep previous_response_id / cache keys (cli-chat-proxy / Build plane).
+    pub preserve_native_continuity: bool,
+    /// Inject Codex-compat tools. Console: full set (x_search+web_search+image_gen).
+    /// Experimental Build: compact set (x_search+image_gen). Native TUI: false.
+    pub inject_codex_compat_tools: bool,
+}
+
+impl SanitizeOpts {
+    pub fn console() -> Self {
+        Self {
+            preserve_native_continuity: false,
+            inject_codex_compat_tools: true,
+        }
+    }
+
+    pub fn native_build() -> Self {
+        Self {
+            preserve_native_continuity: true,
+            inject_codex_compat_tools: false,
+        }
+    }
+
+    pub fn experimental_build() -> Self {
+        Self {
+            preserve_native_continuity: true,
+            inject_codex_compat_tools: true,
+        }
+    }
+}
+
 /// Sanitize a Responses API request body before forwarding to xAI.
 ///
 /// `preserve_native_continuity`: when true (Grok Build / cli-chat-proxy plane),
@@ -41,20 +74,38 @@ pub struct SanitizeResult {
 /// SuperGrok path can reuse server-side state and prompt cache. Codex → console
 /// API still strips them (`false`) because that path re-sends full history.
 pub fn sanitize_responses_request(value: &mut Value) -> SanitizeResult {
-    sanitize_responses_request_ex(value, false)
+    sanitize_responses_request_opts(value, SanitizeOpts::console())
 }
 
 /// Same as [`sanitize_responses_request`] with continuity-preservation control.
 ///
-/// When `preserve_native_continuity` is true (Grok Build / cli-chat-proxy):
-/// - **do not strip** any top-level continuity / OpenAI-compat keys
-/// - **do not inject** Codex-only tools (`x_search` / `web_search` / `image_gen`)
-/// - still convert `custom` tools if present (harmless if none)
+/// When `preserve_native_continuity` is true without inject (native Grok Build TUI):
+/// - **do not strip** continuity keys
+/// - **do not inject** Codex-only tools
+///
+/// Prefer [`sanitize_responses_request_opts`] when inject and preserve differ
+/// (experimental Build: preserve + inject).
 pub fn sanitize_responses_request_ex(
     value: &mut Value,
     preserve_native_continuity: bool,
 ) -> SanitizeResult {
+    sanitize_responses_request_opts(
+        value,
+        SanitizeOpts {
+            preserve_native_continuity,
+            // Legacy: preserve ⇒ no inject (native Build). Console: inject.
+            inject_codex_compat_tools: !preserve_native_continuity,
+        },
+    )
+}
+
+/// Full control sanitize for dual-plane experimental routing.
+pub fn sanitize_responses_request_opts(
+    value: &mut Value,
+    opts: SanitizeOpts,
+) -> SanitizeResult {
     let mut result = SanitizeResult::default();
+    let preserve_native_continuity = opts.preserve_native_continuity;
 
     // Console API (Codex): xAI does not honor OpenAI previous_response_id store
     // semantics via this proxy — strip so clients re-send full history cleanly.
@@ -107,8 +158,8 @@ pub fn sanitize_responses_request_ex(
         *tools = next;
     }
 
-    // Codex custom-provider sessions omit built-ins — only inject for non-build plane.
-    if !preserve_native_continuity {
+    // Ensure tools array exists when we will inject (console + experimental).
+    if opts.inject_codex_compat_tools {
         let needs_tools = value
             .get("tools")
             .and_then(|t| t.as_array())
@@ -122,12 +173,13 @@ pub fn sanitize_responses_request_ex(
         }
     }
 
-    // Ensure X / web search + image_gen when tools are present (Codex agent loops).
-    // Custom providers never get official built-in `image_gen`; we inject a function tool
-    // and fulfill it server-side with Grok Imagine.
-    // Grok Build ships its own tool list — never inject extras on that plane.
-    if !preserve_native_continuity {
+    // Inject Codex-compat tools when requested.
+    // Console: x_search + web_search + image_gen (full set).
+    // Experimental Build: compact x_search + image_gen (stable order for cache).
+    // Native Build TUI: never.
+    if opts.inject_codex_compat_tools {
         if let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            let compact = preserve_native_continuity; // experimental: preserve + inject
             let has_x = tools.iter().any(|t| {
                 matches!(
                     t.get("type").and_then(|v| v.as_str()),
@@ -136,7 +188,9 @@ pub fn sanitize_responses_request_ex(
             });
             if !has_x {
                 tools.push(json!({"type": "x_search"}));
-                tools.push(json!({"type": "web_search"}));
+                if !compact {
+                    tools.push(json!({"type": "web_search"}));
+                }
                 result.modified = true;
             }
 

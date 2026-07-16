@@ -115,6 +115,8 @@ pub fn build_router(state: GatewayState) -> Router {
         .route("/v1/videos/edits", post(video_edits))
         // Deferred video job poll (account-sticky via job_affinity).
         .route("/v1/videos/{request_id}", get(video_job_status))
+        // O-02: simple tools HTTP API (same backend as MCP tools/call).
+        .route("/v1/tools/{name}", post(tools_http_call))
         // xAI Files API proxy — upload once, reference by file_id in Responses.
         .route("/v1/files", any(files_collection))
         .route("/v1/files/{file_id}", any(files_item))
@@ -134,6 +136,9 @@ async fn health(State(state): State<GatewayState>) -> Json<Value> {
     let running = *state.running.lock().await;
     let addr = *state.actual_addr.lock().await;
     let config = load_config().unwrap_or_default();
+    let store = load_auth().unwrap_or_default();
+    let accounts_routable = crate::router::routable_account_count(&store);
+    let accounts_total = store.accounts.len();
     Json(json!({
         "ok": true,
         "running": running,
@@ -141,7 +146,83 @@ async fn health(State(state): State<GatewayState>) -> Json<Value> {
         "port": config.actual_port,
         "lanEnabled": config.lan_enabled,
         "requireToken": config.require_token,
+        // O-18
+        "accountsRoutable": accounts_routable,
+        "accountsTotal": accounts_total,
+        "experimentalImpersonateGrokBuild": config.experimental_impersonate_grok_build,
+        "anthropicThinkingMode": config.anthropic_thinking_mode,
     }))
+}
+
+/// O-02: `POST /v1/tools/{name}` — body = tool arguments JSON object.
+async fn tools_http_call(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(err) => {
+            return layered_error_response(
+                crate::gateway::error_codes::classify_transport_error(&err.to_string()),
+            );
+        }
+    };
+    if let Err(resp) = authorize_request(&headers, &config).await {
+        return resp;
+    }
+    let args: Value = if body.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                return layered_error_response(crate::gateway::error_codes::invalid_request(
+                    format!("invalid JSON body: {err}"),
+                    "Body must be a JSON object of tool arguments.",
+                ));
+            }
+        }
+    };
+    let mut args = args;
+    let _ = crate::gateway::tool_surface::coerce_mcp_tool_arguments(&mut args);
+    let params = json!({"name": name, "arguments": args});
+    match handle_tool_call(&state, &config, params).await {
+        Ok(value) => {
+            // Prefer structured envelope when present in MCP content text.
+            if let Some(text) = value
+                .pointer("/content/0/text")
+                .and_then(|t| t.as_str())
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    if parsed.get("ok").is_some() {
+                        return Json(parsed).into_response();
+                    }
+                }
+            }
+            Json(json!({
+                "ok": true,
+                "tool": name,
+                "result": value,
+            }))
+            .into_response()
+        }
+        Err(err) => {
+            let layered = crate::gateway::error_codes::classify_transport_error(&err.to_string());
+            // Tool failures that aren't transport: wrap as TOOL_FAILED
+            let layered = if layered.code == crate::gateway::error_codes::UPSTREAM_ERROR {
+                crate::gateway::error_codes::tool_failed(&name, err.to_string())
+            } else {
+                layered
+            };
+            (
+                StatusCode::from_u16(layered.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(layered.tool_envelope(&name)),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn models(State(_state): State<GatewayState>, headers: HeaderMap) -> Response {
@@ -873,7 +954,9 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
             "MCP tool `{name}` is disabled in GrokGo settings"
         )));
     }
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // O-13: coerce whole floats (e.g. session_id: 60619.0) to integers.
+    let _ = crate::gateway::tool_surface::coerce_mcp_tool_arguments(&mut args);
     match name {
         "x_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or_default();
@@ -888,9 +971,13 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "tools": [tool]
             });
             let up = call_upstream(state, config, "/responses", body, "mcp-x_search").await?;
-            Ok(json!({
-                "content": [{"type": "text", "text": serde_json::to_string_pretty(&up.value)?}]
-            }))
+            let envelope = crate::gateway::error_codes::tool_ok_envelope(
+                name,
+                "x_search completed",
+                &[],
+                Some(up.value.clone()),
+            );
+            Ok(crate::gateway::error_codes::mcp_content_from_envelope(&envelope))
         }
         // Codex skill looks for `image_gen`; keep `image_generate` as alias.
         "image_gen" | "image_generate" => {
@@ -1007,17 +1094,61 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
             }
 
             // Submit + poll must use the same OAuth account (job is account-scoped).
+            // O-07: clients may pass wait=false to get job_id immediately and poll
+            // GET /v1/videos/{request_id} (existing affinity route).
+            let wait = args
+                .get("wait")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             let up = call_upstream(state, config, "/videos/generations", body, "mcp-video").await?;
-            let final_resp = resolve_video_job(state, config, &up.value, &up.account).await?;
-            let client = state.proxy.client();
-            let files = materialize_video_response(&client, &final_resp).await?;
-            if files.is_empty() {
-                return Err(AppError::msg(format!(
-                    "video generated but failed to materialize local files; upstream={final_resp}"
-                )));
+            let request_id = up
+                .value
+                .get("request_id")
+                .or_else(|| up.value.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if !wait {
+                if let Some(rid) = request_id.as_deref() {
+                    crate::gateway::job_affinity::remember_video_job(rid, &up.account.id);
+                    let envelope = json!({
+                        "ok": true,
+                        "tool": name,
+                        "summary": "video job submitted; poll for completion",
+                        "job_id": rid,
+                        "poll": format!("/v1/videos/{rid}"),
+                        "artifacts": [],
+                        "error": null,
+                        "raw": up.value,
+                    });
+                    return Ok(crate::gateway::error_codes::mcp_content_from_envelope(&envelope));
+                }
             }
-            let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
-            Ok(mcp_media_content(&summary))
+            match resolve_video_job(state, config, &up.value, &up.account).await {
+                Ok(final_resp) => {
+                    let client = state.proxy.client();
+                    let files = materialize_video_response(&client, &final_resp).await?;
+                    if files.is_empty() {
+                        return Err(AppError::msg(format!(
+                            "video generated but failed to materialize local files; upstream={final_resp}"
+                        )));
+                    }
+                    let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
+                    Ok(mcp_media_content(&summary))
+                }
+                Err(err) => {
+                    // O-05: timeout ≠ permanent failure
+                    let msg = err.to_string();
+                    if msg.to_ascii_lowercase().contains("timed out") {
+                        let arts = recent_video_artifacts(3);
+                        return Ok(crate::gateway::error_codes::tool_timeout_mcp_result(
+                            name,
+                            request_id.as_deref(),
+                            &arts,
+                        ));
+                    }
+                    Err(err)
+                }
+            }
         }
         "video_edit" => {
             let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or_default();
@@ -1041,19 +1172,47 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "video": {"url": video_url}
             });
             let up = call_upstream(state, config, "/videos/edits", body, "mcp-video").await?;
-            let final_resp = resolve_video_job(state, config, &up.value, &up.account).await?;
-            let client = state.proxy.client();
-            let files = materialize_video_response(&client, &final_resp).await?;
-            if files.is_empty() {
-                return Err(AppError::msg(format!(
-                    "video edit succeeded but failed to materialize local files; upstream={final_resp}"
-                )));
+            let request_id = up
+                .value
+                .get("request_id")
+                .or_else(|| up.value.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            match resolve_video_job(state, config, &up.value, &up.account).await {
+                Ok(final_resp) => {
+                    let client = state.proxy.client();
+                    let files = materialize_video_response(&client, &final_resp).await?;
+                    if files.is_empty() {
+                        return Err(AppError::msg(format!(
+                            "video edit succeeded but failed to materialize local files; upstream={final_resp}"
+                        )));
+                    }
+                    let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
+                    Ok(mcp_media_content(&summary))
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.to_ascii_lowercase().contains("timed out") {
+                        let arts = recent_video_artifacts(3);
+                        return Ok(crate::gateway::error_codes::tool_timeout_mcp_result(
+                            name,
+                            request_id.as_deref(),
+                            &arts,
+                        ));
+                    }
+                    Err(err)
+                }
             }
-            let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
-            Ok(mcp_media_content(&summary))
         }
         _ => Err(AppError::msg(format!("unknown tool: {name}"))),
     }
+}
+
+fn recent_video_artifacts(limit: usize) -> Vec<String> {
+    let Ok(dir) = crate::paths::artifacts_dir() else {
+        return Vec::new();
+    };
+    crate::gateway::tool_surface::recent_artifacts(&dir, Some("mp4"), limit)
 }
 
 /// Result of one upstream POST, including the account that made it (needed for sticky video poll).
@@ -1188,7 +1347,29 @@ async fn call_upstream(
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {
-    (status, Json(json!({"error": {"message": message}}))).into_response()
+    let layered = crate::gateway::error_codes::classify_transport_error(&message);
+    // Preserve caller status when it is a deliberate HTTP code (auth etc.).
+    let st = if status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::FORBIDDEN
+        || status == StatusCode::BAD_REQUEST
+    {
+        status
+    } else {
+        StatusCode::from_u16(layered.status).unwrap_or(status)
+    };
+    let mut body = layered.openai_body();
+    if let Some(obj) = body.get_mut("error").and_then(|e| e.as_object_mut()) {
+        obj.insert("message".into(), json!(message));
+    }
+    (st, Json(body)).into_response()
+}
+
+fn layered_error_response(err: crate::gateway::error_codes::LayeredError) -> Response {
+    (
+        StatusCode::from_u16(err.status).unwrap_or(StatusCode::BAD_GATEWAY),
+        Json(err.openai_body()),
+    )
+        .into_response()
 }
 
 

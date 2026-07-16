@@ -2,8 +2,38 @@
 
 use serde_json::{json, Value};
 
+/// How reasoning is exposed on the Anthropic Messages path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingMode {
+    /// Do not emit thinking blocks (default — better TTFT for Claude Code).
+    #[default]
+    Hide,
+    /// Forward full reasoning as thinking blocks.
+    Passthrough,
+    /// Emit a short summary thinking block only.
+    Summary,
+}
+
+impl ThinkingMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "passthrough" | "pass" | "full" => Self::Passthrough,
+            "summary" => Self::Summary,
+            _ => Self::Hide,
+        }
+    }
+}
+
 /// Convert a non-streaming OpenAI chat completion JSON body to Anthropic Messages.
 pub fn openai_chat_to_anthropic(body: &Value) -> Result<Value, String> {
+    openai_chat_to_anthropic_with_thinking(body, ThinkingMode::Hide)
+}
+
+/// Same as [`openai_chat_to_anthropic`] with explicit thinking mode.
+pub fn openai_chat_to_anthropic_with_thinking(
+    body: &Value,
+    thinking: ThinkingMode,
+) -> Result<Value, String> {
     // Pass through Anthropic-shaped errors if we already rewrote them.
     if body.get("type").and_then(|t| t.as_str()) == Some("error") {
         return Ok(body.clone());
@@ -22,17 +52,30 @@ pub fn openai_chat_to_anthropic(body: &Value) -> Result<Value, String> {
 
     let mut content: Vec<Value> = Vec::new();
 
-    // Optional reasoning → thinking block (harmless if Claude Code ignores it).
-    if let Some(reasoning) = message
-        .get("reasoning_content")
-        .or_else(|| message.get("reasoning"))
-        .and_then(|r| r.as_str())
-    {
-        if !reasoning.is_empty() {
-            content.push(json!({
-                "type": "thinking",
-                "thinking": reasoning
-            }));
+    // Optional reasoning → thinking block (controlled by ThinkingMode).
+    if thinking != ThinkingMode::Hide {
+        if let Some(reasoning) = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(|r| r.as_str())
+        {
+            if !reasoning.is_empty() {
+                let text = match thinking {
+                    ThinkingMode::Summary => {
+                        let t = reasoning.trim();
+                        if t.chars().count() > 240 {
+                            format!("{}…", t.chars().take(240).collect::<String>())
+                        } else {
+                            t.to_string()
+                        }
+                    }
+                    _ => reasoning.to_string(),
+                };
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": text
+                }));
+            }
         }
     }
 
@@ -261,6 +304,35 @@ mod tests {
         assert_eq!(out["stop_reason"], "end_turn");
         assert_eq!(out["usage"]["input_tokens"], 3);
         assert!(out["id"].as_str().unwrap().starts_with("msg_"));
+    }
+
+    #[test]
+    fn hide_thinking_omits_reasoning_blocks() {
+        let body = json!({
+            "id": "chatcmpl-2",
+            "model": "grok-4.5",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_content": "long chain of thought"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let hidden = openai_chat_to_anthropic_with_thinking(&body, ThinkingMode::Hide).unwrap();
+        assert!(hidden["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking")));
+        let pass = openai_chat_to_anthropic_with_thinking(&body, ThinkingMode::Passthrough).unwrap();
+        assert!(pass["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")));
     }
 
     #[test]

@@ -271,8 +271,23 @@ fn convert_message(role: &str, content: Option<&Value>) -> Result<Vec<Value>, St
             "thinking" | "redacted_thinking" => {
                 // Drop — xAI chat path has no Anthropic thinking wire format.
             }
-            _ => {
-                // Ignore unknown blocks (cache_control-only, document, …).
+            "document" => {
+                // O-17: high-risk silent drop → explicit error
+                return Err(
+                    "document content blocks are not supported on GrokGo Anthropic path; extract text client-side or attach as image/text"
+                        .into(),
+                );
+            }
+            "" => {
+                // cache_control-only or typeless — ignore
+            }
+            other => {
+                // O-17: log unknown blocks (do not silently invent support)
+                tracing::warn!(
+                    target: "gateway",
+                    block_type = other,
+                    "unknown Anthropic content block dropped"
+                );
             }
         }
     }

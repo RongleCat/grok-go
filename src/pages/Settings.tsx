@@ -828,6 +828,24 @@ export function SettingsPage() {
                     }
                   />
                 </div>
+                <div className="md:col-span-2">
+                  <Label className="text-sm font-medium">
+                    {t.settings.anthropicThinkingMode}
+                  </Label>
+                  <select
+                    className="mt-1 w-full rounded-md border border-neutral-200 bg-white px-3 py-2 text-sm"
+                    value={config.anthropicThinkingMode ?? "hide"}
+                    onChange={(e) =>
+                      void applyPatch({ anthropicThinkingMode: e.target.value })
+                    }
+                  >
+                    <option value="hide">{t.settings.anthropicThinkingHide}</option>
+                    <option value="passthrough">
+                      {t.settings.anthropicThinkingPassthrough}
+                    </option>
+                    <option value="summary">{t.settings.anthropicThinkingSummary}</option>
+                  </select>
+                </div>
               </CardContent>
             </Card>
           </div>

@@ -73,6 +73,8 @@ export type AppConfig = {
    * with Grok Build identity headers. Default false.
    */
   experimentalImpersonateGrokBuild?: boolean;
+  /** Anthropic Messages path: hide | passthrough | summary. Default hide. */
+  anthropicThinkingMode?: string;
   oauthRedirectPort: number;
   /** When true, upstream xAI / OAuth requests use httpProxyUrl. Default false. */
   httpProxyEnabled: boolean;

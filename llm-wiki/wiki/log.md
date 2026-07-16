@@ -1,5 +1,28 @@
 # Wiki 日志
 
+## 2026-07-16（仿冒 Build 综合优化 O-01–O-19）
+
+- 回滚点：git tag `pre-experimental-opt/2026-07-16` → `f0b4c44`
+- 方案：`docs/experimental-build-optimization-plan.md`
+- **O-01** 实验仿冒面 `inject_codex_compat_tools`：sanitize 在 preserve continuity 下注入 `x_search`+`image_gen`；native TUI 仍不注
+- **O-02** `POST /v1/tools/{name}`（同 MCP handle_tool_call + local token）
+- **O-03** agents-guide 决策树 A/B/C + Tools HTTP / MCP 旁路模板 + 策略矩阵
+- **O-04** `gateway/error_codes.rs`：GATEWAY_DOWN / UPSTREAM_TIMEOUT / TOOL_TIMEOUT / …
+- **O-05** 视频 poll 超时 → TOOL_TIMEOUT envelope（retryable + job_id/artifacts）
+- **O-06** `anthropicThinkingMode` 默认 hide；Settings 可切换
+- **O-07** `wait=false` 提交即返 `poll=/v1/videos/{id}`；复用 job_affinity
+- **O-08/09** 响应头 plane/account/ms/truncated/thinking-mode
+- **O-10** Claude haiku/sonnet/opus 分档映射
+- **O-11** tool result envelope（ok/tool/artifacts/error）
+- **O-12** 入站图片尺寸预检（≥8px）
+- **O-13** MCP args 整浮点 coerce
+- **O-14/19** Settings 仿冒开关 + thinking；agents-guide 策略矩阵
+- **O-15** count_tokens 头 `x-grokgo-token-count-mode: estimate`
+- **O-16** Anthropic 路径 `x-grokgo-cache-mode: upstream-prefix-only`
+- **O-17** document block 400；未知 content block 打 warn
+- **O-18** `/health` → `accountsRoutable` / `accountsTotal`
+- 模块：`error_codes.rs`、`tool_surface.rs`；`cargo test --lib` 197 ok
+
 ## 2026-07-16（实验：仿冒 Grok Build 双平面）
 
 - 配置：`experimentalImpersonateGrokBuild`（默认 false）；设置页「流量分配」开关。

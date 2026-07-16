@@ -70,6 +70,10 @@ pub struct PlaneDecision {
     /// On for console **and** experimental impersonation; off only for **native**
     /// Grok Build TUI (its own agent loop handles tools).
     pub apply_empty_completion_recovery: bool,
+    /// Inject compact Codex-compat tools (`x_search`, `image_gen`) into Responses.
+    /// True for console and **experimental** impersonation; **false** for native Build TUI
+    /// (preserves official tool list / prefix cache).
+    pub inject_codex_compat_tools: bool,
     /// Path is image/video media (always console upstream).
     pub media_path: bool,
 }
@@ -158,6 +162,7 @@ pub fn decide_plane(config: &AppConfig, headers: &HeaderMap, path: &str) -> Plan
             apply_codex_console_guards: false,
             // Media is not an agent tool loop; no empty-completion recovery.
             apply_empty_completion_recovery: false,
+            inject_codex_compat_tools: false,
             media_path: true,
         };
     }
@@ -187,6 +192,8 @@ pub fn decide_plane(config: &AppConfig, headers: &HeaderMap, path: &str) -> Plan
         apply_codex_console_guards: !build,
         // Codex via experimental build still needs premature-stop recovery.
         apply_empty_completion_recovery: !native,
+        // Console always; experimental Build fills the tool vacuum; native TUI never.
+        inject_codex_compat_tools: !native,
         media_path: false,
     }
 }
@@ -554,6 +561,7 @@ mod tests {
         assert_eq!(d.upstream_base, "https://api.x.ai/v1");
         assert!(d.apply_codex_console_guards);
         assert!(d.apply_empty_completion_recovery);
+        assert!(d.inject_codex_compat_tools);
         assert!(d.allow_files_offload);
         assert!(!d.inject_build_headers);
         assert!(d.client_source_override.is_none());
@@ -570,8 +578,9 @@ mod tests {
         assert_eq!(d.upstream_base, "https://cli-chat-proxy.grok.com/v1");
         assert_eq!(d.client_source_override, Some(NATIVE_BUILD_SOURCE));
         assert!(!d.apply_codex_console_guards);
-        // Native Grok Build TUI: no Codex empty-completion recovery.
+        // Native Grok Build TUI: no Codex empty-completion recovery / tool inject.
         assert!(!d.apply_empty_completion_recovery);
+        assert!(!d.inject_codex_compat_tools);
         assert!(!d.allow_files_offload);
     }
 
@@ -593,6 +602,7 @@ mod tests {
             assert!(!d.apply_codex_console_guards, "path {path}");
             // ...but Codex premature-stop recovery stays on (session 019f6852 regression).
             assert!(d.apply_empty_completion_recovery, "path {path}");
+            assert!(d.inject_codex_compat_tools, "path {path}");
             assert!(!d.allow_files_offload);
         }
     }
@@ -850,7 +860,7 @@ mod tests {
 
     #[test]
     fn responses_sanitize_preserves_tools_and_vision_on_build_plane() {
-        use crate::gateway::sanitize::sanitize_responses_request_ex;
+        use crate::gateway::sanitize::{sanitize_responses_request_ex, sanitize_responses_request_opts, SanitizeOpts};
         let mut body = json!({
             "model": "grok-4.5",
             "previous_response_id": "resp_1",
@@ -870,6 +880,7 @@ mod tests {
         });
         assert!(body_has_vision_input(&body));
         assert!(body_has_tools(&body));
+        // Native preserve: no inject
         let r = sanitize_responses_request_ex(&mut body, true);
         assert!(!r.modified || body.get("previous_response_id").is_some());
         assert_eq!(
@@ -878,6 +889,30 @@ mod tests {
         );
         assert!(body_has_tools(&body));
         assert!(body_has_vision_input(&body));
+        assert_eq!(body["tools"].as_array().map(|a| a.len()), Some(1));
+
+        // Experimental: preserve continuity + inject codex compat
+        let mut exp = body.clone();
+        let r2 = sanitize_responses_request_opts(
+            &mut exp,
+            SanitizeOpts {
+                preserve_native_continuity: true,
+                inject_codex_compat_tools: true,
+            },
+        );
+        assert!(r2.modified);
+        assert_eq!(
+            exp.get("previous_response_id").and_then(|v| v.as_str()),
+            Some("resp_1")
+        );
+        let types: Vec<_> = exp["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("type").and_then(|v| v.as_str()))
+            .collect();
+        assert!(types.contains(&"x_search"));
+        assert!(types.iter().any(|t| *t == "function" || *t == "image_gen" || *t == "image_generation") || exp["tools"].as_array().unwrap().iter().any(|t| t.get("name").and_then(|n| n.as_str()) == Some("image_gen")));
     }
 
     #[test]

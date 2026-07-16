@@ -75,6 +75,10 @@ export type AppConfig = {
   experimentalImpersonateGrokBuild?: boolean;
   /** Anthropic Messages path: hide | passthrough | summary. Default hide. */
   anthropicThinkingMode?: string;
+  /** Request log auto-prune retention (days). Default 30. */
+  logRetentionDays?: number;
+  /** Max log rows; 0 = unlimited. Default 50000. */
+  logMaxRows?: number;
   oauthRedirectPort: number;
   /** When true, upstream xAI / OAuth requests use httpProxyUrl. Default false. */
   httpProxyEnabled: boolean;
@@ -216,6 +220,16 @@ export type HeatmapDay = {
   costUsd: number;
 };
 
+export type LogStoreStats = {
+  totalRows: number;
+  oldestAt?: string | null;
+  newestAt?: string | null;
+  dbBytes: number;
+  retentionDays: number;
+  /** 0 = unlimited row cap */
+  maxRows: number;
+};
+
 export type IntegrationStatus = {
   codexMcpInjected: boolean;
   codexConfigPath: string;
@@ -310,6 +324,12 @@ export const api = {
     invoke<RequestLog[]>("get_recent_logs", { limit, offset }),
   getHeatmap: (days = 371) => invoke<HeatmapDay[]>("get_heatmap", { days }),
   clearLogs: () => invoke<void>("clear_logs"),
+  getLogStats: () => invoke<LogStoreStats>("get_log_stats"),
+  clearLogsOlderThan: (olderThanDays: number) =>
+    invoke<number>("clear_logs_older_than", { olderThanDays }),
+  clearLogsRange: (from: string, to: string) =>
+    invoke<number>("clear_logs_range", { from, to }),
+  pruneLogsNow: () => invoke<LogStoreStats>("prune_logs_now"),
   getIntegrations: () => invoke<IntegrationStatus>("get_integrations"),
   setMcpInject: (enabled: boolean) => invoke<IntegrationStatus>("set_mcp_inject", { enabled }),
   injectAgentsGuide: () => invoke<IntegrationStatus>("inject_agents_guide"),

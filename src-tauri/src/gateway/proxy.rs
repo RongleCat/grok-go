@@ -443,7 +443,7 @@ async fn proxy_anthropic_messages_inner(
             Some(converted.requested_model.clone()),
             Some(resolved_model.clone()),
             status.as_u16(),
-            latency_ms,
+            started,
             client_source.clone(),
             config.session_affinity,
             config.session_affinity_ttl_secs,
@@ -1144,7 +1144,7 @@ async fn proxy_json_inner(
             requested_model.clone(),
             resolved_model.clone(),
             status.as_u16(),
-            latency_ms,
+            started,
             effective_source.to_string(),
             config.session_affinity,
             config.session_affinity_ttl_secs,
@@ -2504,7 +2504,8 @@ struct StreamUsageTracker {
     requested_model: Option<String>,
     resolved_model: Option<String>,
     status_code: u16,
-    latency_ms: u64,
+    /// Wall-clock start of the client request (for total latency + first token).
+    started: Instant,
     client_source: String,
     session_affinity: bool,
     session_affinity_ttl_secs: u64,
@@ -2512,6 +2513,8 @@ struct StreamUsageTracker {
     input: AtomicU64,
     output: AtomicU64,
     cache: AtomicU64,
+    /// 0 = not yet seen; else ms from `started` to first body chunk.
+    first_token_ms: AtomicU64,
     logged: AtomicBool,
     /// Carry incomplete UTF-8 / partial SSE lines across chunks.
     pending: parking_lot::Mutex<String>,
@@ -2526,7 +2529,7 @@ impl StreamUsageTracker {
         requested_model: Option<String>,
         resolved_model: Option<String>,
         status_code: u16,
-        latency_ms: u64,
+        started: Instant,
         client_source: String,
         session_affinity: bool,
         session_affinity_ttl_secs: u64,
@@ -2539,7 +2542,7 @@ impl StreamUsageTracker {
             requested_model,
             resolved_model,
             status_code,
-            latency_ms,
+            started,
             client_source,
             session_affinity,
             session_affinity_ttl_secs,
@@ -2547,12 +2550,22 @@ impl StreamUsageTracker {
             input: AtomicU64::new(0),
             output: AtomicU64::new(0),
             cache: AtomicU64::new(0),
+            first_token_ms: AtomicU64::new(0),
             logged: AtomicBool::new(false),
             pending: parking_lot::Mutex::new(String::new()),
         }
     }
 
     fn note_chunk(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            let ms = self.started.elapsed().as_millis() as u64;
+            let _ = self.first_token_ms.compare_exchange(
+                0,
+                ms.max(1),
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            );
+        }
         let chunk = String::from_utf8_lossy(bytes);
         let mut pending = self.pending.lock();
         pending.push_str(&chunk);
@@ -2653,6 +2666,9 @@ impl StreamUsageTracker {
         } else {
             None
         };
+        let total_ms = self.started.elapsed().as_millis() as u64;
+        let ft = self.first_token_ms.load(AtomicOrdering::Relaxed);
+        let first_token_ms = if ft > 0 { Some(ft) } else { None };
         log_request(
             &self.request_id,
             self.account_id.clone(),
@@ -2660,8 +2676,8 @@ impl StreamUsageTracker {
             self.requested_model.clone(),
             self.resolved_model.clone(),
             self.status_code,
-            self.latency_ms,
-            None,
+            total_ms,
+            first_token_ms,
             input,
             output,
             cache,

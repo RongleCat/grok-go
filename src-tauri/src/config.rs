@@ -93,6 +93,12 @@ pub struct AppConfig {
     /// `POST /v1/tools/video_generate` still defaults wait=true (human/curl sync).
     #[serde(default)]
     pub mcp_video_wait_default: bool,
+    /// Request log retention in days (auto-prune). Default 30. Minimum 1.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    /// Max request_log rows kept (oldest dropped first). Default 50_000. 0 = no row cap.
+    #[serde(default = "default_log_max_rows")]
+    pub log_max_rows: u32,
     #[serde(default = "default_oauth_redirect_port")]
     pub oauth_redirect_port: u16,
     /// When true, upstream xAI/OAuth HTTP goes through `http_proxy_url`.
@@ -215,6 +221,14 @@ fn default_anthropic_thinking_mode() -> String {
     "hide".into()
 }
 
+fn default_log_retention_days() -> u32 {
+    30
+}
+
+fn default_log_max_rows() -> u32 {
+    50_000
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -259,6 +273,8 @@ impl Default for AppConfig {
             experimental_impersonate_grok_build: false,
             anthropic_thinking_mode: default_anthropic_thinking_mode(),
             mcp_video_wait_default: false,
+            log_retention_days: default_log_retention_days(),
+            log_max_rows: default_log_max_rows(),
             oauth_redirect_port: default_oauth_redirect_port(),
             http_proxy_enabled: false,
             http_proxy_url: String::new(),

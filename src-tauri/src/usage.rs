@@ -52,12 +52,26 @@ pub struct HeatmapDay {
 
 /// Bound the log queue so a stuck writer cannot grow RAM without limit.
 const LOG_QUEUE_CAP: usize = 2048;
-/// Keep at most this many rows (oldest deleted first).
-const MAX_LOG_ROWS: i64 = 50_000;
-/// Drop rows older than this many days.
-const LOG_RETENTION_DAYS: i64 = 30;
+/// Fallback when config is unavailable.
+const DEFAULT_MAX_LOG_ROWS: i64 = 50_000;
+const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
 /// Prune / checkpoint every N inserts on the writer thread.
 const PRUNE_EVERY_N: u32 = 64;
+
+fn prune_limits_from_config() -> (i64, i64) {
+    match crate::config::load_config() {
+        Ok(c) => {
+            let days = (c.log_retention_days.max(1)) as i64;
+            let max_rows = if c.log_max_rows == 0 {
+                i64::MAX / 4
+            } else {
+                c.log_max_rows as i64
+            };
+            (days, max_rows)
+        }
+        Err(_) => (DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_LOG_ROWS),
+    }
+}
 
 static LOG_TX: Lazy<SyncSender<RequestLog>> = Lazy::new(|| {
     let (tx, rx) = mpsc::sync_channel::<RequestLog>(LOG_QUEUE_CAP);
@@ -70,7 +84,8 @@ static LOG_TX: Lazy<SyncSender<RequestLog>> = Lazy::new(|| {
                 while rx.recv().is_ok() {}
                 return;
             };
-            let _ = store.prune(LOG_RETENTION_DAYS, MAX_LOG_ROWS);
+            let (days, max_rows) = prune_limits_from_config();
+            let _ = store.prune(days, max_rows);
             let _ = store.checkpoint();
             let mut since_prune = 0u32;
             while let Ok(log) = rx.recv() {
@@ -81,7 +96,8 @@ static LOG_TX: Lazy<SyncSender<RequestLog>> = Lazy::new(|| {
                 since_prune += 1;
                 if since_prune >= PRUNE_EVERY_N {
                     since_prune = 0;
-                    if let Err(err) = store.prune(LOG_RETENTION_DAYS, MAX_LOG_ROWS) {
+                    let (days, max_rows) = prune_limits_from_config();
+                    if let Err(err) = store.prune(days, max_rows) {
                         tracing::warn!("usage prune failed: {err}");
                     }
                     if let Err(err) = store.checkpoint() {
@@ -381,6 +397,91 @@ impl UsageStore {
         self.checkpoint()?;
         Ok(())
     }
+
+    /// Delete rows with `created_at` strictly before the RFC3339 cutoff.
+    pub fn delete_before(&self, before_rfc3339: &str) -> AppResult<u64> {
+        let n = self.conn.execute(
+            "DELETE FROM request_logs WHERE created_at < ?1",
+            params![before_rfc3339],
+        )?;
+        self.checkpoint()?;
+        Ok(n as u64)
+    }
+
+    /// Delete rows in inclusive RFC3339 range `[from, to]`.
+    pub fn delete_range(&self, from_rfc3339: &str, to_rfc3339: &str) -> AppResult<u64> {
+        let n = self.conn.execute(
+            "DELETE FROM request_logs WHERE created_at >= ?1 AND created_at <= ?2",
+            params![from_rfc3339, to_rfc3339],
+        )?;
+        self.checkpoint()?;
+        Ok(n as u64)
+    }
+
+    pub fn count(&self) -> AppResult<u64> {
+        let n: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM request_logs", [], |row| row.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Aggregate stats for the log management UI.
+    pub fn stats(&self) -> AppResult<LogStoreStats> {
+        let total = self.count()?;
+        let (oldest, newest): (Option<String>, Option<String>) = self.conn.query_row(
+            r#"
+            SELECT MIN(created_at), MAX(created_at) FROM request_logs
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let db_bytes = self.db_file_bytes().unwrap_or(0);
+        let (days, max_rows) = prune_limits_from_config();
+        Ok(LogStoreStats {
+            total_rows: total,
+            oldest_at: oldest,
+            newest_at: newest,
+            db_bytes,
+            retention_days: days as u32,
+            max_rows: if max_rows >= i64::MAX / 8 {
+                0
+            } else {
+                max_rows as u32
+            },
+        })
+    }
+
+    fn db_file_bytes(&self) -> AppResult<u64> {
+        let path = db_path()?;
+        let mut total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        for suffix in ["-wal", "-shm"] {
+            let p = format!("{}{suffix}", path.display());
+            if let Ok(m) = std::fs::metadata(&p) {
+                total = total.saturating_add(m.len());
+            }
+        }
+        Ok(total)
+    }
+
+    /// Apply current config retention + row cap immediately.
+    pub fn prune_now(&self) -> AppResult<LogStoreStats> {
+        let (days, max_rows) = prune_limits_from_config();
+        self.prune(days, max_rows)?;
+        self.checkpoint()?;
+        self.stats()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogStoreStats {
+    pub total_rows: u64,
+    pub oldest_at: Option<String>,
+    pub newest_at: Option<String>,
+    pub db_bytes: u64,
+    pub retention_days: u32,
+    /// 0 = unlimited row cap
+    pub max_rows: u32,
 }
 
 pub fn empty_summary() -> UsageSummary {
@@ -443,6 +544,55 @@ mod usage_store_tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn delete_before_and_range() {
+        let path = temp_db();
+        let _ = std::fs::remove_file(&path);
+        let store = UsageStore::open(&path).expect("open");
+        let mk = |id: &str, created: &str| RequestLog {
+            request_id: id.into(),
+            account_id: None,
+            endpoint: "/v1/responses".into(),
+            requested_model: Some("m".into()),
+            resolved_model: Some("m".into()),
+            status_code: 200,
+            latency_ms: 100,
+            first_token_ms: Some(40),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_tokens: 0,
+            estimated_cost_usd: 0.0,
+            error_summary: None,
+            client_source: "test".into(),
+            created_at: DateTime::parse_from_rfc3339(created)
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        store
+            .insert(&mk("a", "2020-01-01T00:00:00Z"))
+            .unwrap();
+        store
+            .insert(&mk("b", "2024-06-15T12:00:00Z"))
+            .unwrap();
+        store
+            .insert(&mk("c", "2024-06-20T12:00:00Z"))
+            .unwrap();
+        assert_eq!(store.count().unwrap(), 3);
+        let n = store.delete_before("2024-01-01T00:00:00Z").unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(store.count().unwrap(), 2);
+        let n2 = store
+            .delete_range("2024-06-15T00:00:00Z", "2024-06-15T23:59:59Z")
+            .unwrap();
+        assert_eq!(n2, 1);
+        assert_eq!(store.count().unwrap(), 1);
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.total_rows, 1);
+        store.clear().unwrap();
+        assert_eq!(store.count().unwrap(), 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

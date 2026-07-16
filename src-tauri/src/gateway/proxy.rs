@@ -20,7 +20,8 @@ use crate::auth::{
 use crate::config::{load_auth, load_config, resolve_model, AppConfig};
 use crate::error::{AppError, AppResult};
 use crate::gateway::build_plane_route::{
-    adapt_chat_body_for_build_plane, decide_plane, effective_client_source, PlaneDecision,
+    adapt_chat_body_for_build_plane, adapt_responses_body_for_build_plane, decide_plane,
+    effective_client_source, BuildPlaneHeaderContext, PlaneDecision,
 };
 use crate::gateway::empty_completion::{
     build_empty_completion_retry_request, extract_completed_response_from_sse, is_responses_path,
@@ -30,8 +31,8 @@ use crate::gateway::empty_completion::{
 
 // Public re-exports (API stability for external callers / tests).
 pub use crate::gateway::build_plane_route::{
-    collect_build_plane_passthrough_headers, is_grok_build_plane, resolve_upstream_base,
-    DEFAULT_GROK_CLIENT_VERSION,
+    collect_build_plane_headers, collect_build_plane_passthrough_headers, is_grok_build_plane,
+    resolve_upstream_base, DEFAULT_GROK_CLIENT_VERSION,
 };
 use crate::gateway::image_bridge::{
     collect_image_gen_calls, fulfill_image_gen_call, inject_image_generation_calls,
@@ -295,11 +296,6 @@ async fn proxy_anthropic_messages_inner(
     let http = ctx.client();
     let upstream_base = plane.upstream_base.clone();
     let url = format!("{upstream_base}/chat/completions");
-    let passthrough_headers = if plane.inject_build_headers {
-        collect_build_plane_passthrough_headers(&headers)
-    } else {
-        Vec::new()
-    };
     let conv_header = headers
         .get("x-grok-conv-id")
         .and_then(|v| v.to_str().ok())
@@ -311,11 +307,24 @@ async fn proxy_anthropic_messages_inner(
                 .as_deref()
                 .and_then(session_affinity::stable_cache_key)
         });
+    let passthrough_headers = if plane.inject_build_headers {
+        collect_build_plane_headers(
+            &headers,
+            &BuildPlaneHeaderContext {
+                model_id: Some(resolved_model.as_str()),
+                session_id: session_key.as_deref(),
+                conv_id: conv_header.as_deref(),
+                agent_id: Some("gateway"),
+                force_official_ua: plane.experimental_impersonation,
+            },
+        )
+    } else {
+        Vec::new()
+    };
 
     let build_upstream = {
         let url = url.clone();
         let passthrough_headers = passthrough_headers.clone();
-        let conv_header = conv_header.clone();
         move |client: &reqwest::Client, token: &str, body: Bytes| {
             let mut req = client
                 .post(&url)
@@ -329,14 +338,9 @@ async fn proxy_anthropic_messages_inner(
                         "application/json"
                     },
                 );
+            // Official bag already includes x-grok-conv-id / model-override / etc.
             for (name, value) in &passthrough_headers {
-                if name.as_str().eq_ignore_ascii_case("x-grok-conv-id") {
-                    continue;
-                }
                 req = req.header(name.clone(), value.as_str());
-            }
-            if let Some(ref cid) = conv_header {
-                req = req.header("x-grok-conv-id", cid.as_str());
             }
             req.body(body)
         }
@@ -665,6 +669,15 @@ async fn proxy_json_inner(
                 if sanitized.modified {
                     body_changed = true;
                 }
+                // Official Grok Build Responses path: fill missing prompt_cache_* for multi-turn.
+                if build_plane
+                    && adapt_responses_body_for_build_plane(
+                        &mut value,
+                        session_key.as_deref(),
+                    )
+                {
+                    body_changed = true;
+                }
                 // Image tool loop needs a full JSON response; force non-stream upstream
                 // when we will fulfill image tools server-side (non-native clients).
                 if run_image_tool_bridge
@@ -763,8 +776,20 @@ async fn proxy_json_inner(
             .and_then(session_affinity::stable_cache_key)
     });
 
+    let model_for_headers = resolved_model
+        .as_deref()
+        .or(requested_model.as_deref());
     let passthrough_headers = if plane.inject_build_headers {
-        collect_build_plane_passthrough_headers(&headers)
+        collect_build_plane_headers(
+            &headers,
+            &BuildPlaneHeaderContext {
+                model_id: model_for_headers,
+                session_id: session_key.as_deref(),
+                conv_id: conv_header.as_deref(),
+                agent_id: Some("gateway"),
+                force_official_ua: plane.experimental_impersonation,
+            },
+        )
     } else {
         Vec::new()
     };
@@ -774,20 +799,21 @@ async fn proxy_json_inner(
         let url = url.clone();
         let accept = accept.clone();
         let passthrough_headers = passthrough_headers.clone();
+        let inject_build = plane.inject_build_headers;
         move |client: &reqwest::Client, token: &str, body: Bytes| {
             let mut req = client
                 .request(method.clone(), &url)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::ACCEPT, accept.as_str());
-            // Apply client CLI headers first, then pin conv-id so affinity wins.
+            // Official bag includes conv-id / model-override / token-auth / etc.
             for (name, value) in &passthrough_headers {
-                if name.as_str().eq_ignore_ascii_case("x-grok-conv-id") {
-                    continue;
-                }
                 req = req.header(name.clone(), value.as_str());
             }
-            if let Some(ref cid) = conv_header {
-                req = req.header("x-grok-conv-id", cid.as_str());
+            // Console path still benefits from conv-id affinity when no build bag.
+            if !inject_build {
+                if let Some(ref cid) = conv_header {
+                    req = req.header("x-grok-conv-id", cid.as_str());
+                }
             }
             if !body.is_empty() || matches!(method, Method::POST | Method::PUT | Method::PATCH) {
                 // Force a single JSON content type for mutating requests (even empty body).

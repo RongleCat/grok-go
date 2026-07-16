@@ -33,18 +33,29 @@ fn build_client(config: &AppConfig, kind: ClientKind) -> AppResult<reqwest::Clie
         ClientKind::Api => Duration::from_secs(600),
         ClientKind::Oauth => Duration::from_secs(45),
     };
+    // Official sampling client defaults connect_timeout to 10s (`GROK_CONNECT_TIMEOUT_SECS`).
     let connect = match kind {
-        ClientKind::Api => Duration::from_secs(20),
+        ClientKind::Api => Duration::from_secs(10),
         ClientKind::Oauth => Duration::from_secs(15),
     };
 
+    // Pool / HTTP/2 keepalive aligned with official `xai-grok-sampler::shared_http`
+    // (and `xai-grok-http::shared_client`) so cli-chat-proxy connections stay healthy
+    // through Cloudflare/LB idle windows instead of recycling half-dead TLS streams.
     let mut builder = reqwest::Client::builder()
         .timeout(timeout)
         .connect_timeout(connect)
         .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(8)
+        .pool_max_idle_per_host(if matches!(kind, ClientKind::Api) {
+            2
+        } else {
+            4
+        })
         .tcp_nodelay(true)
-        .tcp_keepalive(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .http2_keep_alive_interval(Duration::from_secs(15))
+        .http2_keep_alive_timeout(Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true)
         .user_agent(concat!("grok-go/", env!("CARGO_PKG_VERSION")));
 
     match resolve_proxy_url(config) {

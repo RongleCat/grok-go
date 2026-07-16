@@ -8,6 +8,13 @@
 - 用量：`client_source=experimental-build`（媒体 `experimental-build-media`）。
 - 开源调研：CLIProxyAPI 有同类 OAuth→cli-chat-proxy 头；无完整可 vend 的转换库，本仓内实现。
 
+## 2026-07-16（对齐官方 xai-org/grok-build 开源线格式）
+
+- 源：https://github.com/xai-org/grok-build（`xai-grok-shell` / `xai-grok-sampler` / `xai-grok-http`）。
+- 出站头完整对齐：`X-XAI-Token-Auth`、`x-authenticateresponse`、`x-grok-client-mode`、`x-grok-client-identifier=grok-shell`、官方 UA `grok-shell/{ver} ({os}; {arch})`、采样 `x-grok-conv-id/req-id/model-override/session-id/agent-id`。
+- Body：`adapt_responses_body_for_build_plane` 补 `prompt_cache_key` / `prompt_cache_retention=24h`（不覆盖客户端已有值）。
+- HTTP 池：`http_client` 对齐 sampler shared_http（max_idle=2、H2 keepalive 15s/5s）。
+
 ## 2026-07-15（WorkBuddy MCP 写入路径修正）
 
 - UI「配置 MCP」编辑的是 `~/.workbuddy/mcp.json`，不是自动生成的 `.mcp.json`（connector-proxy）。

@@ -7,15 +7,38 @@
 //! When **on**, non–Grok-Build clients (Codex / OpenAI / Claude Code) are forced
 //! onto the SuperGrok / cli-chat-proxy chat plane with required identity headers.
 //! Media (images/videos) stays on the console API — cli-chat-proxy does not host
-//! those routes (CLIProxyAPI / wire survey).
+//! those routes (official `xai-org/grok-build` sampling vs media split).
+//!
+//! ## Wire source of truth
+//! Aligned with open-source **https://github.com/xai-org/grok-build**:
+//! - `xai-grok-shell` `inject_url_derived_headers` / `add_cli_chat_proxy_headers_*`
+//! - `xai-grok-sampler` `SamplingClient` default + per-request `x-grok-*` headers
+//! - `xai-grok-workspace` `build_proxy_headers`
+//! - `xai-grok-http` User-Agent rendering (`grok-shell/{ver} ({os}; {arch})`)
+//! - `xai-grok-sampler::shared_http` connection pool / HTTP/2 keepalive
 
 use axum::http::{header, HeaderMap, HeaderName};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::config::AppConfig;
 
-/// Minimum cli-chat-proxy client version (426 Upgrade Required below this).
+/// Client version sent as `x-grok-client-version` (cli-chat-proxy 426 if too old).
+/// Known-good against production proxy gates; not the OSS package `0.2.0-dev`.
 pub const DEFAULT_GROK_CLIENT_VERSION: &str = "0.2.101";
+
+/// Official product token in User-Agent (`xai-grok-http` AGENT_PRODUCT / DEFAULT_CLIENT_IDENTIFIER).
+pub const GROK_SHELL_PRODUCT: &str = "grok-shell";
+
+/// `GrokComConfig::default().token_header` / inject_url_derived_headers.
+pub const XAI_TOKEN_AUTH_VALUE: &str = "xai-grok-cli";
+
+/// Shell `inject_url_derived_headers` for cli-chat-proxy bases.
+pub const AUTHENTICATE_RESPONSE_VALUE: &str = "authenticate-response";
+
+/// `xai-grok-http::CLIENT_MODE_HEADER` default (`process_client_mode`).
+pub const CLIENT_MODE_HEADER: &str = "x-grok-client-mode";
+pub const CLIENT_MODE_INTERACTIVE: &str = "interactive";
 
 /// Usage / log tag when traffic is forced onto the build plane by config.
 pub const EXPERIMENTAL_BUILD_SOURCE: &str = "experimental-build";
@@ -168,8 +191,8 @@ pub fn effective_client_source(decision: &PlaneDecision, fallback: &str) -> Stri
 
 /// Whether a client header should be forwarded on the Grok Build / cli-chat-proxy plane.
 ///
-/// Includes all `x-grok-*` / `x-xai-*` plus a few non-prefixed headers the official
-/// CLI sends (`User-Agent`, `x-email`, `x-models-etag`, tracing). Authorization is
+/// Includes all `x-grok-*` / `x-xai-*` plus non-prefixed headers the official
+/// CLI sends (`User-Agent`, `x-email`, `x-userid`, tracing). Authorization is
 /// rewritten to a pool token and must never pass through.
 pub fn should_passthrough_build_header(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -199,8 +222,10 @@ pub fn should_passthrough_build_header(name: &str) -> bool {
             lower.as_str(),
             "user-agent"
                 | "x-email"
+                | "x-userid"
                 | "x-models-etag"
                 | "x-authenticate"
+                | "x-authenticateresponse"
                 | "accept-language"
                 | "x-request-id"
                 | "traceparent"
@@ -209,10 +234,61 @@ pub fn should_passthrough_build_header(name: &str) -> bool {
         )
 }
 
+/// Official User-Agent shape from `xai-grok-http::UserAgent::render` when
+/// origin product == agent product (`grok-shell/{ver} ({os}; {arch})`).
+pub fn official_grok_shell_user_agent() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "windows" => "windows",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" | "arm64" => "aarch64",
+        "x86_64" => "x86_64",
+        other => other,
+    };
+    format!("{GROK_SHELL_PRODUCT}/{DEFAULT_GROK_CLIENT_VERSION} ({os}; {arch})")
+}
+
+/// True when `base_url` is a cli-chat-proxy / chat-proxy host (official
+/// `is_cli_chat_proxy_url` / `build_proxy_headers` check).
+pub fn is_cli_chat_proxy_url(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.contains("cli-chat-proxy") || lower.contains("chat-proxy")
+}
+
+/// Optional sampling context for per-request `x-grok-*` headers
+/// (`xai-grok-sampler::GrokRequestHeaders`).
+#[derive(Debug, Clone, Default)]
+pub struct BuildPlaneHeaderContext<'a> {
+    pub model_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub conv_id: Option<&'a str>,
+    pub agent_id: Option<&'a str>,
+    /// Force rewrite of non-Grok User-Agents (experimental impersonation).
+    pub force_official_ua: bool,
+}
+
 /// Client headers that must reach cli-chat-proxy for native or impersonated Grok Build.
 ///
-/// Always ensures `X-XAI-Token-Auth`, `x-grok-client-version`, and a Grok-like UA.
+/// Mirrors official inject set:
+/// - `X-XAI-Token-Auth: xai-grok-cli`
+/// - `x-authenticateresponse: authenticate-response`
+/// - `x-grok-client-mode` (default interactive)
+/// - `x-grok-client-identifier: grok-shell`
+/// - `x-grok-client-version`
+/// - User-Agent `grok-shell/{ver} ({os}; {arch})`
+/// - sampling: `x-grok-conv-id`, `x-grok-req-id`, `x-grok-model-override`,
+///   `x-grok-session-id`, `x-grok-agent-id` when context supplied
 pub fn collect_build_plane_passthrough_headers(headers: &HeaderMap) -> Vec<(HeaderName, String)> {
+    collect_build_plane_headers(headers, &BuildPlaneHeaderContext::default())
+}
+
+/// Full outbound header bag for cli-chat-proxy (passthrough + official inject).
+pub fn collect_build_plane_headers(
+    headers: &HeaderMap,
+    ctx: &BuildPlaneHeaderContext<'_>,
+) -> Vec<(HeaderName, String)> {
     let mut out = Vec::new();
     for (name, value) in headers.iter() {
         if !should_passthrough_build_header(name.as_str()) {
@@ -224,66 +300,130 @@ pub fn collect_build_plane_passthrough_headers(headers: &HeaderMap) -> Vec<(Head
             }
         }
     }
-    // Ensure the canonical CLI marker is always present on the build plane.
-    if !out
+
+    // --- URL-derived headers (inject_url_derived_headers) ---
+    ensure_header(&mut out, "x-xai-token-auth", XAI_TOKEN_AUTH_VALUE);
+    ensure_header(
+        &mut out,
+        "x-authenticateresponse",
+        AUTHENTICATE_RESPONSE_VALUE,
+    );
+    ensure_header(&mut out, CLIENT_MODE_HEADER, CLIENT_MODE_INTERACTIVE);
+    ensure_header(
+        &mut out,
+        "x-grok-client-identifier",
+        GROK_SHELL_PRODUCT,
+    );
+    ensure_header(
+        &mut out,
+        "x-grok-client-version",
+        DEFAULT_GROK_CLIENT_VERSION,
+    );
+
+    // User-Agent: official grok-shell form; rewrite non-Grok when impersonating
+    // or when missing.
+    let ua_idx = out
         .iter()
-        .any(|(n, _)| n.as_str().eq_ignore_ascii_case("x-xai-token-auth"))
-    {
-        out.push((
-            HeaderName::from_static("x-xai-token-auth"),
-            "xai-grok-cli".into(),
-        ));
-    }
-    // cli-chat-proxy rejects missing / outdated versions with 426.
-    if !out
-        .iter()
-        .any(|(n, v)| {
-            n.as_str().eq_ignore_ascii_case("x-grok-client-version") && !v.trim().is_empty()
-        })
-    {
-        out.push((
-            HeaderName::from_static("x-grok-client-version"),
-            DEFAULT_GROK_CLIENT_VERSION.into(),
-        ));
-    }
-    // Sensible User-Agent when callers (curl / tests / Codex) omit it.
-    if !out
-        .iter()
-        .any(|(n, v)| n.as_str().eq_ignore_ascii_case("user-agent") && !v.trim().is_empty())
-    {
-        out.push((
-            HeaderName::from_static("user-agent"),
-            format!("xai-grok-shell/{DEFAULT_GROK_CLIENT_VERSION} (grok-build)"),
-        ));
-    }
-    // When impersonating, rewrite non-Grok UAs so cli-chat-proxy sees a CLI-like client.
-    // Keep explicit Grok UAs from native clients.
-    if let Some(idx) = out
-        .iter()
-        .position(|(n, _)| n.as_str().eq_ignore_ascii_case("user-agent"))
-    {
-        let ua = out[idx].1.to_ascii_lowercase();
-        let looks_grok = ua.contains("grok") || ua.contains("xai-grok");
-        if !looks_grok {
-            out[idx].1 = format!("xai-grok-shell/{DEFAULT_GROK_CLIENT_VERSION} (grok-build)");
+        .position(|(n, _)| n.as_str().eq_ignore_ascii_case("user-agent"));
+    let official_ua = official_grok_shell_user_agent();
+    match ua_idx {
+        None => {
+            out.push((HeaderName::from_static("user-agent"), official_ua));
+        }
+        Some(idx) => {
+            let ua = out[idx].1.to_ascii_lowercase();
+            let looks_grok = ua.contains("grok-shell")
+                || ua.contains("xai-grok-shell")
+                || ua.contains("xai-grok-workspace")
+                || ua.contains("grok-build")
+                || ua.contains("grok-cli");
+            if ctx.force_official_ua || !looks_grok {
+                out[idx].1 = official_ua;
+            }
         }
     }
+
+    // --- Per-request sampling headers (GrokRequestHeaders) ---
+    if let Some(model) = ctx.model_id.map(str::trim).filter(|s| !s.is_empty()) {
+        // Native client may already send override; only fill when missing.
+        if !has_header(&out, "x-grok-model-override") {
+            out.push((
+                HeaderName::from_static("x-grok-model-override"),
+                model.to_string(),
+            ));
+        }
+    }
+    if let Some(sid) = ctx.session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if !has_header(&out, "x-grok-session-id") {
+            out.push((
+                HeaderName::from_static("x-grok-session-id"),
+                sid.to_string(),
+            ));
+        }
+        // conv-id is the primary cache namespace for multi-turn on build plane.
+        if !has_header(&out, "x-grok-conv-id") {
+            if let Some(cid) = ctx.conv_id.map(str::trim).filter(|s| !s.is_empty()) {
+                out.push((HeaderName::from_static("x-grok-conv-id"), cid.to_string()));
+            } else {
+                out.push((
+                    HeaderName::from_static("x-grok-conv-id"),
+                    sid.to_string(),
+                ));
+            }
+        }
+    } else if let Some(cid) = ctx.conv_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if !has_header(&out, "x-grok-conv-id") {
+            out.push((HeaderName::from_static("x-grok-conv-id"), cid.to_string()));
+        }
+    }
+    if !has_header(&out, "x-grok-req-id") {
+        out.push((
+            HeaderName::from_static("x-grok-req-id"),
+            Uuid::new_v4().to_string(),
+        ));
+    }
+    let agent = ctx
+        .agent_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("main");
+    if !has_header(&out, "x-grok-agent-id") {
+        out.push((
+            HeaderName::from_static("x-grok-agent-id"),
+            agent.to_string(),
+        ));
+    }
+
     out
+}
+
+fn has_header(headers: &[(HeaderName, String)], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|(n, v)| n.as_str().eq_ignore_ascii_case(name) && !v.trim().is_empty())
+}
+
+/// Insert header if missing or empty (does not overwrite client values).
+fn ensure_header(headers: &mut Vec<(HeaderName, String)>, name: &'static str, value: &str) {
+    if has_header(headers, name) {
+        return;
+    }
+    if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+        headers.push((hn, value.to_string()));
+    }
 }
 
 /// Build-plane body adapt for chat completions: strip fields cli-chat-proxy may reject
 /// that OpenAI clients sometimes send. Idempotent; returns whether the body changed.
 ///
-/// Responses path uses [`crate::gateway::sanitize::sanitize_responses_request_ex`] instead.
+/// Responses path uses [`crate::gateway::sanitize::sanitize_responses_request_ex`] plus
+/// [`adapt_responses_body_for_build_plane`].
 pub fn adapt_chat_body_for_build_plane(value: &mut Value) -> bool {
     let Some(obj) = value.as_object_mut() else {
         return false;
     };
     let mut modified = false;
-    // OpenAI-only stream_options is harmless on many planes but strip if empty object issues.
-    // Keep stream_options when present (include_usage) — xAI accepts it.
-    // Remove parallel_tool_calls only if false? Keep as-is; xAI accepts.
-    // Strip service_tier / safety_identifier style OpenAI extras if present.
+    // Strip OpenAI-console-only extras (official sampler never sends these).
     for key in ["service_tier", "safety_identifier"] {
         if obj.remove(key).is_some() {
             modified = true;
@@ -300,6 +440,47 @@ pub fn adapt_chat_body_for_build_plane(value: &mut Value) -> bool {
                 }
             }
         }
+    }
+    modified
+}
+
+/// Responses body continuity for cli-chat-proxy (cache / multi-turn).
+///
+/// Official sampling keeps `previous_response_id` when the shell has a prior turn
+/// and may set `prompt_cache_key` for stable prefix cache. Continuity is also
+/// carried via `x-grok-conv-id` headers. This fills missing body keys only —
+/// never strips client-provided values on the build plane.
+pub fn adapt_responses_body_for_build_plane(
+    value: &mut Value,
+    session_key: Option<&str>,
+) -> bool {
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    let mut modified = false;
+    // Stable prompt_cache_key for multi-turn when client omitted it.
+    if obj
+        .get("prompt_cache_key")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+    {
+        if let Some(key) = session_key.map(str::trim).filter(|s| !s.is_empty()) {
+            obj.insert(
+                "prompt_cache_key".into(),
+                Value::String(key.to_string()),
+            );
+            modified = true;
+        }
+    }
+    // Prefer 24h retention when absent so SuperGrok can reuse prefixes across turns.
+    // Official may leave this None; cli-chat-proxy accepts the field when present.
+    if obj.get("prompt_cache_retention").is_none() {
+        obj.insert(
+            "prompt_cache_retention".into(),
+            Value::String("24h".into()),
+        );
+        modified = true;
     }
     modified
 }
@@ -433,22 +614,38 @@ mod tests {
     }
 
     #[test]
-    fn inject_headers_include_markers_for_plain_client() {
+    fn inject_headers_include_official_cli_chat_proxy_markers() {
         let headers = collect_build_plane_passthrough_headers(&HeaderMap::new());
         let map: std::collections::HashMap<_, _> = headers
             .iter()
-            .map(|(n, v)| (n.as_str().to_ascii_lowercase(), v.as_str()))
+            .map(|(n, v)| (n.as_str().to_ascii_lowercase(), v.as_str().to_string()))
             .collect();
-        assert_eq!(map.get("x-xai-token-auth").copied(), Some("xai-grok-cli"));
         assert_eq!(
-            map.get("x-grok-client-version").copied(),
+            map.get("x-xai-token-auth").map(|s| s.as_str()),
+            Some(XAI_TOKEN_AUTH_VALUE)
+        );
+        assert_eq!(
+            map.get("x-authenticateresponse").map(|s| s.as_str()),
+            Some(AUTHENTICATE_RESPONSE_VALUE)
+        );
+        assert_eq!(
+            map.get("x-grok-client-mode").map(|s| s.as_str()),
+            Some(CLIENT_MODE_INTERACTIVE)
+        );
+        assert_eq!(
+            map.get("x-grok-client-identifier").map(|s| s.as_str()),
+            Some(GROK_SHELL_PRODUCT)
+        );
+        assert_eq!(
+            map.get("x-grok-client-version").map(|s| s.as_str()),
             Some(DEFAULT_GROK_CLIENT_VERSION)
         );
-        assert!(map
-            .get("user-agent")
-            .copied()
-            .unwrap_or("")
-            .contains("grok"));
+        let ua = map.get("user-agent").map(|s| s.as_str()).unwrap_or("");
+        assert!(ua.starts_with("grok-shell/"), "ua={ua}");
+        assert!(ua.contains('(') && ua.contains(';'), "ua={ua}");
+        // sampling defaults
+        assert!(map.contains_key("x-grok-req-id"));
+        assert_eq!(map.get("x-grok-agent-id").map(|s| s.as_str()), Some("main"));
     }
 
     #[test]
@@ -458,13 +655,19 @@ mod tests {
             header::USER_AGENT,
             HeaderValue::from_static("codex_cli_rs/0.1.0"),
         );
-        let headers = collect_build_plane_passthrough_headers(&h);
+        let headers = collect_build_plane_headers(
+            &h,
+            &BuildPlaneHeaderContext {
+                force_official_ua: true,
+                ..Default::default()
+            },
+        );
         let ua = headers
             .iter()
             .find(|(n, _)| n.as_str().eq_ignore_ascii_case("user-agent"))
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert!(ua.contains("grok"), "got {ua}");
+        assert!(ua.starts_with("grok-shell/"), "got {ua}");
         assert!(!ua.contains("codex"));
     }
 
@@ -473,15 +676,83 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(
             header::USER_AGENT,
-            HeaderValue::from_static("xai-grok-shell/0.2.200 (grok-build)"),
+            HeaderValue::from_static("xai-grok-shell/0.2.200 (macos; aarch64)"),
         );
-        let headers = collect_build_plane_passthrough_headers(&h);
+        let headers = collect_build_plane_headers(
+            &h,
+            &BuildPlaneHeaderContext {
+                force_official_ua: false,
+                ..Default::default()
+            },
+        );
         let ua = headers
             .iter()
             .find(|(n, _)| n.as_str().eq_ignore_ascii_case("user-agent"))
             .map(|(_, v)| v.as_str())
             .unwrap();
-        assert_eq!(ua, "xai-grok-shell/0.2.200 (grok-build)");
+        assert_eq!(ua, "xai-grok-shell/0.2.200 (macos; aarch64)");
+    }
+
+    #[test]
+    fn inject_headers_sampling_context_model_session_conv() {
+        let headers = collect_build_plane_headers(
+            &HeaderMap::new(),
+            &BuildPlaneHeaderContext {
+                model_id: Some("grok-4.5"),
+                session_id: Some("sess-abc"),
+                conv_id: Some("conv-xyz"),
+                agent_id: Some("gateway"),
+                force_official_ua: true,
+            },
+        );
+        let map: std::collections::HashMap<_, _> = headers
+            .iter()
+            .map(|(n, v)| (n.as_str().to_ascii_lowercase(), v.as_str()))
+            .collect();
+        assert_eq!(map.get("x-grok-model-override").copied(), Some("grok-4.5"));
+        assert_eq!(map.get("x-grok-session-id").copied(), Some("sess-abc"));
+        assert_eq!(map.get("x-grok-conv-id").copied(), Some("conv-xyz"));
+        assert_eq!(map.get("x-grok-agent-id").copied(), Some("gateway"));
+    }
+
+    #[test]
+    fn responses_adapt_fills_cache_keys() {
+        let mut body = json!({
+            "model": "grok-4.5",
+            "input": "hi"
+        });
+        assert!(adapt_responses_body_for_build_plane(
+            &mut body,
+            Some("thread-1")
+        ));
+        assert_eq!(
+            body.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some("thread-1")
+        );
+        assert_eq!(
+            body.get("prompt_cache_retention").and_then(|v| v.as_str()),
+            Some("24h")
+        );
+        // Does not overwrite existing
+        body["prompt_cache_key"] = json!("keep-me");
+        body["prompt_cache_retention"] = json!("in_memory");
+        assert!(!adapt_responses_body_for_build_plane(
+            &mut body,
+            Some("other")
+        ));
+        assert_eq!(
+            body.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some("keep-me")
+        );
+    }
+
+    #[test]
+    fn detects_cli_chat_proxy_url() {
+        assert!(is_cli_chat_proxy_url(
+            "https://cli-chat-proxy.grok.com/v1"
+        ));
+        assert!(is_cli_chat_proxy_url("https://chat-proxy.example/v1"));
+        assert!(!is_cli_chat_proxy_url("https://api.x.ai/v1"));
     }
 
     #[test]

@@ -55,7 +55,7 @@
 | 条件 | 推理上游 | 媒体上游 | 日志 `client_source` |
 |---|---|---|---|
 | 客户端带 Grok Build 标记 | `cli_chat_proxy_base_url` | `xai_base_url`（图片/视频） | `grok-build` |
-| `experimentalImpersonateGrokBuild=true` 且无原生标记 | 同上（注入 `X-XAI-Token-Auth` 等） | 同上（cli-chat-proxy 无 media） | `experimental-build` / `experimental-build-media` |
+| `experimentalImpersonateGrokBuild=true` 且无原生标记 | 同上（官方头：Token-Auth + authenticateresponse + client-mode/identifier + sampling `x-grok-*`） | 同上（cli-chat-proxy 无 media） | `experimental-build` / `experimental-build-media` |
 | 开关关 + 普通 Codex/OpenAI/Claude | `xai_base_url` | `xai_base_url` | 原协议标签 |
 
 - 默认 **关**；稳定 console 路径行为不变。

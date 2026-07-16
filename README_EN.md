@@ -13,6 +13,8 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/status-archived-lightgrey" alt="Archived" />
+  <img src="https://img.shields.io/badge/maintenance-none-red" alt="No maintenance" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <a href="https://github.com/RongleCat/grok-go/stargazers"><img src="https://img.shields.io/github/stars/RongleCat/grok-go?style=social" alt="GitHub stars" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="Platforms" />
@@ -25,6 +27,17 @@
   · Repo
   <a href="https://github.com/RongleCat/grok-go">RongleCat/grok-go</a>
 </p>
+
+---
+
+> [!CAUTION]
+> ## Project discontinued
+>
+> **Do not use this tool anymore.**
+>
+> GrokGo is no longer developed or maintained. There will be no updates, compatibility fixes, or support. Continued use may break, fail to connect, or carry unknown risk.
+>
+> Please uninstall the app and clean up `~/.grok-go/` (and any client config you injected for Codex / others). This repository is kept only as a historical archive.
 
 ---
 
@@ -87,6 +100,8 @@ Wiring **Grok / xAI** into **Codex**, OpenAI-compatible clients, or other agents
 ---
 
 ## Install & first run
+
+> **Discontinued: do not download or install new copies.** Links below are archival only.
 
 ### 1. Download
 
@@ -197,6 +212,9 @@ Cross-compile and release notes: [docs/BUILD.md](./docs/BUILD.md).
 ---
 
 ## Docs & contributing
+
+> This project is archived and **no longer accepts contributions or issue follow-up**.
+
 
 | Audience | Link |
 |----------|------|

@@ -13,6 +13,8 @@
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/badge/status-archived-lightgrey" alt="Archived" />
+  <img src="https://img.shields.io/badge/maintenance-none-red" alt="No maintenance" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <a href="https://github.com/RongleCat/grok-go/stargazers"><img src="https://img.shields.io/github/stars/RongleCat/grok-go?style=social" alt="GitHub stars" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="Platforms" />
@@ -25,6 +27,17 @@
   · 仓库
   <a href="https://github.com/RongleCat/grok-go">RongleCat/grok-go</a>
 </p>
+
+---
+
+> [!CAUTION]
+> ## 项目已停止维护
+>
+> **请不要再使用本工具。**
+>
+> GrokGo 已停止开发与维护，不再提供更新、兼容性修复或使用支持。继续使用可能导致无法连接、账号异常或其他未知风险。
+>
+> 请卸载应用，并自行清理本机配置目录 `~/.grok-go/`（以及你曾注入到 Codex / 其他客户端中的相关配置）。仓库仅作历史归档保留。
 
 ---
 
@@ -89,6 +102,8 @@
 ## 安装与使用
 
 ### 1. 下载
+
+> **已停止维护：不建议下载或新装。** 下方链接仅作历史归档。
 
 从 [Releases](https://github.com/RongleCat/grok-go/releases) 下载对应平台安装包：
 
@@ -207,6 +222,9 @@ pnpm tauri build
 ---
 
 ## 文档与贡献
+
+> 项目已归档，**不再接受功能贡献或 issue 跟进**。如有历史问题，请勿期望回复。
+
 
 | 对象 | 入口 |
 |------|------|

@@ -418,7 +418,7 @@ async fn proxy_anthropic_messages_inner(
             .map(|v| v.contains("text/event-stream") || v.contains("stream"))
             .unwrap_or(false);
 
-    let latency_ms = started.elapsed().as_millis() as u64;
+    let ttfb_ms = started.elapsed().as_millis() as u64;
     let path = "/v1/messages";
     let client_source = effective_client_source(&plane, "anthropic-messages");
 
@@ -518,7 +518,7 @@ async fn proxy_anthropic_messages_inner(
             response.headers_mut(),
             plane_label(plane.build_plane, plane.experimental_impersonation, false),
             &account.id,
-            latency_ms,
+            ttfb_ms,
             truncated,
             &config.anthropic_thinking_mode,
             None,
@@ -611,7 +611,7 @@ async fn proxy_anthropic_messages_inner(
         Some(resolved_model.clone()),
         out_status.as_u16(),
         started.elapsed().as_millis() as u64,
-        None,
+        Some(ttfb_ms.max(1)),
         i,
         o,
         c,
@@ -1049,7 +1049,9 @@ async fn proxy_json_inner(
             .unwrap_or(false);
 
     let request_id = Uuid::new_v4().to_string();
-    let latency_ms = started.elapsed().as_millis() as u64;
+    // Time-to-first-byte (response headers). For non-stream JSON this is often ≈ total
+    // because upstream buffers the full generation; still useful when headers arrive early.
+    let ttfb_ms = started.elapsed().as_millis() as u64;
 
     if is_stream {
         if status.is_success() {
@@ -1086,6 +1088,7 @@ async fn proxy_json_inner(
                 &build_upstream,
                 parsed_request.as_ref().unwrap(),
                 custom_tool_names.as_ref(),
+                started,
             )
             .await?;
             let (i, o, c) = extract_usage_tokens(&recovered.usage_source);
@@ -1096,7 +1099,7 @@ async fn proxy_json_inner(
                     config.session_affinity_ttl_secs,
                 );
             }
-            let latency_ms = started.elapsed().as_millis() as u64;
+            let total_ms = started.elapsed().as_millis() as u64;
             let reason = recovered
                 .retried
                 .then_some("empty-completion-retry".to_string())
@@ -1108,8 +1111,8 @@ async fn proxy_json_inner(
                 requested_model,
                 resolved_model,
                 status.as_u16(),
-                latency_ms,
-                None,
+                total_ms,
+                Some(recovered.first_token_ms.unwrap_or(ttfb_ms).max(1)),
                 i,
                 o,
                 c,
@@ -1171,7 +1174,7 @@ async fn proxy_json_inner(
             response.headers_mut(),
             plane_label(plane.build_plane, plane.experimental_impersonation, plane.media_path),
             &account.id,
-            latency_ms,
+            ttfb_ms,
             false,
             "",
             tools_inj,
@@ -1375,6 +1378,9 @@ async fn proxy_json_inner(
             "prompt cache hit recorded"
         );
     }
+    // Non-stream: total = full body (+ recovery); first token ≈ TTFB (headers).
+    // Agent tools force non-stream so StreamUsageTracker never runs — must fill here.
+    let total_ms = started.elapsed().as_millis() as u64;
     log_request(
         &request_id,
         Some(account.id.clone()),
@@ -1382,8 +1388,8 @@ async fn proxy_json_inner(
         requested_model.clone(),
         resolved_model.clone(),
         status.as_u16(),
-        latency_ms,
-        None,
+        total_ms,
+        Some(ttfb_ms.max(1)),
         input_tokens,
         output_tokens,
         cache_tokens,
@@ -1565,6 +1571,8 @@ struct EmptyCompletionStreamResult {
     /// Best-effort JSON used for usage / session-id extraction.
     usage_source: Value,
     retried: bool,
+    /// ms from request start to first SSE body chunk (if any).
+    first_token_ms: Option<u64>,
 }
 
 /// Buffer an upstream Responses SSE, rewrite custom tools, and if the completed
@@ -1576,6 +1584,7 @@ async fn buffer_sse_and_recover_empty_completion<F>(
     build_upstream: &F,
     original_request: &Value,
     custom_names: &HashSet<String>,
+    started: Instant,
 ) -> AppResult<EmptyCompletionStreamResult>
 where
     F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
@@ -1583,8 +1592,12 @@ where
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut stream = upstream.bytes_stream();
     let mut truncated = false;
+    let mut first_token_ms: Option<u64> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| AppError::msg(format!("sse buffer read: {e}")))?;
+        if first_token_ms.is_none() && !chunk.is_empty() {
+            first_token_ms = Some(started.elapsed().as_millis() as u64).map(|m| m.max(1));
+        }
         if buf.len() + chunk.len() > SSE_BUFFER_LIMIT {
             truncated = true;
             // Keep a prefix so we can still return something useful.
@@ -1611,6 +1624,7 @@ where
             sse,
             usage_source,
             retried,
+            first_token_ms,
         });
     }
 
@@ -1667,6 +1681,7 @@ where
         sse,
         usage_source,
         retried,
+        first_token_ms,
     })
 }
 

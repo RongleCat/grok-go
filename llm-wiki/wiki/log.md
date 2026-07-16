@@ -8,6 +8,13 @@
 - 用量：`client_source=experimental-build`（媒体 `experimental-build-media`）。
 - 开源调研：CLIProxyAPI 有同类 OAuth→cli-chat-proxy 头；无完整可 vend 的转换库，本仓内实现。
 
+## 2026-07-16（Codex 会话 019f6852 提前终止：experimental-build 关掉了 empty-completion）
+
+- 现象：任务做到「参考 PDF 是图片」后 `task_complete`，`last_agent_message=null`，最后一回合仅 reasoning、无 tool call。
+- 证据：`client_source=experimental-build`、`/responses` 末次 `output_tokens=134`；config 开着 `experimentalImpersonateGrokBuild` + `emptyCompletionRetry`。
+- 根因：`apply_codex_console_guards=!build_plane` 把 **empty-completion 恢复** 与 nuclear strip 绑在一起，实验仿冒 Build 时恢复被关掉；流式 `response.completed` 后 Codex 直接结束。
+- 修复：`apply_empty_completion_recovery=!native_build_client`（console + experimental 开，原生 TUI 关）；agent tools 回合强制非流式以便 JSON 恢复后再 SSE 回放。
+
 ## 2026-07-16（对齐官方 xai-org/grok-build 开源线格式）
 
 - 源：https://github.com/xai-org/grok-build（`xai-grok-shell` / `xai-grok-sampler` / `xai-grok-http`）。

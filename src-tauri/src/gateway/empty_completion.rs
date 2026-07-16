@@ -647,6 +647,22 @@ mod tests {
         assert!(is_reasoning_only_empty_completion(&v));
     }
 
+    /// Fixture matching Codex session 019f6852… premature stop shape:
+    /// completed + reasoning only + tools were in the request → must recover.
+    #[test]
+    fn session_019f6852_style_reasoning_only_is_premature() {
+        let v = json!({
+            "id": "resp_test",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "I need to view the reference PDF pages to understand the structure."}]
+            }]
+        });
+        assert!(is_reasoning_only_empty_completion(&v));
+        assert!(should_retry_premature_agent_stop(&v, Some(&tools_req())));
+    }
+
     #[test]
     fn detects_short_status_without_tool_as_premature() {
         let v = json!({

@@ -600,8 +600,10 @@ async fn proxy_json_inner(
     // Plane decision: native markers OR experimental impersonation flag.
     let plane: PlaneDecision = decide_plane(&config, &headers, path);
     let build_plane = plane.build_plane;
-    // Codex console-only guards (empty-completion, nuclear strip, stream buffer).
+    // Nuclear strip / messages-only: console only (protects build-plane continuity).
     let apply_console_guards = plane.apply_codex_console_guards;
+    // Premature agent-stop recovery: console + experimental (not native Grok Build TUI).
+    let apply_empty_completion = plane.apply_empty_completion_recovery;
     // Image tool bridge: run for non-native clients (console or experimental
     // impersonation). Native Grok Build handles tools upstream.
     let run_image_tool_bridge = !plane.native_build_client;
@@ -686,6 +688,27 @@ async fn proxy_json_inner(
                 {
                     value["stream"] = Value::Bool(false);
                     body_changed = true;
+                }
+                // Agent tool turns: force non-stream when empty-completion recovery is on.
+                // Codex streams response.completed and ends the turn on reasoning-only /
+                // narration-only stops; recovery needs a full JSON body (then we re-emit SSE).
+                // Session 019f6852… failed on experimental-build for exactly this reason.
+                let agent_tools = value
+                    .get("tools")
+                    .and_then(|t| t.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+                if apply_empty_completion
+                    && config.empty_completion_retry
+                    && agent_tools
+                    && value.get("stream").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    value["stream"] = Value::Bool(false);
+                    body_changed = true;
+                    tracing::debug!(
+                        target: "gateway",
+                        "force non-stream for agent tools (empty-completion recovery)"
+                    );
                 }
             }
             if is_chat && build_plane {
@@ -873,7 +896,7 @@ async fn proxy_json_inner(
         // Grok Build always true-streams. Non-stream JSON empty recovery is separate.
         let guard_empty = config.empty_completion_retry
             && config.empty_completion_stream_buffer
-            && apply_console_guards
+            && apply_empty_completion
             && is_responses_path(path)
             && status.is_success()
             && parsed_request.is_some();
@@ -1062,10 +1085,10 @@ async fn proxy_json_inner(
         }
 
         // Reasoning-only / narration-only premature stop → silent retry so Codex keeps going.
-        // Disabled on build plane (native/experimental SuperGrok path; retries double spend).
+        // Enabled for console + experimental impersonation; disabled only for native Grok Build TUI.
         if status.is_success()
             && config.empty_completion_retry
-            && apply_console_guards
+            && apply_empty_completion
             && is_responses_path(path)
             && should_retry_premature_agent_stop(&value, parsed_request.as_ref())
         {

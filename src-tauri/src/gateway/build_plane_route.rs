@@ -63,8 +63,13 @@ pub struct PlaneDecision {
     pub inject_build_headers: bool,
     /// Allow console Files offload (never on build chat plane).
     pub allow_files_offload: bool,
-    /// Apply Codex-console-only recovery (empty-completion, nuclear strip, stream buffer).
+    /// Console-only input recovery (nuclear strip / messages-only retry).
+    /// Off on build plane so we do not destroy cli-chat-proxy continuity fields.
     pub apply_codex_console_guards: bool,
+    /// Premature agent-stop recovery for Codex/OpenAI clients.
+    /// On for console **and** experimental impersonation; off only for **native**
+    /// Grok Build TUI (its own agent loop handles tools).
+    pub apply_empty_completion_recovery: bool,
     /// Path is image/video media (always console upstream).
     pub media_path: bool,
 }
@@ -151,6 +156,8 @@ pub fn decide_plane(config: &AppConfig, headers: &HeaderMap, path: &str) -> Plan
             inject_build_headers: false,
             allow_files_offload: false,
             apply_codex_console_guards: false,
+            // Media is not an agent tool loop; no empty-completion recovery.
+            apply_empty_completion_recovery: false,
             media_path: true,
         };
     }
@@ -176,7 +183,10 @@ pub fn decide_plane(config: &AppConfig, headers: &HeaderMap, path: &str) -> Plan
         },
         inject_build_headers: build,
         allow_files_offload: !build && is_inference_files_path(path),
+        // Nuclear strip only on pure console (would burn build-plane cache).
         apply_codex_console_guards: !build,
+        // Codex via experimental build still needs premature-stop recovery.
+        apply_empty_completion_recovery: !native,
         media_path: false,
     }
 }
@@ -543,6 +553,7 @@ mod tests {
         assert!(!d.experimental_impersonation);
         assert_eq!(d.upstream_base, "https://api.x.ai/v1");
         assert!(d.apply_codex_console_guards);
+        assert!(d.apply_empty_completion_recovery);
         assert!(d.allow_files_offload);
         assert!(!d.inject_build_headers);
         assert!(d.client_source_override.is_none());
@@ -559,6 +570,8 @@ mod tests {
         assert_eq!(d.upstream_base, "https://cli-chat-proxy.grok.com/v1");
         assert_eq!(d.client_source_override, Some(NATIVE_BUILD_SOURCE));
         assert!(!d.apply_codex_console_guards);
+        // Native Grok Build TUI: no Codex empty-completion recovery.
+        assert!(!d.apply_empty_completion_recovery);
         assert!(!d.allow_files_offload);
     }
 
@@ -576,7 +589,10 @@ mod tests {
             assert_eq!(d.upstream_base, "https://cli-chat-proxy.grok.com/v1");
             assert_eq!(d.client_source_override, Some(EXPERIMENTAL_BUILD_SOURCE));
             assert!(d.inject_build_headers);
-            assert!(!d.apply_codex_console_guards);
+            // Nuclear strip stays off on build plane...
+            assert!(!d.apply_codex_console_guards, "path {path}");
+            // ...but Codex premature-stop recovery stays on (session 019f6852 regression).
+            assert!(d.apply_empty_completion_recovery, "path {path}");
             assert!(!d.allow_files_offload);
         }
     }

@@ -39,6 +39,16 @@ status=completed ∧ 无 error/incomplete
 | `emptyCompletionRetry` | `true` | 非流式空完成恢复；流式还需下面开关 |
 | `emptyCompletionStreamBuffer` | **`false`** | 为 true 才缓冲整段 SSE 做流式恢复（会拖慢首字） |
 
+## 平面策略（console / experimental / native Build）
+
+| 客户端 | 上游 | empty-completion 恢复 | 说明 |
+|---|---|---|---|
+| Codex/OpenAI 走 console | `api.x.ai` | **开** | 原有逻辑 |
+| Codex/OpenAI + `experimentalImpersonateGrokBuild` | cli-chat-proxy | **开** | 仿冒 Build 线，但仍是 Codex agent loop |
+| 原生 Grok Build TUI | cli-chat-proxy | **关** | 官方 agent loop 自管 tool turn |
+
+另：有 `tools` 的 agent 回合在恢复开启时会 **强制上游 `stream=false`**，再在客户端要 SSE 时用 `responses_json_to_sse` 回放——否则 Codex 会在 `response.completed`（仅 reasoning）处结束任务（见会话 `019f6852-8442-7fc2-89a3-360cdca9f9b6`）。
+
 ## 相关页面
 
 - [[../modules/gateway]]

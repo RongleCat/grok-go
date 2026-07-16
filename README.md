@@ -13,8 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-archived-lightgrey" alt="Archived" />
-  <img src="https://img.shields.io/badge/maintenance-none-red" alt="No maintenance" />
+  <img src="https://img.shields.io/badge/note-use%20with%20care-yellow" alt="Use with care" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <a href="https://github.com/RongleCat/grok-go/stargazers"><img src="https://img.shields.io/github/stars/RongleCat/grok-go?style=social" alt="GitHub stars" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="Platforms" />
@@ -30,14 +29,14 @@
 
 ---
 
-> [!CAUTION]
-> ## 项目已停止维护
+> [!WARNING]
+> ## 使用提示
 >
-> **请不要再使用本工具。**
+> 官方路径通常不鼓励用第三方本地网关这种方式接入；请自行评估风险，**不要当作长期生产方案**。
 >
-> GrokGo 已停止开发与维护，不再提供更新、兼容性修复或使用支持。继续使用可能导致无法连接、账号异常或其他未知风险。
+> 就当前实现而言，**API 模式可以正常使用**，适合个人场景下的**轻度使用**。设置里请保持默认的 **API** 渠道；**Grok Build** 会话面仍有更高账号风险，不建议日常打开。
 >
-> 请卸载应用，并自行清理本机配置目录 `~/.grok-go/`（以及你曾注入到 Codex / 其他客户端中的相关配置）。仓库仅作历史归档保留。
+> 本仓库维护节奏会放缓，兼容性与上游策略可能随时变化，请以实际连通为准。
 
 ---
 
@@ -103,7 +102,7 @@
 
 ### 1. 下载
 
-> **已停止维护：不建议下载或新装。** 下方链接仅作历史归档。
+> 若仍要试用：请用 **API 模式**，轻度使用即可。
 
 从 [Releases](https://github.com/RongleCat/grok-go/releases) 下载对应平台安装包：
 
@@ -223,7 +222,7 @@ pnpm tauri build
 
 ## 文档与贡献
 
-> 项目已归档，**不再接受功能贡献或 issue 跟进**。如有历史问题，请勿期望回复。
+> 维护节奏放缓；欢迎反馈，但请理解响应可能较慢。
 
 
 | 对象 | 入口 |

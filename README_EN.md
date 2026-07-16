@@ -13,8 +13,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-archived-lightgrey" alt="Archived" />
-  <img src="https://img.shields.io/badge/maintenance-none-red" alt="No maintenance" />
+  <img src="https://img.shields.io/badge/note-use%20with%20care-yellow" alt="Use with care" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <a href="https://github.com/RongleCat/grok-go/stargazers"><img src="https://img.shields.io/github/stars/RongleCat/grok-go?style=social" alt="GitHub stars" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey" alt="Platforms" />
@@ -30,14 +29,14 @@
 
 ---
 
-> [!CAUTION]
-> ## Project discontinued
+> [!WARNING]
+> ## Usage note
 >
-> **Do not use this tool anymore.**
+> Official channels generally do **not** encourage third-party local gateways like this. Use at your own risk — **not a long-term production setup**.
 >
-> GrokGo is no longer developed or maintained. There will be no updates, compatibility fixes, or support. Continued use may break, fail to connect, or carry unknown risk.
+> With the current build, **API mode works** and is fine for **light personal use**. Keep the default **API** channel in Settings; the **Grok Build** session plane carries higher account risk and is not recommended for daily use.
 >
-> Please uninstall the app and clean up `~/.grok-go/` (and any client config you injected for Codex / others). This repository is kept only as a historical archive.
+> Maintenance will be slower; compatibility and upstream policy can change anytime — trust live connectivity over docs.
 
 ---
 
@@ -101,7 +100,7 @@ Wiring **Grok / xAI** into **Codex**, OpenAI-compatible clients, or other agents
 
 ## Install & first run
 
-> **Discontinued: do not download or install new copies.** Links below are archival only.
+> If you still try it: use **API mode**, lightly.
 
 ### 1. Download
 
@@ -213,7 +212,7 @@ Cross-compile and release notes: [docs/BUILD.md](./docs/BUILD.md).
 
 ## Docs & contributing
 
-> This project is archived and **no longer accepts contributions or issue follow-up**.
+> Maintenance is slower; feedback is welcome, but replies may take time.
 
 
 | Audience | Link |

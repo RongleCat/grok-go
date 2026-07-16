@@ -84,6 +84,7 @@ export function SettingsPage() {
   const [error, setError] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [restartOpen, setRestartOpen] = useState(false);
+  const [channelConfirmOpen, setChannelConfirmOpen] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const [exportSections, setExportSections] = useState<BackupSections>(defaultSections);
@@ -810,6 +811,55 @@ export function SettingsPage() {
                     <p className="mt-1 text-xs text-neutral-500">{t.settings.accountMaxConcurrencyDesc}</p>
                   ) : null}
                 </div>
+                <div className="md:col-span-2">
+                  <Label>{t.settings.chatChannel}</Label>
+                  <Tabs
+                    className="mt-1 w-full max-w-sm [&>button]:flex-1"
+                    value={
+                      config.experimentalImpersonateGrokBuild
+                        ? "grok-build"
+                        : "api"
+                    }
+                    onChange={(id) => {
+                      if (id === "grok-build") {
+                        if (config.experimentalImpersonateGrokBuild) return;
+                        setChannelConfirmOpen(true);
+                        return;
+                      }
+                      void applyPatch({ experimentalImpersonateGrokBuild: false });
+                    }}
+                    items={[
+                      { id: "api", label: t.settings.chatChannelApi },
+                      {
+                        id: "grok-build",
+                        label: t.settings.chatChannelGrokBuild,
+                      },
+                    ]}
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <Label className="text-sm font-medium">
+                    {t.settings.anthropicThinkingMode}
+                  </Label>
+                  <select
+                    className="mt-1 w-full rounded-md border border-neutral-200 bg-white px-3 py-2 text-sm"
+                    value={config.anthropicThinkingMode ?? "hide"}
+                    onChange={(e) =>
+                      void applyPatch({ anthropicThinkingMode: e.target.value })
+                    }
+                  >
+                    <option value="hide">{t.settings.anthropicThinkingHide}</option>
+                    <option value="passthrough">
+                      {t.settings.anthropicThinkingPassthrough}
+                    </option>
+                    <option value="summary">{t.settings.anthropicThinkingSummary}</option>
+                  </select>
+                  {t.settings.anthropicThinkingModeHint ? (
+                    <p className="mt-1 text-xs text-neutral-500">
+                      {t.settings.anthropicThinkingModeHint}
+                    </p>
+                  ) : null}
+                </div>
               </CardContent>
             </Card>
           </div>
@@ -869,6 +919,19 @@ export function SettingsPage() {
         onCancel={() => setRestartOpen(false)}
         onConfirm={() => {
           void relaunch().catch((e) => toast(String(e), "error"));
+        }}
+      />
+
+      <ConfirmDialog
+        open={channelConfirmOpen}
+        title={t.settings.chatChannelGrokBuildConfirmTitle}
+        description={t.settings.chatChannelGrokBuildConfirmDesc}
+        cancelLabel={t.common.cancel}
+        confirmLabel={t.settings.chatChannelGrokBuildConfirm}
+        onCancel={() => setChannelConfirmOpen(false)}
+        onConfirm={() => {
+          setChannelConfirmOpen(false);
+          void applyPatch({ experimentalImpersonateGrokBuild: true });
         }}
       />
 

@@ -83,6 +83,11 @@ pub async fn start_gateway(state: GatewayState) -> AppResult<SocketAddr> {
         *state.actual_addr.lock().await = Some(addr);
     }
 
+    // R2-01: always refresh runtime agents-guide so Codex sees decision tree / tools API.
+    if let Err(err) = crate::integrations::refresh_agents_guide_file() {
+        tracing::warn!(error = %err, "failed to refresh agents-guide on gateway start");
+    }
+
     let app = build_router(state.clone());
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -93,7 +98,8 @@ pub async fn start_gateway(state: GatewayState) -> AppResult<SocketAddr> {
     Ok(addr)
 }
 
-fn build_router(state: GatewayState) -> Router {
+/// Build the gateway Axum router (also used by live integration tests).
+pub fn build_router(state: GatewayState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
@@ -114,6 +120,8 @@ fn build_router(state: GatewayState) -> Router {
         .route("/v1/videos/edits", post(video_edits))
         // Deferred video job poll (account-sticky via job_affinity).
         .route("/v1/videos/{request_id}", get(video_job_status))
+        // O-02: simple tools HTTP API (same backend as MCP tools/call).
+        .route("/v1/tools/{name}", post(tools_http_call))
         // xAI Files API proxy — upload once, reference by file_id in Responses.
         .route("/v1/files", any(files_collection))
         .route("/v1/files/{file_id}", any(files_item))
@@ -133,6 +141,9 @@ async fn health(State(state): State<GatewayState>) -> Json<Value> {
     let running = *state.running.lock().await;
     let addr = *state.actual_addr.lock().await;
     let config = load_config().unwrap_or_default();
+    let store = load_auth().unwrap_or_default();
+    let accounts_routable = crate::router::routable_account_count(&store);
+    let accounts_total = store.accounts.len();
     Json(json!({
         "ok": true,
         "running": running,
@@ -140,7 +151,89 @@ async fn health(State(state): State<GatewayState>) -> Json<Value> {
         "port": config.actual_port,
         "lanEnabled": config.lan_enabled,
         "requireToken": config.require_token,
+        // O-18
+        "accountsRoutable": accounts_routable,
+        "accountsTotal": accounts_total,
+        "experimentalImpersonateGrokBuild": config.experimental_impersonate_grok_build,
+        "anthropicThinkingMode": config.anthropic_thinking_mode,
+        "mcpVideoWaitDefault": config.mcp_video_wait_default,
+        "agentsGuideVersion": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// O-02: `POST /v1/tools/{name}` — body = tool arguments JSON object.
+async fn tools_http_call(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    let config = match load_config() {
+        Ok(c) => c,
+        Err(err) => {
+            return layered_error_response(
+                crate::gateway::error_codes::classify_transport_error(&err.to_string()),
+            );
+        }
+    };
+    if let Err(resp) = authorize_request(&headers, &config).await {
+        return resp;
+    }
+    let args: Value = if body.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                return layered_error_response(crate::gateway::error_codes::invalid_request(
+                    format!("invalid JSON body: {err}"),
+                    "Body must be a JSON object of tool arguments.",
+                ));
+            }
+        }
+    };
+    let mut args = args;
+    // R2-03: Tools HTTP defaults wait=true for human/curl sync (override if client set wait).
+    if name == "video_generate" && args.get("wait").is_none() {
+        args["wait"] = json!(true);
+    }
+    let _ = crate::gateway::tool_surface::coerce_mcp_tool_arguments(&mut args);
+    let params = json!({"name": name, "arguments": args});
+    match handle_tool_call(&state, &config, params, ToolCallSource::Http).await {
+        Ok(value) => {
+            // Prefer structured envelope when present in MCP content text.
+            if let Some(text) = value
+                .pointer("/content/0/text")
+                .and_then(|t| t.as_str())
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    if parsed.get("ok").is_some() {
+                        return Json(parsed).into_response();
+                    }
+                }
+            }
+            Json(json!({
+                "ok": true,
+                "tool": name,
+                "result": value,
+            }))
+            .into_response()
+        }
+        Err(err) => {
+            let layered = crate::gateway::error_codes::classify_transport_error(&err.to_string());
+            // Tool failures that aren't transport: wrap as TOOL_FAILED
+            let layered = if layered.code == crate::gateway::error_codes::UPSTREAM_ERROR {
+                crate::gateway::error_codes::tool_failed(&name, err.to_string())
+            } else {
+                layered
+            };
+            (
+                StatusCode::from_u16(layered.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(layered.tool_envelope(&name)),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn models(State(_state): State<GatewayState>, headers: HeaderMap) -> Response {
@@ -407,7 +500,25 @@ async fn video_job_status(
         return resp;
     }
     match poll_video_job_http(&state, &config, &request_id).await {
-        Ok(value) => Json(value).into_response(),
+        Ok(mut value) => {
+            // R2-09: when job is done, materialize local artifacts for agent recovery.
+            let status = value
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if matches!(status, "done" | "completed" | "succeeded") {
+                let client = state.proxy.client();
+                if let Ok(files) = materialize_video_response(&client, &value).await {
+                    if !files.is_empty() {
+                        value["artifacts"] = json!(files);
+                        value["path"] = json!(files.first());
+                        value["files"] = json!(files);
+                        value["markdown"] = json!(format!("![video]({})", files[0]));
+                    }
+                }
+            }
+            Json(value).into_response()
+        }
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -667,7 +778,7 @@ fn mcp_tools_catalog_all() -> Value {
         },
         {
             "name": "video_generate",
-            "description": "Generate a video (text-to-video OR image-to-video OR multi-reference). CALL IMMEDIATELY — do NOT web_search or grep the repo for parameters. This schema is complete.\n\nMODES (pick one):\n1) Text-to-video: prompt only\n2) Image-to-video (图生视频 / animate still): prompt + image_url (starting frame)\n3) Reference-to-video: prompt + reference_image_urls (1–7 style/content refs). Do NOT combine image_url with reference_image_urls.\n\nARGS (complete):\n- prompt (string, REQUIRED): scene + motion description\n- image_url (string, optional): starting-frame image for image-to-video. Accepts https://, data:, absolute local path, file://\n- reference_image_urls (string[], optional): 1–7 reference images (same URL/path forms). Alternative to image_url\n- duration (number 1–15, optional): seconds (default upstream ~5–8)\n- aspect_ratio (string, optional): 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3. Image-to-video defaults to source image AR if omitted\n- resolution (string, optional): 480p | 720p | 1080p (1080p only on some models / image-to-video)\n- model (string, optional; default grok-imagine-video)\n\nBEHAVIOR: submits job, polls until done, downloads mp4 to ~/.grok-go/artifacts/, returns local path.\nRETURNS JSON: path/file/files (absolute local mp4), markdown ![video](/abs/path.mp4). Never show remote CDN urls.\n\nEXAMPLES:\n- Text: {\"prompt\":\"cat running through tall grass at golden hour\",\"duration\":8,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\"}\n- Image-to-video: {\"prompt\":\"gentle camera push-in, soft wind in fur\",\"image_url\":\"/Users/me/.grok-go/artifacts/cat.png\",\"duration\":6}\n- Refs: {\"prompt\":\"cinematic fashion walk\",\"reference_image_urls\":[\"/tmp/a.jpg\",\"/tmp/b.jpg\"],\"duration\":6}",
+            "description": "Generate a video (text-to-video OR image-to-video OR multi-reference). CALL IMMEDIATELY — do NOT web_search or grep the repo for parameters. This schema is complete.\n\nMODES (pick one):\n1) Text-to-video: prompt only\n2) Image-to-video (图生视频 / animate still): prompt + image_url (starting frame)\n3) Reference-to-video: prompt + reference_image_urls (1–7 style/content refs). Do NOT combine image_url with reference_image_urls.\n\nARGS (complete):\n- prompt (string, REQUIRED): scene + motion description\n- image_url (string, optional): starting-frame image for image-to-video. Accepts https://, data:, absolute local path, file://\n- reference_image_urls (string[], optional): 1–7 reference images (same URL/path forms). Alternative to image_url\n- duration (number 1–15, optional): seconds (default upstream ~5–8)\n- aspect_ratio (string, optional): 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3. Image-to-video defaults to source image AR if omitted\n- resolution (string, optional): 480p | 720p | 1080p (1080p only on some models / image-to-video)\n- model (string, optional; default grok-imagine-video)\n- wait (boolean, optional): MCP tools/call defaults false (async job_id+poll); POST /v1/tools/video_generate defaults true (sync). Explicit wait always wins.\n\nBEHAVIOR: wait=true polls until done and returns local mp4 path. wait=false returns job_id + poll GET /v1/videos/{id} immediately.\nRETURNS JSON: path/file/files (absolute local mp4), markdown ![video](/abs/path.mp4). Never show remote CDN urls.\n\nEXAMPLES:\n- Text: {\"prompt\":\"cat running through tall grass at golden hour\",\"duration\":8,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\"}\n- Image-to-video: {\"prompt\":\"gentle camera push-in, soft wind in fur\",\"image_url\":\"/Users/me/.grok-go/artifacts/cat.png\",\"duration\":6}\n- Refs: {\"prompt\":\"cinematic fashion walk\",\"reference_image_urls\":[\"/tmp/a.jpg\",\"/tmp/b.jpg\"],\"duration\":6}\n- Async submit: {\"prompt\":\"ocean waves\",\"wait\":false}",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -706,6 +817,10 @@ fn mcp_tools_catalog_all() -> Value {
                     "model": {
                         "type": "string",
                         "description": "OPTIONAL. Default: grok-imagine-video."
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "description": "OPTIONAL. MCP default false (async). Tools HTTP default true (sync). false = return job_id + poll GET /v1/videos/{id}."
                     }
                 },
                 "required": ["prompt"]
@@ -836,12 +951,30 @@ async fn mcp_endpoint(State(state): State<GatewayState>, headers: HeaderMap, bod
                 &state,
                 &config,
                 payload.get("params").cloned().unwrap_or(json!({})),
+                ToolCallSource::Mcp,
             )
             .await
             {
                 Ok(value) => value,
                 Err(err) => {
-                    return mcp_json_error(id, -32000, err.to_string());
+                    // R2-10: structured envelope for agents (not only JSON-RPC error string).
+                    let name = payload
+                        .pointer("/params/name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown");
+                    let layered =
+                        crate::gateway::error_codes::classify_transport_error(&err.to_string());
+                    let layered = if layered.code == crate::gateway::error_codes::UPSTREAM_ERROR {
+                        crate::gateway::error_codes::tool_failed(name, err.to_string())
+                    } else {
+                        layered
+                    };
+                    let envelope = layered.tool_envelope(name);
+                    // Still return as tools/call result with isError so MCP clients parse it.
+                    return mcp_json_result(
+                        id,
+                        crate::gateway::error_codes::mcp_content_from_envelope(&envelope),
+                    );
                 }
             }
         }
@@ -862,7 +995,21 @@ async fn mcp_endpoint(State(state): State<GatewayState>, headers: HeaderMap, bod
     mcp_json_result(id, result)
 }
 
-async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Value) -> AppResult<Value> {
+/// Call path for tool dispatch — controls video `wait` default (R2-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallSource {
+    /// MCP tools/call — default video wait from `mcp_video_wait_default` (usually false).
+    Mcp,
+    /// POST /v1/tools/* — default video wait=true (sync for humans/curl).
+    Http,
+}
+
+async fn handle_tool_call(
+    state: &GatewayState,
+    config: &AppConfig,
+    params: Value,
+    source: ToolCallSource,
+) -> AppResult<Value> {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or_default();
     if name.is_empty() {
         return Err(AppError::msg("tool name is required"));
@@ -872,7 +1019,14 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
             "MCP tool `{name}` is disabled in GrokGo settings"
         )));
     }
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // O-13: coerce whole floats (e.g. session_id: 60619.0) to integers.
+    let _ = crate::gateway::tool_surface::coerce_mcp_tool_arguments(&mut args);
+    let include_raw = args
+        .get("debug")
+        .and_then(|v| v.as_bool())
+        .or_else(|| args.get("include_raw").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
     match name {
         "x_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or_default();
@@ -887,9 +1041,22 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "tools": [tool]
             });
             let up = call_upstream(state, config, "/responses", body, "mcp-x_search").await?;
-            Ok(json!({
-                "content": [{"type": "text", "text": serde_json::to_string_pretty(&up.value)?}]
-            }))
+            // R2-02: agent-consumable result; no fat raw unless debug.
+            let (summary, result) =
+                crate::gateway::error_codes::extract_x_search_result(&up.value);
+            let raw = if include_raw {
+                Some(up.value)
+            } else {
+                None
+            };
+            let envelope = crate::gateway::error_codes::tool_ok_envelope_with_result(
+                name,
+                summary,
+                &[],
+                Some(result),
+                raw,
+            );
+            Ok(crate::gateway::error_codes::mcp_content_from_envelope(&envelope))
         }
         // Codex skill looks for `image_gen`; keep `image_generate` as alias.
         "image_gen" | "image_generate" => {
@@ -1006,17 +1173,69 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
             }
 
             // Submit + poll must use the same OAuth account (job is account-scoped).
+            // R2-03: MCP defaults wait from config (usually false); HTTP defaults true.
+            let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(
+                match source {
+                    ToolCallSource::Mcp => config.mcp_video_wait_default,
+                    ToolCallSource::Http => true,
+                },
+            );
             let up = call_upstream(state, config, "/videos/generations", body, "mcp-video").await?;
-            let final_resp = resolve_video_job(state, config, &up.value, &up.account).await?;
-            let client = state.proxy.client();
-            let files = materialize_video_response(&client, &final_resp).await?;
-            if files.is_empty() {
-                return Err(AppError::msg(format!(
-                    "video generated but failed to materialize local files; upstream={final_resp}"
-                )));
+            let request_id = up
+                .value
+                .get("request_id")
+                .or_else(|| up.value.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if !wait {
+                if let Some(rid) = request_id.as_deref() {
+                    crate::gateway::job_affinity::remember_video_job(rid, &up.account.id);
+                    let mut envelope = json!({
+                        "ok": true,
+                        "tool": name,
+                        "summary": "video job submitted; poll for completion",
+                        "job_id": rid,
+                        "poll": format!("/v1/videos/{rid}"),
+                        "artifacts": [],
+                        "error": null,
+                        "result": {
+                            "job_id": rid,
+                            "poll": format!("/v1/videos/{rid}"),
+                            "status": "pending"
+                        }
+                    });
+                    if include_raw {
+                        envelope["raw"] = up.value;
+                    }
+                    return Ok(crate::gateway::error_codes::mcp_content_from_envelope(&envelope));
+                }
             }
-            let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
-            Ok(mcp_media_content(&summary))
+            match resolve_video_job(state, config, &up.value, &up.account).await {
+                Ok(final_resp) => {
+                    let client = state.proxy.client();
+                    let files = materialize_video_response(&client, &final_resp).await?;
+                    if files.is_empty() {
+                        return Err(AppError::msg(format!(
+                            "video generated but failed to materialize local files; upstream={final_resp}"
+                        )));
+                    }
+                    let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
+                    Ok(mcp_media_content(&summary))
+                }
+                Err(err) => {
+                    // O-05: timeout ≠ permanent failure
+                    let msg = err.to_string();
+                    if msg.to_ascii_lowercase().contains("timed out") {
+                        let arts = recent_video_artifacts(3);
+                        return Ok(crate::gateway::error_codes::tool_timeout_mcp_result(
+                            name,
+                            request_id.as_deref(),
+                            &arts,
+                        ));
+                    }
+                    Err(err)
+                }
+            }
         }
         "video_edit" => {
             let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or_default();
@@ -1040,19 +1259,47 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "video": {"url": video_url}
             });
             let up = call_upstream(state, config, "/videos/edits", body, "mcp-video").await?;
-            let final_resp = resolve_video_job(state, config, &up.value, &up.account).await?;
-            let client = state.proxy.client();
-            let files = materialize_video_response(&client, &final_resp).await?;
-            if files.is_empty() {
-                return Err(AppError::msg(format!(
-                    "video edit succeeded but failed to materialize local files; upstream={final_resp}"
-                )));
+            let request_id = up
+                .value
+                .get("request_id")
+                .or_else(|| up.value.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            match resolve_video_job(state, config, &up.value, &up.account).await {
+                Ok(final_resp) => {
+                    let client = state.proxy.client();
+                    let files = materialize_video_response(&client, &final_resp).await?;
+                    if files.is_empty() {
+                        return Err(AppError::msg(format!(
+                            "video edit succeeded but failed to materialize local files; upstream={final_resp}"
+                        )));
+                    }
+                    let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
+                    Ok(mcp_media_content(&summary))
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.to_ascii_lowercase().contains("timed out") {
+                        let arts = recent_video_artifacts(3);
+                        return Ok(crate::gateway::error_codes::tool_timeout_mcp_result(
+                            name,
+                            request_id.as_deref(),
+                            &arts,
+                        ));
+                    }
+                    Err(err)
+                }
             }
-            let summary = media_summary(name, &model, prompt, &files, &final_resp, "video");
-            Ok(mcp_media_content(&summary))
         }
         _ => Err(AppError::msg(format!("unknown tool: {name}"))),
     }
+}
+
+fn recent_video_artifacts(limit: usize) -> Vec<String> {
+    let Ok(dir) = crate::paths::artifacts_dir() else {
+        return Vec::new();
+    };
+    crate::gateway::tool_surface::recent_artifacts(&dir, Some("mp4"), limit)
 }
 
 /// Result of one upstream POST, including the account that made it (needed for sticky video poll).
@@ -1187,7 +1434,29 @@ async fn call_upstream(
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {
-    (status, Json(json!({"error": {"message": message}}))).into_response()
+    let layered = crate::gateway::error_codes::classify_transport_error(&message);
+    // Preserve caller status when it is a deliberate HTTP code (auth etc.).
+    let st = if status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::FORBIDDEN
+        || status == StatusCode::BAD_REQUEST
+    {
+        status
+    } else {
+        StatusCode::from_u16(layered.status).unwrap_or(status)
+    };
+    let mut body = layered.openai_body();
+    if let Some(obj) = body.get_mut("error").and_then(|e| e.as_object_mut()) {
+        obj.insert("message".into(), json!(message));
+    }
+    (st, Json(body)).into_response()
+}
+
+fn layered_error_response(err: crate::gateway::error_codes::LayeredError) -> Response {
+    (
+        StatusCode::from_u16(err.status).unwrap_or(StatusCode::BAD_GATEWAY),
+        Json(err.openai_body()),
+    )
+        .into_response()
 }
 
 
@@ -1290,9 +1559,15 @@ mod mcp_handshake_tests {
             "aspect_ratio",
             "resolution",
             "model",
+            "wait",
         ] {
             assert!(props.get(key).is_some(), "missing property {key}");
         }
+        assert_eq!(
+            props.pointer("/wait/type").and_then(|v| v.as_str()),
+            Some("boolean")
+        );
+        assert!(desc.contains("wait"), "description must document wait");
     }
 
     #[tokio::test]

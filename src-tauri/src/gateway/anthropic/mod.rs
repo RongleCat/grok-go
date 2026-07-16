@@ -17,6 +17,8 @@ mod stream;
 
 pub use request::{anthropic_to_openai_chat, estimate_token_count, map_client_model};
 pub use response::{
-    anthropic_error_body, openai_chat_to_anthropic, openai_error_to_anthropic,
+    anthropic_error_body, openai_chat_to_anthropic, openai_chat_to_anthropic_with_thinking,
+    openai_error_to_anthropic, ThinkingMode,
 };
+// openai_chat_to_anthropic re-exported for API stability (default hide).
 pub use stream::OpenAiToAnthropicSse;

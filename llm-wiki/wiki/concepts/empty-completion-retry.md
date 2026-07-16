@@ -26,11 +26,19 @@ status=completed ∧ 无 error/incomplete
 
 ## 行为
 
-1. **非流式 JSON**：判定空完成 → 静默重试 1 次  
-2. **流式（默认）**：**真流式透传**（与 Grok Build 一致），**不**整段缓冲——否则 TTFT = 整段生成时间，体感极慢  
-3. **流式 + `emptyCompletionStreamBuffer=true`**：缓冲 SSE（上限 24MB）→ 判定 → 恢复 → SSE 回放（牺牲首字速度换 agent 续跑）  
-4. **软重试**：`stream=false` + 钉死 shell 类 `tool_choice` + recovery nudge  
-5. **硬兜底**：注入合成 `function_call`（`echo grok-go-continue`）
+1. **非流式 JSON / agent tools 强制非流式**：判定 premature → **多阶段恢复**  
+2. **流式（默认）**：**真流式透传**；有 tools 的 agent 回合会强制上游 `stream=false` 以便恢复后再 SSE 回放  
+3. **流式 + `emptyCompletionStreamBuffer=true`**：缓冲 SSE（上限 24MB）→ 判定 → 恢复 → SSE 回放  
+
+### 多阶段恢复（对齐 Grok Build 采样层 + Codex 硬兜底）
+
+| 阶段 | 次数 | 行为 |
+|---|---|---|
+| A 透明重采 | ≤2 | 原请求体 + `stream=false`，**保留** `previous_response_id` / cache key（Build 风） |
+| B 软恢复 | ≤1 | 钉 shell `tool_choice` + recovery nudge；build 面保留 `prompt_cache_key` |
+| C 硬兜底 | 1 | 合成中性 `function_call`（`echo grok-go-continue`），保证 Codex 不收工 |
+
+分类日志：`ReasoningOnly` / `NoToolNonFinal`（对应 Build `EmptyReason`）。
 
 ## 配置
 
@@ -38,6 +46,16 @@ status=completed ∧ 无 error/incomplete
 |---|---|---|
 | `emptyCompletionRetry` | `true` | 非流式空完成恢复；流式还需下面开关 |
 | `emptyCompletionStreamBuffer` | **`false`** | 为 true 才缓冲整段 SSE 做流式恢复（会拖慢首字） |
+
+## 平面策略（API 默认 / Build 会话面 opt-in / native Build）
+
+| 客户端 | 上游 | empty-completion 恢复 | 说明 |
+|---|---|---|---|
+| Codex/OpenAI 走 API 平面（默认 / 开关关） | `api.x.ai` | **开** | 原有 console 逻辑 |
+| Codex/OpenAI + Build 会话面（opt-in） | cli-chat-proxy | **开** | 仍是 Codex agent loop，需 premature-stop 恢复 |
+| 原生 Grok Build TUI | cli-chat-proxy | **关** | 官方 agent loop 自管 tool turn |
+
+另：有 `tools` 的 agent 回合在恢复开启时会 **强制上游 `stream=false`**，再在客户端要 SSE 时用 `responses_json_to_sse` 回放——否则 Codex 会在 `response.completed`（仅 reasoning）处结束任务（见会话 `019f6852-8442-7fc2-89a3-360cdca9f9b6`）。
 
 ## 相关页面
 

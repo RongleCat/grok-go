@@ -1,10 +1,10 @@
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderName, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -19,10 +19,21 @@ use crate::auth::{
 };
 use crate::config::{load_auth, load_config, resolve_model, AppConfig};
 use crate::error::{AppError, AppResult};
+use crate::gateway::build_plane_route::{
+    adapt_chat_body_for_build_plane, adapt_responses_body_for_build_plane, decide_plane,
+    effective_client_source, BuildPlaneHeaderContext, PlaneDecision,
+};
 use crate::gateway::empty_completion::{
-    build_empty_completion_retry_request, extract_completed_response_from_sse, is_responses_path,
-    recovery_quality_score, should_retry_premature_agent_stop, synthesize_forced_tool_response,
-    SSE_BUFFER_LIMIT,
+    build_soft_recovery_request, build_transparent_resample_request, classify_premature_stop,
+    extract_completed_response_from_sse, is_responses_path, recovery_quality_score,
+    should_retry_premature_agent_stop, split_sse_hold_completed, synthesize_forced_tool_response,
+    SoftRecoveryOpts, SOFT_RECOVERY_MAX, SSE_BUFFER_LIMIT, TRANSPARENT_RESAMPLE_MAX,
+};
+
+// Public re-exports (API stability for external callers / tests).
+pub use crate::gateway::build_plane_route::{
+    collect_build_plane_headers, collect_build_plane_passthrough_headers, is_grok_build_plane,
+    resolve_upstream_base, DEFAULT_GROK_CLIENT_VERSION,
 };
 use crate::gateway::image_bridge::{
     collect_image_gen_calls, fulfill_image_gen_call, inject_image_generation_calls,
@@ -33,8 +44,13 @@ use crate::gateway::payload_optimize::{
 };
 use crate::gateway::sanitize::{
     is_compaction_blob_error, is_model_input_error, rewrite_responses_payload,
-    rewrite_sse_data_line, sanitize_responses_request, sanitize_responses_request_ex,
-    strip_opaque_context,
+    rewrite_sse_data_line, sanitize_responses_request, sanitize_responses_request_opts,
+    SanitizeOpts, strip_opaque_context,
+};
+use crate::gateway::tool_surface::{
+    plane_label, precheck_vision_in_body, short_account_tag, HDR_ACCOUNT, HDR_CACHE_MODE,
+    HDR_CONVERT_MS, HDR_MODEL_REQUESTED, HDR_MODEL_ROUTED, HDR_MODEL_UPSTREAM, HDR_OPTIMIZE_MS,
+    HDR_PLANE, HDR_THINKING, HDR_TOOLS_INJECTED, HDR_TRUNCATED, HDR_UPSTREAM_MS,
 };
 use crate::http_client::build_http_client;
 use crate::concurrency::AccountPermit;
@@ -140,144 +156,6 @@ pub async fn authorize_request(headers: &HeaderMap, config: &AppConfig) -> Resul
         .into_response())
 }
 
-/// True when the client is Grok Build CLI (session / SuperGrok credits plane).
-///
-/// Markers from official docs: `X-XAI-Token-Auth: xai-grok-cli`,
-/// `x-grok-model-override`, and Grok CLI user-agents.
-pub fn is_grok_build_plane(headers: &HeaderMap) -> bool {
-    if let Some(v) = headers
-        .get("x-xai-token-auth")
-        .and_then(|v| v.to_str().ok())
-    {
-        let lower = v.to_ascii_lowercase();
-        if lower.contains("grok-cli") || lower.contains("xai-grok") {
-            return true;
-        }
-    }
-    if headers.get("x-grok-model-override").is_some() {
-        return true;
-    }
-    if let Some(ua) = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-    {
-        let lower = ua.to_ascii_lowercase();
-        if lower.contains("grok-cli")
-            || lower.contains("grok-build")
-            || lower.contains("xai-grok-shell")
-            || lower.contains("xai-grok")
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Pick upstream base: Grok Build → cli-chat-proxy; otherwise console API.
-pub fn resolve_upstream_base(config: &AppConfig, headers: &HeaderMap) -> String {
-    if is_grok_build_plane(headers) {
-        config.cli_chat_proxy_base_url.trim_end_matches('/').to_string()
-    } else {
-        config.xai_base_url.trim_end_matches('/').to_string()
-    }
-}
-
-/// Minimum cli-chat-proxy client version (426 Upgrade Required below this).
-const DEFAULT_GROK_CLIENT_VERSION: &str = "0.2.101";
-
-/// Whether a client header should be forwarded on the Grok Build / cli-chat-proxy plane.
-///
-/// Includes all `x-grok-*` / `x-xai-*` plus a few non-prefixed headers the official
-/// CLI sends (`User-Agent`, `x-email`, `x-models-etag`, tracing). Authorization is
-/// rewritten to a pool token and must never pass through.
-fn should_passthrough_build_header(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    // Hop-by-hop / rewritten by us.
-    if matches!(
-        lower.as_str(),
-        "authorization"
-            | "host"
-            | "content-length"
-            | "content-type"
-            | "accept"
-            | "connection"
-            | "transfer-encoding"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailers"
-            | "upgrade"
-            | "cookie"
-            | "set-cookie"
-    ) {
-        return false;
-    }
-    lower.starts_with("x-grok-")
-        || lower.starts_with("x-xai-")
-        || matches!(
-            lower.as_str(),
-            "user-agent"
-                | "x-email"
-                | "x-models-etag"
-                | "x-authenticate"
-                | "accept-language"
-                | "x-request-id"
-                | "traceparent"
-                | "tracestate"
-                | "baggage"
-        )
-}
-
-/// Client headers that must reach cli-chat-proxy for native Grok Build behaviour.
-fn collect_build_plane_passthrough_headers(headers: &HeaderMap) -> Vec<(HeaderName, String)> {
-    let mut out = Vec::new();
-    for (name, value) in headers.iter() {
-        if !should_passthrough_build_header(name.as_str()) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            if !v.is_empty() {
-                out.push((name.clone(), v.to_string()));
-            }
-        }
-    }
-    // Ensure the canonical CLI marker is always present on the build plane.
-    if !out
-        .iter()
-        .any(|(n, _)| n.as_str().eq_ignore_ascii_case("x-xai-token-auth"))
-    {
-        out.push((
-            HeaderName::from_static("x-xai-token-auth"),
-            "xai-grok-cli".into(),
-        ));
-    }
-    // cli-chat-proxy rejects missing / outdated versions with 426.
-    // Prefer client value; fall back to a known-good default so curl / old clients work.
-    if !out
-        .iter()
-        .any(|(n, v)| {
-            n.as_str().eq_ignore_ascii_case("x-grok-client-version") && !v.trim().is_empty()
-        })
-    {
-        out.push((
-            HeaderName::from_static("x-grok-client-version"),
-            DEFAULT_GROK_CLIENT_VERSION.into(),
-        ));
-    }
-    // Sensible User-Agent when callers (curl / tests) omit it.
-    if !out
-        .iter()
-        .any(|(n, v)| n.as_str().eq_ignore_ascii_case("user-agent") && !v.trim().is_empty())
-    {
-        out.push((
-            HeaderName::from_static("user-agent"),
-            format!("xai-grok-shell/{DEFAULT_GROK_CLIENT_VERSION} (grok-build)"),
-        ));
-    }
-    out
-}
-
 pub async fn proxy_json(
     ctx: &ProxyContext,
     method: Method,
@@ -288,11 +166,18 @@ pub async fn proxy_json(
 ) -> Response {
     match proxy_json_inner(ctx, method, path, headers, body, client_source).await {
         Ok(resp) => resp,
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            json!({"error": {"message": err.to_string(), "type": "proxy_error"}}).to_string(),
-        )
-            .into_response(),
+        Err(err) => {
+            let layered =
+                crate::gateway::error_codes::classify_transport_error(&err.to_string());
+            let status =
+                StatusCode::from_u16(layered.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut body = layered.openai_body();
+            // Keep original message for diagnostics while preserving code/retryable/hint.
+            if let Some(obj) = body.get_mut("error").and_then(|e| e.as_object_mut()) {
+                obj.insert("message".into(), json!(err.to_string()));
+            }
+            (status, Json(body)).into_response()
+        }
     }
 }
 
@@ -307,9 +192,12 @@ pub async fn proxy_anthropic_messages(
     match proxy_anthropic_messages_inner(ctx, headers, body).await {
         Ok(resp) => resp,
         Err(err) => {
-            let status = StatusCode::BAD_GATEWAY;
-            let body = crate::gateway::anthropic::anthropic_error_body("api_error", err.to_string());
-            (status, body.to_string()).into_response()
+            let layered =
+                crate::gateway::error_codes::classify_transport_error(&err.to_string());
+            let status =
+                StatusCode::from_u16(layered.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = layered.anthropic_body();
+            (status, Json(body)).into_response()
         }
     }
 }
@@ -348,10 +236,19 @@ pub async fn proxy_anthropic_count_tokens(
         }
     };
     let input_tokens = crate::gateway::anthropic::estimate_token_count(&value);
-    Json(json!({
-        "input_tokens": input_tokens
-    }))
-    .into_response()
+    let mut response = (
+        StatusCode::OK,
+        Json(json!({
+            "input_tokens": input_tokens
+        })),
+    )
+        .into_response();
+    // O-15: honest estimate label for Claude Code preflight.
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-grokgo-token-count-mode"),
+        axum::http::HeaderValue::from_static("estimate"),
+    );
+    response
 }
 
 async fn proxy_anthropic_messages_inner(
@@ -360,8 +257,8 @@ async fn proxy_anthropic_messages_inner(
     body: Bytes,
 ) -> AppResult<Response> {
     use crate::gateway::anthropic::{
-        anthropic_to_openai_chat, map_client_model, openai_chat_to_anthropic,
-        openai_error_to_anthropic, OpenAiToAnthropicSse,
+        anthropic_to_openai_chat, map_client_model, openai_chat_to_anthropic_with_thinking,
+        openai_error_to_anthropic, OpenAiToAnthropicSse, ThinkingMode,
     };
     use crate::gateway::payload_optimize::{
         enforce_chat_context_budget, optimize_responses_payload,
@@ -376,19 +273,33 @@ async fn proxy_anthropic_messages_inner(
     let anthropic_req: Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::msg(format!("invalid JSON body: {e}")))?;
 
+    let convert_started = Instant::now();
     let converted = anthropic_to_openai_chat(&anthropic_req)
         .map_err(|e| AppError::msg(format!("anthropic request convert: {e}")))?;
+    let convert_ms = convert_started.elapsed().as_millis() as u64;
 
     let (mapped_model, map_reason) =
         map_client_model(&converted.requested_model, &config.default_model);
     let (resolved_model, resolve_reason) = resolve_model(&config, &mapped_model);
     let mapping_reason = format!("anthropic:{map_reason}:{resolve_reason}");
+    let requested_model_str = converted.requested_model.clone();
 
     let mut chat_body = converted.body;
     chat_body["model"] = Value::String(resolved_model.clone());
 
+    // O-12: reject tiny vision probes with actionable error before upstream 400.
+    if let Err(msg) = precheck_vision_in_body(&chat_body) {
+        let body = crate::gateway::anthropic::anthropic_error_body("invalid_request_error", msg);
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
+            .unwrap_or_else(|_| Response::new(Body::empty())));
+    }
+
     // Byte-oriented multi-turn shrink (images / huge tool outputs) — rarely
     // fires on text-only Claude Code loops (12MiB soft budget).
+    let opt_started = Instant::now();
     let opt = optimize_responses_payload(&mut chat_body);
     if opt.modified {
         opt.log_summary("/v1/messages");
@@ -399,6 +310,9 @@ async fn proxy_anthropic_messages_inner(
     if budget.modified {
         budget.log_summary("/v1/messages#token-budget");
     }
+    let optimize_ms = opt_started.elapsed().as_millis() as u64;
+    let truncated = budget.modified || opt.modified;
+    let thinking_mode = ThinkingMode::parse(&config.anthropic_thinking_mode);
 
     let client_wants_stream = converted.stream
         || headers
@@ -413,16 +327,48 @@ async fn proxy_anthropic_messages_inner(
         }
     }
 
+    // Build-plane adapt when experimental impersonation / native markers force cli-chat-proxy.
+    let plane = decide_plane(&config, &headers, "/chat/completions");
+    if plane.build_plane {
+        let _ = adapt_chat_body_for_build_plane(&mut chat_body);
+    }
+
     let outbound_body = Bytes::from(serde_json::to_vec(&chat_body)?);
     let session_key = session_affinity::extract_session_key(&headers, Some(&chat_body));
     let http = ctx.client();
-    let upstream_base = config.xai_base_url.trim_end_matches('/');
+    let upstream_base = plane.upstream_base.clone();
     let url = format!("{upstream_base}/chat/completions");
+    let conv_header = headers
+        .get("x-grok-conv-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            session_key
+                .as_deref()
+                .and_then(session_affinity::stable_cache_key)
+        });
+    let passthrough_headers = if plane.inject_build_headers {
+        collect_build_plane_headers(
+            &headers,
+            &BuildPlaneHeaderContext {
+                model_id: Some(resolved_model.as_str()),
+                session_id: session_key.as_deref(),
+                conv_id: conv_header.as_deref(),
+                agent_id: Some("gateway"),
+                force_official_ua: plane.experimental_impersonation,
+            },
+        )
+    } else {
+        Vec::new()
+    };
 
     let build_upstream = {
         let url = url.clone();
+        let passthrough_headers = passthrough_headers.clone();
         move |client: &reqwest::Client, token: &str, body: Bytes| {
-            client
+            let mut req = client
                 .post(&url)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
@@ -433,13 +379,24 @@ async fn proxy_anthropic_messages_inner(
                     } else {
                         "application/json"
                     },
-                )
-                .body(body)
+                );
+            // Official bag already includes x-grok-conv-id / model-override / etc.
+            for (name, value) in &passthrough_headers {
+                req = req.header(name.clone(), value.as_str());
+            }
+            req.body(body)
         }
     };
 
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
+    if plane.experimental_impersonation {
+        tracing::info!(
+            target: "gateway",
+            upstream = %upstream_base,
+            "Grok Build session plane (Anthropic) → cli-chat-proxy"
+        );
+    }
     let (mut account, _token, upstream) = send_with_account_failover(
         &config,
         &http,
@@ -461,9 +418,9 @@ async fn proxy_anthropic_messages_inner(
             .map(|v| v.contains("text/event-stream") || v.contains("stream"))
             .unwrap_or(false);
 
-    let latency_ms = started.elapsed().as_millis() as u64;
+    let ttfb_ms = started.elapsed().as_millis() as u64;
     let path = "/v1/messages";
-    let client_source = "anthropic-messages";
+    let client_source = effective_client_source(&plane, "anthropic-messages");
 
     if is_stream {
         if status.is_success() {
@@ -486,8 +443,8 @@ async fn proxy_anthropic_messages_inner(
             Some(converted.requested_model.clone()),
             Some(resolved_model.clone()),
             status.as_u16(),
-            latency_ms,
-            client_source.to_string(),
+            started,
+            client_source.clone(),
             config.session_affinity,
             config.session_affinity_ttl_secs,
             account.id.clone(),
@@ -499,7 +456,9 @@ async fn proxy_anthropic_messages_inner(
         // Claude Code reports those as "Connection closed mid-response" because
         // the HTTP body aborts before `message_stop`. On abort we stop the head
         // stream and still run finish() to synthesize a clean SSE trailer.
-        let converter = Arc::new(parking_lot::Mutex::new(OpenAiToAnthropicSse::new()));
+        let converter = Arc::new(parking_lot::Mutex::new(
+            OpenAiToAnthropicSse::with_thinking_mode(thinking_mode),
+        ));
         let tracker = usage_tracker.clone();
         let conv_push = converter.clone();
         let request_id_for_log = request_id.clone();
@@ -555,10 +514,26 @@ async fn proxy_anthropic_messages_inner(
                 }
             }
         }
+        insert_observability_headers_ex(
+            response.headers_mut(),
+            plane_label(plane.build_plane, plane.experimental_impersonation, false),
+            &account.id,
+            ttfb_ms,
+            truncated,
+            &config.anthropic_thinking_mode,
+            None,
+            Some(&requested_model_str),
+            Some(&resolved_model),
+            Some(convert_ms),
+            Some(optimize_ms),
+        );
         tracing::debug!(
             target: "gateway",
             %mapping_reason,
             model = %resolved_model,
+            thinking = %config.anthropic_thinking_mode,
+            convert_ms,
+            optimize_ms,
             "anthropic messages stream started"
         );
         return Ok(response);
@@ -584,7 +559,7 @@ async fn proxy_anthropic_messages_inner(
     });
 
     let (out_status, out_value) = if status.is_success() {
-        match openai_chat_to_anthropic(&upstream_json) {
+        match openai_chat_to_anthropic_with_thinking(&upstream_json, thinking_mode) {
             Ok(v) => (StatusCode::OK, v),
             Err(err) => (
                 StatusCode::BAD_GATEWAY,
@@ -632,11 +607,11 @@ async fn proxy_anthropic_messages_inner(
         &request_id,
         Some(account.id.clone()),
         path,
-        Some(converted.requested_model),
-        Some(resolved_model),
+        Some(converted.requested_model.clone()),
+        Some(resolved_model.clone()),
         out_status.as_u16(),
         started.elapsed().as_millis() as u64,
-        None,
+        Some(ttfb_ms.max(1)),
         i,
         o,
         c,
@@ -646,7 +621,7 @@ async fn proxy_anthropic_messages_inner(
             // Prefer raw upstream for diagnostics; fall back to mapped Anthropic body.
             Some(upstream_json.to_string())
         },
-        client_source,
+        &client_source,
         Some(mapping_reason),
     );
 
@@ -656,7 +631,113 @@ async fn proxy_anthropic_messages_inner(
         .body(Body::from(serde_json::to_vec(&out_value)?))
         .unwrap_or_else(|_| Response::new(Body::empty()));
     copy_safe_headers(upstream_headers, response.headers_mut());
+    insert_observability_headers_ex(
+        response.headers_mut(),
+        plane_label(plane.build_plane, plane.experimental_impersonation, false),
+        &account.id,
+        started.elapsed().as_millis() as u64,
+        truncated,
+        &config.anthropic_thinking_mode,
+        None,
+        Some(&requested_model_str),
+        Some(&resolved_model),
+        Some(convert_ms),
+        Some(optimize_ms),
+    );
+    // O-16: cache_control is not full Anthropic semantics on this path.
+    if let Ok(hv) = HeaderValue::from_str("upstream-prefix-only") {
+        response.headers_mut().insert(
+            HeaderName::from_static(HDR_CACHE_MODE),
+            hv,
+        );
+    }
     Ok(response)
+}
+
+fn insert_observability_headers(
+    headers: &mut axum::http::HeaderMap,
+    plane: &str,
+    account_id: &str,
+    upstream_ms: u64,
+    truncated: bool,
+    thinking_mode: &str,
+) {
+    insert_observability_headers_ex(
+        headers,
+        plane,
+        account_id,
+        upstream_ms,
+        truncated,
+        thinking_mode,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_observability_headers_ex(
+    headers: &mut axum::http::HeaderMap,
+    plane: &str,
+    account_id: &str,
+    upstream_ms: u64,
+    truncated: bool,
+    thinking_mode: &str,
+    tools_injected: Option<&str>,
+    model_requested: Option<&str>,
+    model_routed: Option<&str>,
+    convert_ms: Option<u64>,
+    optimize_ms: Option<u64>,
+) {
+    if let Ok(hv) = HeaderValue::from_str(plane) {
+        headers.insert(HeaderName::from_static(HDR_PLANE), hv);
+    }
+    if let Ok(hv) = HeaderValue::from_str(&short_account_tag(account_id)) {
+        headers.insert(HeaderName::from_static(HDR_ACCOUNT), hv);
+    }
+    if let Ok(hv) = HeaderValue::from_str(&upstream_ms.to_string()) {
+        headers.insert(HeaderName::from_static(HDR_UPSTREAM_MS), hv);
+    }
+    if truncated {
+        headers.insert(
+            HeaderName::from_static(HDR_TRUNCATED),
+            HeaderValue::from_static("1"),
+        );
+    }
+    if !thinking_mode.is_empty() {
+        if let Ok(hv) = HeaderValue::from_str(thinking_mode) {
+            headers.insert(HeaderName::from_static(HDR_THINKING), hv);
+        }
+    }
+    if let Some(t) = tools_injected.filter(|s| !s.is_empty()) {
+        if let Ok(hv) = HeaderValue::from_str(t) {
+            headers.insert(HeaderName::from_static(HDR_TOOLS_INJECTED), hv);
+        }
+    }
+    if let Some(m) = model_requested.filter(|s| !s.is_empty()) {
+        if let Ok(hv) = HeaderValue::from_str(m) {
+            headers.insert(HeaderName::from_static(HDR_MODEL_REQUESTED), hv);
+        }
+    }
+    if let Some(m) = model_routed.filter(|s| !s.is_empty()) {
+        if let Ok(hv) = HeaderValue::from_str(m) {
+            headers.insert(HeaderName::from_static(HDR_MODEL_ROUTED), hv.clone());
+            // upstream often same as routed after mapping; clients can refine later
+            headers.insert(HeaderName::from_static(HDR_MODEL_UPSTREAM), hv);
+        }
+    }
+    if let Some(ms) = convert_ms {
+        if let Ok(hv) = HeaderValue::from_str(&ms.to_string()) {
+            headers.insert(HeaderName::from_static(HDR_CONVERT_MS), hv);
+        }
+    }
+    if let Some(ms) = optimize_ms {
+        if let Ok(hv) = HeaderValue::from_str(&ms.to_string()) {
+            headers.insert(HeaderName::from_static(HDR_OPTIMIZE_MS), hv);
+        }
+    }
 }
 
 async fn proxy_json_inner(
@@ -682,8 +763,16 @@ async fn proxy_json_inner(
     let mut client_wants_stream = false;
     // Capture session key before sanitize strips previous_response_id etc.
     let mut session_key: Option<String> = None;
-    // Detect Grok Build early — native plane must keep continuity + skip Codex-only guards.
-    let build_plane = is_grok_build_plane(&headers);
+    // Plane decision: native markers OR experimental impersonation flag.
+    let plane: PlaneDecision = decide_plane(&config, &headers, path);
+    let build_plane = plane.build_plane;
+    // Nuclear strip / messages-only: console only (protects build-plane continuity).
+    let apply_console_guards = plane.apply_codex_console_guards;
+    // Premature agent-stop recovery: console + experimental (not native Grok Build TUI).
+    let apply_empty_completion = plane.apply_empty_completion_recovery;
+    // Image tool bridge: run for non-native clients (console or experimental
+    // impersonation). Native Grok Build handles tools upstream.
+    let run_image_tool_bridge = !plane.native_build_client;
 
     if matches!(method, Method::POST | Method::PUT | Method::PATCH) && !outbound_body.is_empty() {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&outbound_body) {
@@ -740,21 +829,46 @@ async fn proxy_json_inner(
                 || path.ends_with("/responses/compact");
             let is_chat = path.contains("/chat/completions");
             if is_responses {
-                // Build plane: keep previous_response_id / prompt_cache_retention for
-                // cli-chat-proxy continuity. Codex console path still strips them.
-                let sanitized = sanitize_responses_request_ex(&mut value, build_plane);
+                // Continuity and tool inject are independent:
+                // - native Build: preserve, no inject
+                // - experimental Build: preserve + compact Codex tools
+                // - console: strip continuity + full inject
+                let sanitized = sanitize_responses_request_opts(
+                    &mut value,
+                    SanitizeOpts {
+                        preserve_native_continuity: build_plane,
+                        inject_codex_compat_tools: plane.inject_codex_compat_tools,
+                    },
+                );
                 custom_tool_names = sanitized.custom_tool_names;
                 has_image_gen_tools = sanitized.has_image_gen_tools;
                 if sanitized.modified {
                     body_changed = true;
                 }
-                // Image tool loop needs a full JSON response; force non-stream upstream.
-                // Only for non-build (Codex) plane — Grok Build handles tools natively.
-                if !build_plane
+                // Official Grok Build Responses path: fill missing prompt_cache_* for multi-turn.
+                if build_plane
+                    && adapt_responses_body_for_build_plane(
+                        &mut value,
+                        session_key.as_deref(),
+                    )
+                {
+                    body_changed = true;
+                }
+                // Image tool loop needs a full JSON response; force non-stream upstream
+                // when we will fulfill image tools server-side (non-native clients).
+                if run_image_tool_bridge
                     && has_image_gen_tools
                     && value.get("stream").and_then(|v| v.as_bool()) == Some(true)
                 {
                     value["stream"] = Value::Bool(false);
+                    body_changed = true;
+                }
+                // Agent tools: keep stream=true for real SSE TTFT. Premature-stop recovery
+                // runs by holding `response.completed` until the stream ends (see
+                // stream_responses_hold_completed), not by forcing non-stream anymore.
+            }
+            if is_chat && build_plane {
+                if adapt_chat_body_for_build_plane(&mut value) {
                     body_changed = true;
                 }
             }
@@ -782,14 +896,17 @@ async fn proxy_json_inner(
     let custom_tool_names = Arc::new(custom_tool_names);
 
     let http = ctx.client();
-    let upstream_base = resolve_upstream_base(&config, &headers);
+    let upstream_base = plane.upstream_base.clone();
     let url = format!("{upstream_base}{path}");
-    let effective_source = if build_plane {
-        "grok-build"
-    } else {
-        client_source
-    };
-    if build_plane {
+    let effective_source = effective_client_source(&plane, client_source);
+    if plane.experimental_impersonation {
+        tracing::info!(
+            target: "gateway",
+            %path,
+            upstream = %upstream_base,
+            "Grok Build session plane → cli-chat-proxy"
+        );
+    } else if build_plane {
         tracing::debug!(
             target: "gateway",
             %path,
@@ -838,8 +955,20 @@ async fn proxy_json_inner(
             .and_then(session_affinity::stable_cache_key)
     });
 
-    let passthrough_headers = if build_plane {
-        collect_build_plane_passthrough_headers(&headers)
+    let model_for_headers = resolved_model
+        .as_deref()
+        .or(requested_model.as_deref());
+    let passthrough_headers = if plane.inject_build_headers {
+        collect_build_plane_headers(
+            &headers,
+            &BuildPlaneHeaderContext {
+                model_id: model_for_headers,
+                session_id: session_key.as_deref(),
+                conv_id: conv_header.as_deref(),
+                agent_id: Some("gateway"),
+                force_official_ua: plane.experimental_impersonation,
+            },
+        )
     } else {
         Vec::new()
     };
@@ -849,20 +978,21 @@ async fn proxy_json_inner(
         let url = url.clone();
         let accept = accept.clone();
         let passthrough_headers = passthrough_headers.clone();
+        let inject_build = plane.inject_build_headers;
         move |client: &reqwest::Client, token: &str, body: Bytes| {
             let mut req = client
                 .request(method.clone(), &url)
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::ACCEPT, accept.as_str());
-            // Apply client CLI headers first, then pin conv-id so affinity wins.
+            // Official bag includes conv-id / model-override / token-auth / etc.
             for (name, value) in &passthrough_headers {
-                if name.as_str().eq_ignore_ascii_case("x-grok-conv-id") {
-                    continue;
-                }
                 req = req.header(name.clone(), value.as_str());
             }
-            if let Some(ref cid) = conv_header {
-                req = req.header("x-grok-conv-id", cid.as_str());
+            // Console path still benefits from conv-id affinity when no build bag.
+            if !inject_build {
+                if let Some(ref cid) = conv_header {
+                    req = req.header("x-grok-conv-id", cid.as_str());
+                }
             }
             if !body.is_empty() || matches!(method, Method::POST | Method::PUT | Method::PATCH) {
                 // Force a single JSON content type for mutating requests (even empty body).
@@ -877,10 +1007,8 @@ async fn proxy_json_inner(
     // Single-account happy path is unchanged (one pick + one send).
     // On account-scoped failures (401/403/429/5xx/transport), try other accounts
     // inside this request so the client does not see several hard failures in a row.
-    // Files offload targets console Files API (api.x.ai) — never enable on Grok Build
-    // plane where inference hits cli-chat-proxy (file_id would be wrong account/plane).
-    let allow_files_offload = !build_plane
-        && (path.contains("/responses") || path.contains("/chat/completions"));
+    // Files offload targets console Files API (api.x.ai) — never enable on build chat plane.
+    let allow_files_offload = plane.allow_files_offload;
     let (mut account, token, upstream) = send_with_account_failover(
         &config,
         &http,
@@ -903,7 +1031,9 @@ async fn proxy_json_inner(
             .unwrap_or(false);
 
     let request_id = Uuid::new_v4().to_string();
-    let latency_ms = started.elapsed().as_millis() as u64;
+    // Time-to-first-byte (response headers). For non-stream JSON this is often ≈ total
+    // because upstream buffers the full generation; still useful when headers arrive early.
+    let ttfb_ms = started.elapsed().as_millis() as u64;
 
     if is_stream {
         if status.is_success() {
@@ -924,7 +1054,7 @@ async fn proxy_json_inner(
         // Grok Build always true-streams. Non-stream JSON empty recovery is separate.
         let guard_empty = config.empty_completion_retry
             && config.empty_completion_stream_buffer
-            && !build_plane
+            && apply_empty_completion
             && is_responses_path(path)
             && status.is_success()
             && parsed_request.is_some();
@@ -940,6 +1070,7 @@ async fn proxy_json_inner(
                 &build_upstream,
                 parsed_request.as_ref().unwrap(),
                 custom_tool_names.as_ref(),
+                started,
             )
             .await?;
             let (i, o, c) = extract_usage_tokens(&recovered.usage_source);
@@ -950,7 +1081,7 @@ async fn proxy_json_inner(
                     config.session_affinity_ttl_secs,
                 );
             }
-            let latency_ms = started.elapsed().as_millis() as u64;
+            let total_ms = started.elapsed().as_millis() as u64;
             let reason = recovered
                 .retried
                 .then_some("empty-completion-retry".to_string())
@@ -962,13 +1093,13 @@ async fn proxy_json_inner(
                 requested_model,
                 resolved_model,
                 status.as_u16(),
-                latency_ms,
-                None,
+                total_ms,
+                Some(recovered.first_token_ms.unwrap_or(ttfb_ms).max(1)),
                 i,
                 o,
                 c,
                 None,
-                effective_source,
+                &effective_source,
                 reason,
             );
             let mut response = Response::builder()
@@ -988,6 +1119,54 @@ async fn proxy_json_inner(
             return Ok(response);
         }
 
+        let agent_tools = parsed_request
+            .as_ref()
+            .and_then(|v| v.get("tools").and_then(|t| t.as_array()))
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        // Codex agent tools: true-stream deltas, hold `response.completed` so we can
+        // still run empty-completion recovery without forcing non-stream (TTFT).
+        let hold_completed = apply_empty_completion
+            && config.empty_completion_retry
+            && is_responses_path(path)
+            && agent_tools
+            && parsed_request.is_some()
+            && status.is_success();
+
+        if hold_completed {
+            tracing::debug!(
+                target: "gateway",
+                "SSE hold-completed path (agent tools + empty-completion recovery)"
+            );
+            let build_arc: UpstreamBuilder = Arc::new(build_upstream);
+            return stream_responses_hold_completed(
+                upstream,
+                status,
+                upstream_headers,
+                http.clone(),
+                token.clone(),
+                build_arc,
+                parsed_request.as_ref().unwrap().clone(),
+                custom_tool_names.as_ref().clone(),
+                build_plane,
+                request_id,
+                account.id.clone(),
+                path.to_string(),
+                requested_model.clone(),
+                resolved_model.clone(),
+                effective_source.to_string(),
+                config.session_affinity,
+                config.session_affinity_ttl_secs,
+                started,
+                ttfb_ms,
+                plane.inject_codex_compat_tools,
+                plane.build_plane,
+                plane.experimental_impersonation,
+                plane.media_path,
+            )
+            .await;
+        }
+
         let custom_names = custom_tool_names.clone();
         // Scan SSE for usage (xAI puts cached_tokens under input_tokens_details).
         // Log on stream drop so streaming traffic is not silently recorded as 0 tokens.
@@ -998,7 +1177,7 @@ async fn proxy_json_inner(
             requested_model.clone(),
             resolved_model.clone(),
             status.as_u16(),
-            latency_ms,
+            started,
             effective_source.to_string(),
             config.session_affinity,
             config.session_affinity_ttl_secs,
@@ -1016,6 +1195,24 @@ async fn proxy_json_inner(
         let body = Body::from_stream(stream);
         let mut response = Response::builder().status(status).body(body).unwrap_or_else(|_| Response::new(Body::empty()));
         copy_safe_headers(upstream_headers, response.headers_mut());
+        let tools_inj = if plane.inject_codex_compat_tools {
+            Some("x_search,image_gen")
+        } else {
+            None
+        };
+        insert_observability_headers_ex(
+            response.headers_mut(),
+            plane_label(plane.build_plane, plane.experimental_impersonation, plane.media_path),
+            &account.id,
+            ttfb_ms,
+            false,
+            "",
+            tools_inj,
+            requested_model.as_deref(),
+            resolved_model.as_deref(),
+            None,
+            None,
+        );
         return Ok(response);
     }
 
@@ -1024,7 +1221,7 @@ async fn proxy_json_inner(
     // Retry once when xAI rejects opaque context or input item shapes (Codex multi-turn).
     // Skip nuclear strip on Grok Build plane: it removes prompt_cache_key / continuity
     // and forces a full re-tokenize (token blow-up + cache miss).
-    if !status.is_success() && !build_plane {
+    if !status.is_success() && apply_console_guards {
         let err_text = String::from_utf8_lossy(&bytes);
         if is_compaction_blob_error(&err_text) || is_model_input_error(&err_text) {
             if let Some(mut req_value) = parsed_request.clone() {
@@ -1113,10 +1310,10 @@ async fn proxy_json_inner(
         }
 
         // Reasoning-only / narration-only premature stop → silent retry so Codex keeps going.
-        // Disabled on Grok Build plane (native agent loop; retries would double SuperGrok spend).
+        // Enabled for console + experimental impersonation; disabled only for native Grok Build TUI.
         if status.is_success()
             && config.empty_completion_retry
-            && !build_plane
+            && apply_empty_completion
             && is_responses_path(path)
             && should_retry_premature_agent_stop(&value, parsed_request.as_ref())
         {
@@ -1127,6 +1324,7 @@ async fn proxy_json_inner(
                     &build_upstream,
                     req_template,
                     &value,
+                    /*preserve_cache_keys*/ build_plane,
                 )
                 .await
                 {
@@ -1210,20 +1408,23 @@ async fn proxy_json_inner(
             "prompt cache hit recorded"
         );
     }
+    // Non-stream: total = full body (+ recovery); first token ≈ TTFB (headers).
+    // Agent tools force non-stream so StreamUsageTracker never runs — must fill here.
+    let total_ms = started.elapsed().as_millis() as u64;
     log_request(
         &request_id,
         Some(account.id.clone()),
         path,
-        requested_model,
-        resolved_model,
+        requested_model.clone(),
+        resolved_model.clone(),
         status.as_u16(),
-        latency_ms,
-        None,
+        total_ms,
+        Some(ttfb_ms.max(1)),
         input_tokens,
         output_tokens,
         cache_tokens,
         error_summary,
-        effective_source,
+        &effective_source,
         mapping_reason,
     );
 
@@ -1255,11 +1456,55 @@ async fn proxy_json_inner(
         }
     }
 
+    // R2-05: optional body fields (do not replace `model`)
+    let out_bytes = if status.is_success() {
+        if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(r) = requested_model.as_ref() {
+                    obj.entry("requested_model".to_string())
+                        .or_insert_with(|| json!(r));
+                }
+                if let Some(r) = resolved_model.as_ref() {
+                    obj.entry("routed_model".to_string())
+                        .or_insert_with(|| json!(r));
+                    if let Some(up) = obj.get("model").cloned() {
+                        obj.entry("upstream_model".to_string()).or_insert(up);
+                    }
+                }
+                Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
+            } else {
+                bytes
+            }
+        } else {
+            bytes
+        }
+    } else {
+        bytes
+    };
+
     let mut response = Response::builder()
         .status(status)
-        .body(Body::from(bytes))
+        .body(Body::from(out_bytes))
         .unwrap_or_else(|_| Response::new(Body::empty()));
     copy_safe_headers(upstream_headers, response.headers_mut());
+    let tools_inj = if plane.inject_codex_compat_tools {
+        Some("x_search,image_gen")
+    } else {
+        None
+    };
+    insert_observability_headers_ex(
+        response.headers_mut(),
+        plane_label(plane.build_plane, plane.experimental_impersonation, plane.media_path),
+        &account.id,
+        started.elapsed().as_millis() as u64,
+        false,
+        "",
+        tools_inj,
+        requested_model.as_deref(),
+        resolved_model.as_deref(),
+        None,
+        None,
+    );
     Ok(response)
 }
 
@@ -1356,6 +1601,204 @@ struct EmptyCompletionStreamResult {
     /// Best-effort JSON used for usage / session-id extraction.
     usage_source: Value,
     retried: bool,
+    /// ms from request start to first SSE body chunk (if any).
+    first_token_ms: Option<u64>,
+}
+
+/// Boxed upstream request builder for spawned SSE hold/recovery tasks.
+type UpstreamBuilder = std::sync::Arc<
+    dyn Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder + Send + Sync + 'static,
+>;
+
+/// True-stream Responses SSE for Codex agent tools while preserving empty-completion recovery.
+///
+/// Strategy:
+/// 1. Forward every SSE frame **except** `response.completed` (client sees tokens early).
+/// 2. When the upstream stream ends, inspect the completed payload.
+/// 3. If premature stop → multi-phase non-stream recovery, then emit recovered SSE.
+/// 4. Otherwise flush the held `response.completed` frame(s).
+///
+/// Image-gen bridge still forces non-stream separately.
+#[allow(clippy::too_many_arguments)]
+async fn stream_responses_hold_completed(
+    upstream: reqwest::Response,
+    status: reqwest::StatusCode,
+    upstream_headers: reqwest::header::HeaderMap,
+    http: reqwest::Client,
+    token: String,
+    build_upstream: UpstreamBuilder,
+    original_request: Value,
+    custom_tool_names: HashSet<String>,
+    build_plane: bool,
+    request_id: String,
+    account_id: String,
+    path: String,
+    requested_model: Option<String>,
+    resolved_model: Option<String>,
+    client_source: String,
+    session_affinity: bool,
+    session_affinity_ttl_secs: u64,
+    started: Instant,
+    ttfb_ms: u64,
+    inject_codex_compat_tools: bool,
+    plane_build: bool,
+    plane_experimental: bool,
+    plane_media: bool,
+) -> AppResult<Response> {
+    let status_code = status.as_u16();
+    let preserve_cache = build_plane
+        || original_request
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let account_hdr = account_id.clone();
+
+    let usage_tracker = Arc::new(StreamUsageTracker::new(
+        request_id.clone(),
+        Some(account_id.clone()),
+        path.clone(),
+        requested_model.clone(),
+        resolved_model.clone(),
+        status_code,
+        started,
+        client_source.clone(),
+        session_affinity,
+        session_affinity_ttl_secs,
+        account_id.clone(),
+    ));
+
+    tokio::spawn(async move {
+        let tracker = usage_tracker.clone();
+        let mut stream = upstream.bytes_stream();
+        let mut carry = String::new();
+        let mut held = String::new();
+        let mut full = String::new();
+        let custom_names = custom_tool_names;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    tracker.note_chunk(&bytes);
+                    let rewritten = rewrite_sse_chunk(&bytes, &custom_names);
+                    let text = String::from_utf8_lossy(&rewritten);
+                    full.push_str(&text);
+                    let pass = split_sse_hold_completed(&text, &mut carry, &mut held);
+                    if !pass.is_empty() && tx.send(Ok(Bytes::from(pass))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        // Try to finish a trailing incomplete frame.
+        if !carry.is_empty() {
+            let pass = split_sse_hold_completed("\n\n", &mut carry, &mut held);
+            if !pass.is_empty() {
+                let _ = tx.send(Ok(Bytes::from(pass))).await;
+            }
+        }
+
+        let completed = extract_completed_response_from_sse(&full)
+            .or_else(|| extract_completed_response_from_sse(&held));
+        let mut flushed_recovery = false;
+        if let Some(ref completed) = completed {
+            if should_retry_premature_agent_stop(completed, Some(&original_request)) {
+                match retry_empty_completion_once(
+                    &http,
+                    &token,
+                    build_upstream.as_ref(),
+                    &original_request,
+                    completed,
+                    preserve_cache,
+                )
+                .await
+                {
+                    Ok(Some(mut value)) => {
+                        if !custom_names.is_empty() {
+                            let _ = rewrite_responses_payload(&mut value, &custom_names);
+                        }
+                        if let Some(rid) = value.get("id").and_then(|v| v.as_str()) {
+                            session_affinity::bind_response_chain(
+                                rid,
+                                &account_id,
+                                session_affinity_ttl_secs,
+                            );
+                        }
+                        let sse = responses_json_to_sse(&value);
+                        let bytes = rewrite_sse_chunk(&Bytes::from(sse), &custom_names);
+                        let _ = tx.send(Ok(bytes)).await;
+                        flushed_recovery = true;
+                        tracing::warn!(
+                            target: "gateway",
+                            "SSE hold-completed: recovered premature stop after true stream"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "gateway",
+                            "SSE hold-completed: recovery still empty; flushing original completed"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "gateway",
+                            error = %err,
+                            "SSE hold-completed: recovery failed; flushing original completed"
+                        );
+                    }
+                }
+            }
+        }
+
+        if !flushed_recovery && !held.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(held))).await;
+        }
+        // StreamUsageTracker Drop logs first_token + total latency.
+        drop(tracker);
+    });
+
+    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(item) => Some((item, rx)),
+            None => None,
+        }
+    }));
+
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()));
+    copy_safe_headers(upstream_headers, response.headers_mut());
+    let tools_inj = if inject_codex_compat_tools {
+        Some("x_search,image_gen")
+    } else {
+        None
+    };
+    insert_observability_headers_ex(
+        response.headers_mut(),
+        plane_label(plane_build, plane_experimental, plane_media),
+        &account_hdr,
+        ttfb_ms,
+        false,
+        "",
+        tools_inj,
+        requested_model.as_deref(),
+        resolved_model.as_deref(),
+        None,
+        None,
+    );
+    Ok(response)
 }
 
 /// Buffer an upstream Responses SSE, rewrite custom tools, and if the completed
@@ -1367,6 +1810,7 @@ async fn buffer_sse_and_recover_empty_completion<F>(
     build_upstream: &F,
     original_request: &Value,
     custom_names: &HashSet<String>,
+    started: Instant,
 ) -> AppResult<EmptyCompletionStreamResult>
 where
     F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
@@ -1374,8 +1818,12 @@ where
     let mut buf = Vec::with_capacity(64 * 1024);
     let mut stream = upstream.bytes_stream();
     let mut truncated = false;
+    let mut first_token_ms: Option<u64> = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| AppError::msg(format!("sse buffer read: {e}")))?;
+        if first_token_ms.is_none() && !chunk.is_empty() {
+            first_token_ms = Some(started.elapsed().as_millis() as u64).map(|m| m.max(1));
+        }
         if buf.len() + chunk.len() > SSE_BUFFER_LIMIT {
             truncated = true;
             // Keep a prefix so we can still return something useful.
@@ -1402,6 +1850,7 @@ where
             sse,
             usage_source,
             retried,
+            first_token_ms,
         });
     }
 
@@ -1410,12 +1859,20 @@ where
     if let Some(completed) = extract_completed_response_from_sse(&sse) {
         usage_source = completed;
         if should_retry_premature_agent_stop(&usage_source, Some(original_request)) {
+            // Prefer keeping cache keys when the original agent turn already set them
+            // (common on experimental-build after adapt_responses_body_for_build_plane).
+            let preserve = original_request
+                .get("prompt_cache_key")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
             match retry_empty_completion_once(
                 http,
                 token,
                 build_upstream,
                 original_request,
                 &usage_source,
+                preserve,
             )
             .await
             {
@@ -1450,87 +1907,130 @@ where
         sse,
         usage_source,
         retried,
+        first_token_ms,
     })
 }
 
-/// Up to two silent non-stream recovery attempts for premature agent stops.
+/// Multi-phase silent recovery for premature agent stops (Grok Build–aligned).
 ///
-/// One attempt is not always enough: empty → narration-only still ends Codex.
+/// 1. **Transparent resample** (`TRANSPARENT_RESAMPLE_MAX`) — same request body,
+///    `stream=false`, keep continuity fields (Build empty-response policy).
+/// 2. **Soft recovery** (`SOFT_RECOVERY_MAX`) — pin shell `tool_choice` + nudge.
+/// 3. **Hard recovery** — synthesize a neutral `function_call` for Codex.
+///
 /// Returns `Ok(Some(value))` when a non-premature payload is obtained, or when
-/// a partial recovery is *better* than the original empty (e.g. message > pure
-/// reasoning). `Ok(None)` only when nothing improved.
+/// a partial recovery is *better* than the original empty. `Ok(None)` only when
+/// nothing improved.
 async fn retry_empty_completion_once<F>(
     http: &reqwest::Client,
     token: &str,
     build_upstream: &F,
     original_request: &Value,
     empty_response: &Value,
+    preserve_cache_keys: bool,
 ) -> AppResult<Option<Value>>
 where
-    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
+    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder + ?Sized,
 {
-    // One soft retry (pinned tool_choice); if still narration, inject a synthetic call.
-    // Two soft retries burned ~5s without producing tools (see session 019f5eaf).
-    const MAX_ATTEMPTS: u32 = 1;
-    let mut seed = empty_response.clone();
+    let kind = classify_premature_stop(empty_response, Some(original_request));
+    tracing::warn!(
+        ?kind,
+        preserve_cache_keys,
+        transparent_max = TRANSPARENT_RESAMPLE_MAX,
+        soft_max = SOFT_RECOVERY_MAX,
+        "starting multi-phase premature-stop recovery"
+    );
+
     let mut best = empty_response.clone();
     let mut best_score = recovery_quality_score(&best);
-    for attempt in 1..=MAX_ATTEMPTS {
-        let retry_req = build_empty_completion_retry_request(original_request, &seed);
-        let retry_body = Bytes::from(serde_json::to_vec(&retry_req)?);
-        let resp = build_upstream(http, token, retry_body)
-            .send()
-            .await
-            .map_err(|e| AppError::msg(format!("empty-completion retry send: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            tracing::warn!(
-                attempt,
-                %status,
-                body = %body.chars().take(240).collect::<String>(),
-                "empty-completion retry upstream non-success"
-            );
-            // Keep best partial if we already improved over pure empty.
-            break;
-        }
-        let content_type = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let bytes = resp.bytes().await?;
-        let value = if content_type.contains("text/event-stream") || content_type.contains("stream")
-        {
-            let text = String::from_utf8_lossy(&bytes);
-            extract_completed_response_from_sse(&text).ok_or_else(|| {
-                AppError::msg("empty-completion retry stream missing response.completed")
-            })?
-        } else {
-            serde_json::from_slice::<Value>(&bytes)?
-        };
-        let score = recovery_quality_score(&value);
-        if score > best_score {
-            best = value.clone();
-            best_score = score;
-        }
-        if !should_retry_premature_agent_stop(&value, Some(original_request)) {
-            if attempt > 1 {
-                tracing::warn!(attempt, "premature agent stop cleared after multi-retry");
+    let mut seed = empty_response.clone();
+
+    // ── Phase A: transparent resample (Build-style) ──────────────────────
+    for attempt in 1..=TRANSPARENT_RESAMPLE_MAX {
+        let retry_req = build_transparent_resample_request(original_request);
+        match send_recovery_sample(http, token, build_upstream, &retry_req).await {
+            Ok(value) => {
+                let score = recovery_quality_score(&value);
+                if score > best_score {
+                    best = value.clone();
+                    best_score = score;
+                }
+                if !should_retry_premature_agent_stop(&value, Some(original_request)) {
+                    tracing::warn!(
+                        phase = "transparent",
+                        attempt,
+                        ?kind,
+                        "premature agent stop cleared via transparent resample"
+                    );
+                    return Ok(Some(value));
+                }
+                tracing::warn!(
+                    phase = "transparent",
+                    attempt,
+                    max = TRANSPARENT_RESAMPLE_MAX,
+                    score,
+                    "transparent resample still empty/narration"
+                );
+                seed = value;
             }
-            return Ok(Some(value));
+            Err(err) => {
+                tracing::warn!(
+                    phase = "transparent",
+                    attempt,
+                    error = %err,
+                    "transparent resample upstream failed"
+                );
+                break;
+            }
         }
-        tracing::warn!(
-            attempt,
-            max = MAX_ATTEMPTS,
-            score,
-            "recovery attempt still empty/narration; retrying if budget remains"
-        );
-        seed = value;
     }
-    // Soft retries (even with tool_choice pin) often still return narration.
-    // Hard guarantee: inject a real function_call so Codex keeps the turn alive.
+
+    // ── Phase B: soft recovery (tool_choice pin + nudge) ─────────────────
+    for attempt in 1..=SOFT_RECOVERY_MAX {
+        let retry_req = build_soft_recovery_request(
+            original_request,
+            &seed,
+            SoftRecoveryOpts {
+                preserve_cache_keys,
+            },
+        );
+        match send_recovery_sample(http, token, build_upstream, &retry_req).await {
+            Ok(value) => {
+                let score = recovery_quality_score(&value);
+                if score > best_score {
+                    best = value.clone();
+                    best_score = score;
+                }
+                if !should_retry_premature_agent_stop(&value, Some(original_request)) {
+                    tracing::warn!(
+                        phase = "soft",
+                        attempt,
+                        "premature agent stop cleared via soft recovery"
+                    );
+                    return Ok(Some(value));
+                }
+                tracing::warn!(
+                    phase = "soft",
+                    attempt,
+                    max = SOFT_RECOVERY_MAX,
+                    score,
+                    "soft recovery still empty/narration"
+                );
+                seed = value;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    phase = "soft",
+                    attempt,
+                    error = %err,
+                    "soft recovery upstream failed"
+                );
+                break;
+            }
+        }
+    }
+
+    // ── Phase C: hard recovery (synthetic tool call) ─────────────────────
     if let Some(forced) = synthesize_forced_tool_response(original_request, &best) {
         tracing::warn!(
             best_score,
@@ -1548,6 +2048,46 @@ where
         return Ok(Some(best));
     }
     Ok(None)
+}
+
+/// Send one non-stream recovery sample and parse JSON or SSE completed payload.
+async fn send_recovery_sample<F>(
+    http: &reqwest::Client,
+    token: &str,
+    build_upstream: &F,
+    retry_req: &Value,
+) -> AppResult<Value>
+where
+    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder + ?Sized,
+{
+    let retry_body = Bytes::from(serde_json::to_vec(retry_req)?);
+    let resp = build_upstream(http, token, retry_body)
+        .send()
+        .await
+        .map_err(|e| AppError::msg(format!("empty-completion retry send: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::msg(format!(
+            "empty-completion retry upstream {status}: {}",
+            body.chars().take(240).collect::<String>()
+        )));
+    }
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp.bytes().await?;
+    if content_type.contains("text/event-stream") || content_type.contains("stream") {
+        let text = String::from_utf8_lossy(&bytes);
+        extract_completed_response_from_sse(&text).ok_or_else(|| {
+            AppError::msg("empty-completion retry stream missing response.completed")
+        })
+    } else {
+        Ok(serde_json::from_slice::<Value>(&bytes)?)
+    }
 }
 
 /// Last-resort request: only plain user/assistant text messages.
@@ -1953,13 +2493,35 @@ where
             replace_account_tokens(&account)?;
         }
 
+        // Account-scoped continuity (previous_response_id): strip when this pick is
+        // not the session's bound principal — covers (a) in-request failover
+        // attempt>0 and (b) sticky miss because bound account is cooldown/disabled.
+        let sticky_mismatch = session_key
+            .and_then(|k| session_affinity::lookup(k))
+            .map(|bound| bound != account.id)
+            .unwrap_or(false);
+        let force_strip = attempt > 0 || sticky_mismatch;
+        let attempt_body = if force_strip {
+            let stripped = session_affinity::body_for_failover_attempt(&body, 1);
+            if stripped.as_ref() != body.as_ref() {
+                tracing::info!(
+                    account = %account.id,
+                    attempt,
+                    sticky_mismatch,
+                    "stripped account-scoped continuity (multi-account rebalance)"
+                );
+            }
+            stripped
+        } else {
+            body.clone()
+        };
+
         // Per-account Files offload: only when body is heavy enough to matter.
         // Failures fall back to already-truncated sync optimize (never block the turn).
         // Only attempt Files API offload when body is large enough that a 32k+
         // text blob could exist (cheap gate before JSON parse + uploads).
-        let send_body = if allow_files_offload && body.len() >= OFFLOAD_TEXT_MIN {
-
-            match serde_json::from_slice::<Value>(&body) {
+        let send_body = if allow_files_offload && attempt_body.len() >= OFFLOAD_TEXT_MIN {
+            match serde_json::from_slice::<Value>(&attempt_body) {
                 Ok(mut value) => {
                     match offload_large_text_blobs(
                         &mut value,
@@ -1974,10 +2536,11 @@ where
                             if stats.modified {
                                 stats.log_summary("files-offload");
                                 Bytes::from(
-                                    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec()),
+                                    serde_json::to_vec(&value)
+                                        .unwrap_or_else(|_| attempt_body.to_vec()),
                                 )
                             } else {
-                                body.clone()
+                                attempt_body.clone()
                             }
                         }
                         Err(err) => {
@@ -1985,14 +2548,14 @@ where
                                 account = %account.id,
                                 "files offload skipped: {err}"
                             );
-                            body.clone()
+                            attempt_body.clone()
                         }
                     }
                 }
-                Err(_) => body.clone(),
+                Err(_) => attempt_body.clone(),
             }
         } else {
-            body.clone()
+            attempt_body
         };
 
         let mut upstream = build_upstream(http, &token, send_body.clone()).send().await;
@@ -2182,7 +2745,8 @@ struct StreamUsageTracker {
     requested_model: Option<String>,
     resolved_model: Option<String>,
     status_code: u16,
-    latency_ms: u64,
+    /// Wall-clock start of the client request (for total latency + first token).
+    started: Instant,
     client_source: String,
     session_affinity: bool,
     session_affinity_ttl_secs: u64,
@@ -2190,6 +2754,8 @@ struct StreamUsageTracker {
     input: AtomicU64,
     output: AtomicU64,
     cache: AtomicU64,
+    /// 0 = not yet seen; else ms from `started` to first body chunk.
+    first_token_ms: AtomicU64,
     logged: AtomicBool,
     /// Carry incomplete UTF-8 / partial SSE lines across chunks.
     pending: parking_lot::Mutex<String>,
@@ -2204,7 +2770,7 @@ impl StreamUsageTracker {
         requested_model: Option<String>,
         resolved_model: Option<String>,
         status_code: u16,
-        latency_ms: u64,
+        started: Instant,
         client_source: String,
         session_affinity: bool,
         session_affinity_ttl_secs: u64,
@@ -2217,7 +2783,7 @@ impl StreamUsageTracker {
             requested_model,
             resolved_model,
             status_code,
-            latency_ms,
+            started,
             client_source,
             session_affinity,
             session_affinity_ttl_secs,
@@ -2225,12 +2791,22 @@ impl StreamUsageTracker {
             input: AtomicU64::new(0),
             output: AtomicU64::new(0),
             cache: AtomicU64::new(0),
+            first_token_ms: AtomicU64::new(0),
             logged: AtomicBool::new(false),
             pending: parking_lot::Mutex::new(String::new()),
         }
     }
 
     fn note_chunk(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            let ms = self.started.elapsed().as_millis() as u64;
+            let _ = self.first_token_ms.compare_exchange(
+                0,
+                ms.max(1),
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            );
+        }
         let chunk = String::from_utf8_lossy(bytes);
         let mut pending = self.pending.lock();
         pending.push_str(&chunk);
@@ -2331,6 +2907,9 @@ impl StreamUsageTracker {
         } else {
             None
         };
+        let total_ms = self.started.elapsed().as_millis() as u64;
+        let ft = self.first_token_ms.load(AtomicOrdering::Relaxed);
+        let first_token_ms = if ft > 0 { Some(ft) } else { None };
         log_request(
             &self.request_id,
             self.account_id.clone(),
@@ -2338,8 +2917,8 @@ impl StreamUsageTracker {
             self.requested_model.clone(),
             self.resolved_model.clone(),
             self.status_code,
-            self.latency_ms,
-            None,
+            total_ms,
+            first_token_ms,
             input,
             output,
             cache,
@@ -2417,6 +2996,8 @@ mod build_plane_tests {
         let mut cfg = AppConfig::default();
         cfg.xai_base_url = "https://api.x.ai/v1".into();
         cfg.cli_chat_proxy_base_url = "https://cli-chat-proxy.grok.com/v1".into();
+        // Default = API channel: plain clients stay on console api.x.ai.
+        assert!(!cfg.experimental_impersonate_grok_build);
         let mut h = HeaderMap::new();
         h.insert("x-xai-token-auth", HeaderValue::from_static("xai-grok-cli"));
         assert_eq!(
@@ -2425,6 +3006,16 @@ mod build_plane_tests {
         );
         let plain = HeaderMap::new();
         assert_eq!(resolve_upstream_base(&cfg, &plain), "https://api.x.ai/v1");
+        // Opt-in Grok Build session plane: plain clients use cli-chat-proxy.
+        cfg.experimental_impersonate_grok_build = true;
+        assert_eq!(
+            resolve_upstream_base(&cfg, &plain),
+            "https://cli-chat-proxy.grok.com/v1"
+        );
+        assert_eq!(
+            resolve_upstream_base(&cfg, &h),
+            "https://cli-chat-proxy.grok.com/v1"
+        );
     }
 
     #[test]
@@ -2608,10 +3199,31 @@ fn response_to_text(resp: Response) -> String {
 
 pub async fn list_models_response(config: &AppConfig) -> Value {
     // Prefer upstream models, fallback to curated list
-    if let Ok(value) = fetch_upstream_models(config).await {
+    if let Ok(mut value) = fetch_upstream_models(config).await {
+        ensure_build_model_aliases(&mut value, config);
         return value;
     }
     curated_models(config)
+}
+
+/// R2-05: ensure `grok-4.5-build` appears when experimental build rewrites model ids.
+fn ensure_build_model_aliases(value: &mut Value, config: &AppConfig) {
+    let Some(data) = value.get_mut("data").and_then(|d| d.as_array_mut()) else {
+        return;
+    };
+    let has_build = data.iter().any(|m| {
+        m.get("id").and_then(|i| i.as_str()) == Some("grok-4.5-build")
+    });
+    if !has_build {
+        data.push(json!({
+            "id": "grok-4.5-build",
+            "object": "model",
+            "owned_by": "xai",
+            "modality": "text",
+            "note": "alias: experimental-build plane may report this id; maps to SuperGrok chat",
+        }));
+    }
+    let _ = config; // reserved for future alias from default_model
 }
 
 /// Fetch raw OpenAI-style `/models` payload from xAI when auth + network allow.
@@ -2656,6 +3268,7 @@ fn curated_models(config: &AppConfig) -> Value {
         }));
     };
     push(&config.default_model, "text");
+    push("grok-4.5-build", "text");
     for id in known_xai_text_models() {
         push(id, "text");
     }

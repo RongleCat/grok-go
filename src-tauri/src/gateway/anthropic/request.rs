@@ -15,6 +15,12 @@ pub struct ConvertedChatRequest {
 /// Map Claude Code model names (haiku/sonnet/opus) before `resolve_model`.
 ///
 /// Returns `(candidate_model, mapping_hint)`.
+///
+/// O-10: do **not** collapse Claude shell names to `default_model` here — that
+/// skips tier mapping in [`crate::config::resolve_model`] /
+/// [`crate::config::map_claude_shell_model`]. Return a stable Grok candidate
+/// (haiku → non-reasoning; sonnet/opus → grok-4.5) so resolve_model can still
+/// honor exact `model_mappings` keys when present.
 pub fn map_client_model(requested: &str, default_model: &str) -> (String, String) {
     let trimmed = requested.trim();
     if trimmed.is_empty() {
@@ -25,10 +31,13 @@ pub fn map_client_model(requested: &str, default_model: &str) -> (String, String
     if lower.starts_with("grok") || lower.contains("imagine") {
         return (trimmed.to_string(), "anthropic-passthrough".into());
     }
-    // Claude family aliases → default Grok text model (user can override via model_mappings).
-    if lower.contains("claude") || lower.contains("haiku") || lower.contains("sonnet") || lower.contains("opus")
-    {
-        return (default_model.to_string(), "anthropic-claude-alias".into());
+    // Claude family: tier map (must not use default_model for all shells).
+    if let Some((model, reason)) = crate::config::map_claude_shell_model(trimmed) {
+        return (model.to_string(), reason.into());
+    }
+    if lower.contains("claude") {
+        // Generic claude-* without haiku/sonnet/opus → default text model.
+        return (default_model.to_string(), "anthropic-claude-generic".into());
     }
     (trimmed.to_string(), "anthropic-passthrough".into())
 }
@@ -271,8 +280,23 @@ fn convert_message(role: &str, content: Option<&Value>) -> Result<Vec<Value>, St
             "thinking" | "redacted_thinking" => {
                 // Drop — xAI chat path has no Anthropic thinking wire format.
             }
-            _ => {
-                // Ignore unknown blocks (cache_control-only, document, …).
+            "document" => {
+                // O-17: high-risk silent drop → explicit error
+                return Err(
+                    "document content blocks are not supported on GrokGo Anthropic path; extract text client-side or attach as image/text"
+                        .into(),
+                );
+            }
+            "" => {
+                // cache_control-only or typeless — ignore
+            }
+            other => {
+                // O-17: log unknown blocks (do not silently invent support)
+                tracing::warn!(
+                    target: "gateway",
+                    block_type = other,
+                    "unknown Anthropic content block dropped"
+                );
             }
         }
     }
@@ -465,6 +489,57 @@ mod tests {
         assert_eq!(msgs[1]["content"], "a.txt");
     }
 
+    /// R2-12 / D-002: multi-segment tool_result content must flatten to one tool message.
+    #[test]
+    fn tool_result_multi_content_segments_flatten() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {"path": "a"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": [
+                            {"type": "text", "text": "line-a"},
+                            {"type": "text", "text": "line-b"}
+                        ]
+                    }]
+                }
+            ]
+        });
+        let conv = anthropic_to_openai_chat(&body).unwrap();
+        let msgs = conv.body["messages"].as_array().unwrap();
+        let tool_msg = msgs.iter().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")).unwrap();
+        let content = tool_msg.get("content").and_then(|c| c.as_str()).unwrap();
+        assert!(content.contains("line-a"));
+        assert!(content.contains("line-b"));
+    }
+
+    #[test]
+    fn document_block_is_explicit_error() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "document", "source": {"type": "base64", "data": "xx"}}]
+            }]
+        });
+        let err = anthropic_to_openai_chat(&body).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("document"));
+    }
+
     #[test]
     fn filters_batch_tool() {
         let body = json!({
@@ -486,9 +561,21 @@ mod tests {
     fn map_client_model_claude_alias() {
         let (m, reason) = map_client_model("claude-sonnet-4-20250514", "grok-4.5");
         assert_eq!(m, "grok-4.5");
-        assert_eq!(reason, "anthropic-claude-alias");
+        assert_eq!(reason, "claude-tier-sonnet");
         let (m2, _) = map_client_model("grok-4.3", "grok-4.5");
         assert_eq!(m2, "grok-4.3");
+    }
+
+    #[test]
+    fn map_client_model_haiku_is_non_reasoning_tier() {
+        let (m, reason) = map_client_model("claude-haiku-4-5-20251001", "grok-4.5");
+        assert_eq!(m, "grok-4.20-0309-non-reasoning");
+        assert_eq!(reason, "claude-tier-haiku");
+        // Must not collapse to the caller's default_model.
+        assert_ne!(m, "grok-4.5");
+        let (opus, r) = map_client_model("claude-opus-4-6", "grok-4.5");
+        assert_eq!(opus, "grok-4.5");
+        assert_eq!(r, "claude-tier-opus");
     }
 
     #[test]

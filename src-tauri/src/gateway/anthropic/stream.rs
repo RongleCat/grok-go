@@ -6,7 +6,7 @@
 //! 3. `message_delta` (stop_reason + usage)
 //! 4. `message_stop`
 
-use super::response::map_stop_reason;
+use super::response::{map_stop_reason, ThinkingMode};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -36,11 +36,22 @@ pub struct OpenAiToAnthropicSse {
     /// Latest usage from upstream (may arrive on a trailing usage-only chunk).
     last_input_tokens: u64,
     last_output_tokens: u64,
+    thinking_mode: ThinkingMode,
 }
 
 impl OpenAiToAnthropicSse {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            thinking_mode: ThinkingMode::Hide,
+            ..Self::default()
+        }
+    }
+
+    pub fn with_thinking_mode(mode: ThinkingMode) -> Self {
+        Self {
+            thinking_mode: mode,
+            ..Self::default()
+        }
     }
 
     /// Ingest an upstream SSE byte chunk; returns Anthropic SSE bytes to forward.
@@ -197,27 +208,41 @@ impl OpenAiToAnthropicSse {
         if let Some(choice) = choice {
             let delta = choice.get("delta").cloned().unwrap_or(json!({}));
 
-            // reasoning / thinking
-            if let Some(reasoning) = delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoning"))
-                .and_then(|r| r.as_str())
-            {
-                if !reasoning.is_empty() {
-                    out.extend_from_slice(&self.ensure_block(BlockKind::Thinking));
-                    if let Some((index, BlockKind::Thinking)) = &self.current {
-                        let index = *index;
-                        out.extend_from_slice(&encode_event(
-                            "content_block_delta",
-                            &json!({
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {
-                                    "type": "thinking_delta",
-                                    "thinking": reasoning
+            // reasoning / thinking (skipped when ThinkingMode::Hide for TTFT)
+            if self.thinking_mode != ThinkingMode::Hide {
+                if let Some(reasoning) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .and_then(|r| r.as_str())
+                {
+                    if !reasoning.is_empty() {
+                        let text = match self.thinking_mode {
+                            ThinkingMode::Summary => {
+                                // Stream only first ~120 chars once per block
+                                let t = reasoning.trim();
+                                if t.chars().count() > 120 {
+                                    format!("{}…", t.chars().take(120).collect::<String>())
+                                } else {
+                                    t.to_string()
                                 }
-                            }),
-                        ));
+                            }
+                            _ => reasoning.to_string(),
+                        };
+                        out.extend_from_slice(&self.ensure_block(BlockKind::Thinking));
+                        if let Some((index, BlockKind::Thinking)) = &self.current {
+                            let index = *index;
+                            out.extend_from_slice(&encode_event(
+                                "content_block_delta",
+                                &json!({
+                                    "type": "content_block_delta",
+                                    "index": index,
+                                    "delta": {
+                                        "type": "thinking_delta",
+                                        "thinking": text
+                                    }
+                                }),
+                            ));
+                        }
                     }
                 }
             }
@@ -542,7 +567,8 @@ mod tests {
     #[test]
     fn finish_synthesizes_stop_after_partial_stream() {
         // Upstream abort mid-thinking: Claude Code needs message_stop, not a hard body error.
-        let mut s = OpenAiToAnthropicSse::new();
+        // Use passthrough so thinking blocks still exercise the lifecycle.
+        let mut s = OpenAiToAnthropicSse::with_thinking_mode(ThinkingMode::Passthrough);
         let mut out = String::new();
         out.push_str(&String::from_utf8_lossy(&s.push(
             sse_data(json!({
@@ -564,6 +590,27 @@ mod tests {
         assert!(out.contains("event: message_delta"));
         assert!(out.contains("event: message_stop"));
         assert!(out.contains("end_turn"));
+    }
+
+    #[test]
+    fn hide_thinking_skips_reasoning_deltas() {
+        let mut s = OpenAiToAnthropicSse::with_thinking_mode(ThinkingMode::Hide);
+        let mut out = String::new();
+        out.push_str(&String::from_utf8_lossy(&s.push(
+            sse_data(json!({
+                "id": "c-hide",
+                "model": "grok-4.5",
+                "choices": [{"index": 0, "delta": {
+                    "role": "assistant",
+                    "reasoning_content": "secret",
+                    "content": "hi"
+                }}]
+            }))
+            .as_bytes(),
+        )));
+        out.push_str(&String::from_utf8_lossy(&s.finish()));
+        assert!(!out.contains("thinking_delta"));
+        assert!(out.contains("text_delta") || out.contains("\"text\":\"hi\"") || out.contains("hi"));
     }
 
     #[test]

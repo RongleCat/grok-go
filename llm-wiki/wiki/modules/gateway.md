@@ -48,6 +48,20 @@
 - image tool 服务端闭环：`proxy::run_image_gen_tool_loop` + `image_bridge`
 - **reasoning-only 空完成恢复**：`empty_completion` + `proxy` 在返回客户端前静默重试一次（见 [[../concepts/empty-completion-retry]]）
 - 视频 job 记住账号：`job_affinity`
+- **双平面路由**：`gateway/build_plane_route.rs` 的 `decide_plane`（原生 Grok Build 标记 **或** 会话面开关，默认关 / API）
+
+## 双平面：API 平面（默认）/ Grok Build 会话面（opt-in）
+
+| 条件 | 推理上游 | 媒体上游 | 日志 `client_source` |
+|---|---|---|---|
+| 客户端带 Grok Build 标记 | `cli_chat_proxy_base_url` | `xai_base_url`（图片/视频） | `grok-build` |
+| 开关 **关**（**默认** / API）+ 普通 Codex/OpenAI/Claude | `xai_base_url` | `xai_base_url` | 原协议标签 |
+| `experimentalImpersonateGrokBuild=true`（opt-in）且无原生标记 | 同上（官方头：Token-Auth + authenticateresponse + client-mode/identifier + sampling `x-grok-*`） | 同上（cli-chat-proxy 无 media） | `experimental-build` / `experimental-build-media`（日志 id 保留） |
+
+- 默认 **API**（`api.x.ai`）；设置页「渠道选择」分段器：**API** | **Grok Build**；切到 Grok Build 需二次确认（账号受限风险）。
+- 配置字段名 `experimentalImpersonateGrokBuild` 仅兼容旧 config（true=Grok Build，false=API）。
+- 会话面开启时：Responses 保留 continuity；Chat 剥 `service_tier` 等；Anthropic 仍回写 Messages 形态。
+- empty-completion 恢复：console **与** 会话面仿冒（Codex agent loop）开；**仅原生 Grok Build TUI** 关。nuclear strip / files offload 仍仅 console。
 
 ## 相关页面
 
@@ -63,6 +77,7 @@
 
 - `src-tauri/src/gateway/server.rs`
 - `src-tauri/src/gateway/proxy.rs`
+- `src-tauri/src/gateway/build_plane_route.rs`
 - `src-tauri/src/gateway/empty_completion.rs`
 - `src-tauri/src/gateway/payload_optimize.rs`
 - `src-tauri/src/gateway/files_api.rs`

@@ -1,5 +1,115 @@
 # Wiki 日志
 
+## 2026-07-16（v0.1.9 发布准备）
+
+- README / README_EN：渠道选择（默认 API，推荐）；Grok Build 可选且有账号受限风险、二次确认
+- CHANGELOG `[0.1.9]`：API 默认、日志管理、真 SSE 恢复、Build 面 opt-in
+- 发版：`./scripts/release-tag.sh 0.1.9` → push tag 触发 CI
+
+## 2026-07-16（日志页实时尾随 + 滚动稳定）
+
+- Logs 页挂载时每 4s 静默拉最新一页；隐藏标签页暂停
+- 内存窗口最多 200 条（虚拟列表仍只渲可见行）
+- 贴顶：新日志出现后保持在顶；已下滚：按新增行数补偿 scrollTop，视口内容不跳
+
+## 2026-07-16（API 渠道为默认；Grok Build 需二次确认）
+
+- 配置 `experimentalImpersonateGrokBuild` 默认 **false**（字段名保留兼容）= API / `api.x.ai`
+- 设置页：「渠道选择」分段器 API | Grok Build（默认 API）；选 Grok Build 需确认（账号受限风险）
+- 缺字段反序列化 / `AppConfig::default` 均为 API 平面；显式 `true` 的已有 config 仍走会话面
+- 产品默认：Codex / OpenAI / Claude → `api.x.ai`；可选 opt-in → cli-chat-proxy；媒体始终 api.x.ai
+
+## 2026-07-16（Codex agent 真 SSE + 续跑）
+
+- 去掉「有 tools 就 force stream=false」
+- 新路径：真流式透传 delta，**暂扣** `response.completed`；结束后若 premature stop 再 multi-phase 非流式续跑，成功则下发 recovered SSE，否则冲刷原 completed
+- image_gen bridge 仍强制非流式；`emptyCompletionStreamBuffer` 全量缓冲路径不变
+- 辅助：`split_sse_hold_completed` / `sse_frame_is_response_completed`
+
+## 2026-07-16（请求日志管理 + 首字/耗时）
+
+- UI：日志页「管理」弹窗 — 条数/磁盘、保留天数、最大条数、立即按策略清理、按 1/7/30 天清除、按日期区间清除、全部清空
+- 配置：`logRetentionDays`（默认 30）、`logMaxRows`（默认 5e4，0=不限）；写入线程按配置 prune
+- 后端：`get_log_stats` / `clear_logs_older_than` / `clear_logs_range` / `prune_logs_now`
+- 延迟列：流式记录 first_token_ms + 总耗时；UI 上下展示「首字 / 耗时」
+
+## 2026-07-16（第二轮 R2：交付闭环 + 跨端安全）
+
+- 方案：`docs/experimental-build-round2-plan.md`
+- **R2-01** 网关 start / integration_status 强制刷新 `agents-guide.md`
+- **R2-02** x_search 顶层 `result.text/citations`；默认不塞 fat `raw`（`debug`/`include_raw` 可开）
+- **R2-03** MCP `video_generate` 默认 `wait=false`（`mcp_video_wait_default`）；Tools HTTP 默认 `wait=true`
+- **R2-04** IntegrationStatus：`agentsGuideVersion` / `claudeHaikuModel`
+- **R2-05** 响应头 model-requested/routed/upstream；body 可选 `requested_model`/`routed_model`/`upstream_model`；`/v1/models` alias `grok-4.5-build`
+- **R2-06** `x-grokgo-tools-injected`
+- **R2-07** guide 图片语义统一为 GrokGo 优先；视频 Agent 异步写死
+- **R2-08** Anthropic `x-grokgo-convert-ms` / `optimize-ms`
+- **R2-09** `GET /v1/videos/{id}` done 时 materialize `artifacts[]`
+- **R2-10** MCP tools/call 失败返回 envelope（isError）而非仅 JSON-RPC 字符串
+- **R2-11** Settings thinking 半句：隐藏≠上游不思考
+- **R2-12** multi tool_result flatten + document block 单测
+- 护栏：Native TUI 不伤；Tools HTTP 仍默认同步；字段只增不删
+- `cargo test --lib` 202 ok
+
+## 2026-07-16（仿冒 Build 综合优化 O-01–O-19）
+
+- 回滚点：git tag `pre-experimental-opt/2026-07-16` → `f0b4c44`
+- 方案：`docs/experimental-build-optimization-plan.md`
+- **O-01** 实验仿冒面 `inject_codex_compat_tools`：sanitize 在 preserve continuity 下注入 `x_search`+`image_gen`；native TUI 仍不注
+- **O-02** `POST /v1/tools/{name}`（同 MCP handle_tool_call + local token）
+- **O-03** agents-guide 决策树 A/B/C + Tools HTTP / MCP 旁路模板 + 策略矩阵
+- **O-04** `gateway/error_codes.rs`：GATEWAY_DOWN / UPSTREAM_TIMEOUT / TOOL_TIMEOUT / …
+- **O-05** 视频 poll 超时 → TOOL_TIMEOUT envelope（retryable + job_id/artifacts）
+- **O-06** `anthropicThinkingMode` 默认 hide；Settings 可切换
+- **O-07** `wait=false` 提交即返 `poll=/v1/videos/{id}`；复用 job_affinity
+- **O-08/09** 响应头 plane/account/ms/truncated/thinking-mode
+- **O-10** Claude haiku/sonnet/opus 分档映射
+- **O-11** tool result envelope（ok/tool/artifacts/error）
+- **O-12** 入站图片尺寸预检（≥8px）
+- **O-13** MCP args 整浮点 coerce
+- **O-14/19** Settings 仿冒开关 + thinking；agents-guide 策略矩阵
+- **O-15** count_tokens 头 `x-grokgo-token-count-mode: estimate`
+- **O-16** Anthropic 路径 `x-grokgo-cache-mode: upstream-prefix-only`
+- **O-17** document block 400；未知 content block 打 warn
+- **O-18** `/health` → `accountsRoutable` / `accountsTotal`
+- 模块：`error_codes.rs`、`tool_surface.rs`；`cargo test --lib` 199 ok
+- 复查修复：`map_client_model` 不再把 haiku 塌到 default；proxy 外层 Err 走 LayeredError；CC Switch haiku=`grok-4.20-0309-non-reasoning`；video_generate schema 暴露 `wait`
+
+## 2026-07-16（实验：仿冒 Grok Build 双平面）
+
+- 配置：`experimentalImpersonateGrokBuild`（默认 false）；设置页「流量分配」开关。
+- 实现：`gateway/build_plane_route.rs` → `decide_plane`；`proxy` / Anthropic 路径共用。
+- 开关开：Codex Responses / OpenAI chat / Claude Messages 注入 Grok Build 头并走 `cli-chat-proxy`；媒体仍 `api.x.ai`。
+- 用量：`client_source=experimental-build`（媒体 `experimental-build-media`）。
+- 开源调研：CLIProxyAPI 有同类 OAuth→cli-chat-proxy 头；无完整可 vend 的转换库，本仓内实现。
+
+## 2026-07-16（多账号 failover：剥 previous_response_id）
+
+- `session_affinity::strip_account_scoped_continuity` / `body_for_failover_attempt`
+- 换号（attempt>0）或 sticky 绑定号 ≠ 本次选号时，去掉 `previous_response_id`，保留 `prompt_cache_key`
+- 防仿冒 Build / console 跨 principal 续链 4xx 与 cache 错乱
+
+## 2026-07-16（续跑对齐 Grok Build：透明重采 → 软恢复 → 硬兜底）
+
+- Phase A：原请求 `stream=false` 透明 resample ×2（保留 continuity，无 nudge）
+- Phase B：钉 shell tool_choice + nudge ×1（build 面保留 `prompt_cache_key`）
+- Phase C：合成 `function_call` 保 Codex loop
+- 日志：`classify_premature_stop` → ReasoningOnly / NoToolNonFinal
+
+## 2026-07-16（Codex 会话 019f6852 提前终止：experimental-build 关掉了 empty-completion）
+
+- 现象：任务做到「参考 PDF 是图片」后 `task_complete`，`last_agent_message=null`，最后一回合仅 reasoning、无 tool call。
+- 证据：`client_source=experimental-build`、`/responses` 末次 `output_tokens=134`；config 开着 `experimentalImpersonateGrokBuild` + `emptyCompletionRetry`。
+- 根因：`apply_codex_console_guards=!build_plane` 把 **empty-completion 恢复** 与 nuclear strip 绑在一起，实验仿冒 Build 时恢复被关掉；流式 `response.completed` 后 Codex 直接结束。
+- 修复：`apply_empty_completion_recovery=!native_build_client`（console + experimental 开，原生 TUI 关）；agent tools 回合强制非流式以便 JSON 恢复后再 SSE 回放。
+
+## 2026-07-16（对齐官方 xai-org/grok-build 开源线格式）
+
+- 源：https://github.com/xai-org/grok-build（`xai-grok-shell` / `xai-grok-sampler` / `xai-grok-http`）。
+- 出站头完整对齐：`X-XAI-Token-Auth`、`x-authenticateresponse`、`x-grok-client-mode`、`x-grok-client-identifier=grok-shell`、官方 UA `grok-shell/{ver} ({os}; {arch})`、采样 `x-grok-conv-id/req-id/model-override/session-id/agent-id`。
+- Body：`adapt_responses_body_for_build_plane` 补 `prompt_cache_key` / `prompt_cache_retention=24h`（不覆盖客户端已有值）。
+- HTTP 池：`http_client` 对齐 sampler shared_http（max_idle=2、H2 keepalive 15s/5s）。
+
 ## 2026-07-15（WorkBuddy MCP 写入路径修正）
 
 - UI「配置 MCP」编辑的是 `~/.workbuddy/mcp.json`，不是自动生成的 `.mcp.json`（connector-proxy）。

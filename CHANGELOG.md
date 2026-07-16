@@ -7,7 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-16
+
+> 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
+>
+> **Highlight:** default **API** chat channel; Grok Build is opt-in with risk confirm; log tools + Codex agent true SSE recovery.
+
+### Added
+
+- **Settings → Channel**: segmented **API** | **Grok Build** for Codex / OpenAI / Claude chat routing (config field `experimentalImpersonateGrokBuild` kept for compatibility).
+- **Grok Build confirm dialog**: switching to Grok Build requires explicit confirmation (account-restriction risk).
+- **Request logs management**: retention policy (days / max rows), prune now, clear by range, clear all; TTFT (`first_token_ms`) and total latency columns.
+- **Live log tail**: Logs page silently refreshes newest page; stable scroll when not pinned to top.
+- **Codex agent true SSE**: stream deltas live; hold `response.completed` and multi-phase recover on premature stop (Build-style empty-completion recovery on session plane too when opted in).
+- **Experimental build plane delivery** (R2 / O-series): optional SuperGrok session plane for non–Grok-Build clients; media always on console API; Anthropic thinking mode; gateway error envelopes; agents-guide refresh hooks.
+
+### Fixed
+
+- **Codex premature stop** on experimental build / tool turns: structure-based recovery + true SSE hold-completed path.
+- **Non-stream first_token_ms**: record TTFT on non-stream request paths.
+- **Multi-account rebalance**: strip `previous_response_id` when switching accounts so continuity does not pin a dead response id.
+
+### Changed
+
+- **Default chat channel is API** (`api.x.ai`). Grok Build / cli-chat-proxy for ordinary clients is **opt-in only**.
+- README documents the channel risk and recommends API mode.
+- Settings / wiki wording: API default; Build session plane no longer default-on.
+
+**中文 · 新增**
+
+- **设置 → 渠道选择**：API | Grok Build；切到 Grok Build 需二次确认（账号受限风险）。
+- **日志管理**：保留策略、按天/区间清理、TTFT 与总耗时；日志页实时尾随。
+- **Codex 真 SSE + 过早结束恢复**；可选 Build 会话面与 R2/O 系列网关增强。
+
+**中文 · 修复**
+
+- Build 面 / agent 工具回合过早结束；非流式首字耗时；换号剥 `previous_response_id`。
+
+**中文 · 变更**
+
+- **默认 API 渠道**（推荐）；Grok Build 仅 opt-in。README 写明限制并建议 API。
+
 ## [0.1.8] - 2026-07-16
+
 
 > 中英文对照 / Bilingual notes. English first (Keep a Changelog), then 中文摘要 under each section.
 >

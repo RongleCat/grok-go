@@ -79,6 +79,28 @@ pub struct AppConfig {
     /// Do **not** point Grok Build at `xai_base_url` — that is the metered API path.
     #[serde(default = "default_cli_chat_proxy_base_url")]
     pub cli_chat_proxy_base_url: String,
+    /// Optional chat plane for non–Grok-Build clients (Codex / OpenAI / Claude Code):
+    /// route to cli-chat-proxy SuperGrok with Grok Build identity headers.
+    /// Default **false** (metered console `api.x.ai` / API channel). Set **true** for
+    /// Grok Build session plane — may risk account restriction on SuperGrok path.
+    /// Field name kept for config.json compatibility.
+    #[serde(default)]
+    pub experimental_impersonate_grok_build: bool,
+    /// Anthropic Messages path: how to surface model reasoning.
+    /// `hide` (default) | `passthrough` | `summary`.
+    #[serde(default = "default_anthropic_thinking_mode")]
+    pub anthropic_thinking_mode: String,
+    /// MCP `tools/call` default for `video_generate.wait` when arg omitted.
+    /// Default **false** (async submit + poll) so agent MCP clients avoid -32001.
+    /// `POST /v1/tools/video_generate` still defaults wait=true (human/curl sync).
+    #[serde(default)]
+    pub mcp_video_wait_default: bool,
+    /// Request log retention in days (auto-prune). Default 30. Minimum 1.
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    /// Max request_log rows kept (oldest dropped first). Default 50_000. 0 = no row cap.
+    #[serde(default = "default_log_max_rows")]
+    pub log_max_rows: u32,
     #[serde(default = "default_oauth_redirect_port")]
     pub oauth_redirect_port: u16,
     /// When true, upstream xAI/OAuth HTTP goes through `http_proxy_url`.
@@ -197,6 +219,18 @@ fn default_oauth_redirect_port() -> u16 {
     56121
 }
 
+fn default_anthropic_thinking_mode() -> String {
+    "hide".into()
+}
+
+fn default_log_retention_days() -> u32 {
+    30
+}
+
+fn default_log_max_rows() -> u32 {
+    50_000
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -212,6 +246,15 @@ impl Default for AppConfig {
             model_mappings: BTreeMap::from([
                 ("gpt-5.6".into(), "grok-4.5".into()),
                 ("gpt-5.5".into(), "grok-4.5".into()),
+                // Claude Code shell names (O-10 tier map)
+                ("claude-haiku-4-5".into(), "grok-4.20-0309-non-reasoning".into()),
+                ("claude-3-5-haiku-latest".into(), "grok-4.20-0309-non-reasoning".into()),
+                ("claude-sonnet-4".into(), "grok-4.5".into()),
+                ("claude-sonnet-4-5".into(), "grok-4.5".into()),
+                ("claude-3-5-sonnet-latest".into(), "grok-4.5".into()),
+                ("claude-opus-4".into(), "grok-4.5".into()),
+                ("claude-opus-4-5".into(), "grok-4.5".into()),
+                ("claude-opus-4-6".into(), "grok-4.5".into()),
             ]),
             routing_strategy: RoutingStrategy::WeightedRoundRobin,
             session_affinity: true,
@@ -229,6 +272,11 @@ impl Default for AppConfig {
             xai_client_id: default_xai_client_id(),
             xai_base_url: default_xai_base_url(),
             cli_chat_proxy_base_url: default_cli_chat_proxy_base_url(),
+            experimental_impersonate_grok_build: false,
+            anthropic_thinking_mode: default_anthropic_thinking_mode(),
+            mcp_video_wait_default: false,
+            log_retention_days: default_log_retention_days(),
+            log_max_rows: default_log_max_rows(),
             oauth_redirect_port: default_oauth_redirect_port(),
             http_proxy_enabled: false,
             http_proxy_url: String::new(),
@@ -428,6 +476,13 @@ pub fn save_config(config: &AppConfig) -> AppResult<()> {
     write_json_atomic(&path, config)?;
     *CONFIG_CACHE.write() = Some(config.clone());
     Ok(())
+}
+
+/// Drop in-memory config/auth caches (tests that mutate config.json mid-process).
+#[cfg(test)]
+pub fn invalidate_caches_for_test() {
+    *CONFIG_CACHE.write() = None;
+    *AUTH_CACHE.write() = None;
 }
 
 pub fn load_auth() -> AppResult<AuthStore> {
@@ -928,6 +983,21 @@ pub fn is_xai_media_model_id(id: &str) -> bool {
         || lower.contains("voice")
 }
 
+/// Claude Code shell model name → Grok tier (O-10).
+pub fn map_claude_shell_model(requested: &str) -> Option<(&'static str, &'static str)> {
+    let lower = requested.trim().to_ascii_lowercase();
+    if lower.contains("haiku") {
+        return Some(("grok-4.20-0309-non-reasoning", "claude-tier-haiku"));
+    }
+    if lower.contains("opus") {
+        return Some(("grok-4.5", "claude-tier-opus"));
+    }
+    if lower.contains("sonnet") {
+        return Some(("grok-4.5", "claude-tier-sonnet"));
+    }
+    None
+}
+
 pub fn resolve_model(config: &AppConfig, requested: &str) -> (String, String) {
     let trimmed = requested.trim();
     if trimmed.is_empty() {
@@ -942,6 +1012,10 @@ pub fn resolve_model(config: &AppConfig, requested: &str) -> (String, String) {
         if k.to_lowercase() == lower {
             return (v.clone(), "mapped".into());
         }
+    }
+    // Substring match for Claude shell ids not listed exactly (e.g. dated suffixes).
+    if let Some((model, reason)) = map_claude_shell_model(trimmed) {
+        return (model.to_string(), reason.into());
     }
     let is_media = is_xai_media_model_id(trimmed);
     let looks_like_grok = lower.starts_with("grok-") || lower.starts_with("grok");
@@ -1009,6 +1083,27 @@ mod tests {
     }
 
     #[test]
+    fn maps_claude_shell_tiers() {
+        assert_eq!(
+            map_claude_shell_model("claude-haiku-4-5-20251001").unwrap().1,
+            "claude-tier-haiku"
+        );
+        let cfg = AppConfig::default();
+        let (m, r) = resolve_model(&cfg, "claude-sonnet-4-5-20250929");
+        assert_eq!(m, "grok-4.5");
+        assert!(r.contains("sonnet") || r == "mapped" || r == "claude-tier-sonnet");
+        // Full Claude Code path: map_client_model → resolve_model must keep haiku tier.
+        let (mapped, _) = crate::gateway::anthropic::map_client_model(
+            "claude-haiku-4-5-20251001",
+            &cfg.default_model,
+        );
+        assert_eq!(mapped, "grok-4.20-0309-non-reasoning");
+        let (resolved, reason) = resolve_model(&cfg, &mapped);
+        assert_eq!(resolved, "grok-4.20-0309-non-reasoning");
+        assert_ne!(resolved, cfg.default_model);
+        assert!(reason == "passthrough" || reason.contains("haiku") || reason == "mapped");
+    }
+
     fn resolve_passes_known_text_models_and_maps_gpt() {
         let cfg = AppConfig::default();
         let (m, reason) = resolve_model(&cfg, "grok-4.3");

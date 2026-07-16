@@ -23,7 +23,7 @@ use crate::router::{
     batch_update_accounts, list_accounts, remove_account, remove_accounts, save_accounts,
     update_account, BatchAccountPatch,
 };
-use crate::usage::{HeatmapDay, RequestLog, UsageStore, UsageSummary};
+use crate::usage::{HeatmapDay, LogStoreStats, RequestLog, UsageStore, UsageSummary};
 use local_ip_address::local_ip;
 
 #[derive(Debug, Clone, Serialize)]
@@ -683,6 +683,81 @@ pub fn clear_logs() -> AppResult<()> {
             tracing::warn!("clear_logs open: {err}");
             Ok(())
         }
+    }
+}
+
+#[tauri::command]
+pub fn get_log_stats() -> AppResult<LogStoreStats> {
+    match UsageStore::open_default() {
+        Ok(store) => store.stats(),
+        Err(err) => {
+            tracing::warn!("get_log_stats open: {err}");
+            Ok(LogStoreStats {
+                total_rows: 0,
+                oldest_at: None,
+                newest_at: None,
+                db_bytes: 0,
+                retention_days: 30,
+                max_rows: 50_000,
+            })
+        }
+    }
+}
+
+/// Delete logs older than `older_than_days` (relative to now).
+#[tauri::command]
+pub fn clear_logs_older_than(older_than_days: u32) -> AppResult<u64> {
+    let days = older_than_days.max(0);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+    match UsageStore::open_default() {
+        Ok(store) => store.delete_before(&cutoff),
+        Err(err) => {
+            tracing::warn!("clear_logs_older_than open: {err}");
+            Ok(0)
+        }
+    }
+}
+
+/// Delete logs in inclusive range. `from` / `to` are ISO-8601 / RFC3339 or `YYYY-MM-DD`.
+#[tauri::command]
+pub fn clear_logs_range(from: String, to: String) -> AppResult<u64> {
+    let from = normalize_log_bound(&from, false);
+    let to = normalize_log_bound(&to, true);
+    match UsageStore::open_default() {
+        Ok(store) => store.delete_range(&from, &to),
+        Err(err) => {
+            tracing::warn!("clear_logs_range open: {err}");
+            Ok(0)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn prune_logs_now() -> AppResult<LogStoreStats> {
+    match UsageStore::open_default() {
+        Ok(store) => store.prune_now(),
+        Err(err) => {
+            tracing::warn!("prune_logs_now open: {err}");
+            Err(err)
+        }
+    }
+}
+
+fn normalize_log_bound(s: &str, end_of_day: bool) -> String {
+    let t = s.trim();
+    if t.len() == 10 && t.chars().nth(4) == Some('-') {
+        // YYYY-MM-DD
+        if end_of_day {
+            format!("{t}T23:59:59.999999999Z")
+        } else {
+            format!("{t}T00:00:00Z")
+        }
+    } else if !t.is_empty() {
+        t.to_string()
+    } else if end_of_day {
+        chrono::Utc::now().to_rfc3339()
+    } else {
+        "1970-01-01T00:00:00Z".into()
     }
 }
 

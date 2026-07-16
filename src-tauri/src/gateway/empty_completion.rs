@@ -308,6 +308,47 @@ fn looks_like_final_delivery(text: &str) -> bool {
     false
 }
 
+/// True when an SSE frame (including trailing `\n\n`) is a `response.completed` event.
+///
+/// Used to **hold** the terminal event until premature-stop recovery can run,
+/// while still true-streaming earlier deltas to Codex (TTFT).
+pub fn sse_frame_is_response_completed(frame: &str) -> bool {
+    for line in frame.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("event:") {
+            if rest.trim() == "response.completed" {
+                return true;
+            }
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            let data = rest.trim();
+            if data.contains("\"type\":\"response.completed\"")
+                || data.contains("\"type\": \"response.completed\"")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Feed SSE text into `carry` (incomplete frame tail). Returns pass-through bytes
+/// (everything except held `response.completed` frames, which are appended to `held`).
+pub fn split_sse_hold_completed(chunk: &str, carry: &mut String, held: &mut String) -> String {
+    carry.push_str(chunk);
+    let mut pass = String::new();
+    while let Some(pos) = carry.find("\n\n") {
+        let frame = carry[..=pos + 1].to_string(); // include \n\n
+        *carry = carry[pos + 2..].to_string();
+        if sse_frame_is_response_completed(&frame) {
+            held.push_str(&frame);
+        } else {
+            pass.push_str(&frame);
+        }
+    }
+    pass
+}
+
 /// Extract the completed response object from an SSE body (last `response.completed`).
 pub fn extract_completed_response_from_sse(sse: &str) -> Option<Value> {
     let mut last: Option<Value> = None;
@@ -837,6 +878,33 @@ data: {"type":"response.completed","response":{"id":"r1","status":"completed","o
         let parsed = extract_completed_response_from_sse(sse).expect("parsed");
         assert_eq!(parsed.get("id").and_then(|v| v.as_str()), Some("r1"));
         assert!(is_reasoning_only_empty_completion(&parsed));
+    }
+
+    #[test]
+    fn hold_completed_splits_pass_through_from_terminal() {
+        let mut carry = String::new();
+        let mut held = String::new();
+        let chunk1 = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\"}\n\n";
+        let pass1 = split_sse_hold_completed(chunk1, &mut carry, &mut held);
+        assert!(pass1.contains("output_item.done"));
+        assert!(held.is_empty());
+        let chunk2 = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"x\"}}\n\n";
+        let pass2 = split_sse_hold_completed(chunk2, &mut carry, &mut held);
+        assert!(pass2.is_empty());
+        assert!(held.contains("response.completed"));
+        assert!(sse_frame_is_response_completed(&held));
+        // Split across chunks
+        carry.clear();
+        held.clear();
+        let _ = split_sse_hold_completed("event: response.completed\ndata: {\"type\":", &mut carry, &mut held);
+        assert!(held.is_empty());
+        let pass = split_sse_hold_completed(
+            "\"response.completed\",\"response\":{}}\n\n",
+            &mut carry,
+            &mut held,
+        );
+        assert!(pass.is_empty());
+        assert!(held.contains("response.completed"));
     }
 
     #[test]

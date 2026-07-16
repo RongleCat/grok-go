@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -26,8 +26,8 @@ use crate::gateway::build_plane_route::{
 use crate::gateway::empty_completion::{
     build_soft_recovery_request, build_transparent_resample_request, classify_premature_stop,
     extract_completed_response_from_sse, is_responses_path, recovery_quality_score,
-    should_retry_premature_agent_stop, synthesize_forced_tool_response, SoftRecoveryOpts,
-    SOFT_RECOVERY_MAX, SSE_BUFFER_LIMIT, TRANSPARENT_RESAMPLE_MAX,
+    should_retry_premature_agent_stop, split_sse_hold_completed, synthesize_forced_tool_response,
+    SoftRecoveryOpts, SOFT_RECOVERY_MAX, SSE_BUFFER_LIMIT, TRANSPARENT_RESAMPLE_MAX,
 };
 
 // Public re-exports (API stability for external callers / tests).
@@ -863,27 +863,9 @@ async fn proxy_json_inner(
                     value["stream"] = Value::Bool(false);
                     body_changed = true;
                 }
-                // Agent tool turns: force non-stream when empty-completion recovery is on.
-                // Codex streams response.completed and ends the turn on reasoning-only /
-                // narration-only stops; recovery needs a full JSON body (then we re-emit SSE).
-                // Session 019f6852… failed on experimental-build for exactly this reason.
-                let agent_tools = value
-                    .get("tools")
-                    .and_then(|t| t.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
-                if apply_empty_completion
-                    && config.empty_completion_retry
-                    && agent_tools
-                    && value.get("stream").and_then(|v| v.as_bool()) == Some(true)
-                {
-                    value["stream"] = Value::Bool(false);
-                    body_changed = true;
-                    tracing::debug!(
-                        target: "gateway",
-                        "force non-stream for agent tools (empty-completion recovery)"
-                    );
-                }
+                // Agent tools: keep stream=true for real SSE TTFT. Premature-stop recovery
+                // runs by holding `response.completed` until the stream ends (see
+                // stream_responses_hold_completed), not by forcing non-stream anymore.
             }
             if is_chat && build_plane {
                 if adapt_chat_body_for_build_plane(&mut value) {
@@ -1135,6 +1117,54 @@ async fn proxy_json_inner(
                 }
             }
             return Ok(response);
+        }
+
+        let agent_tools = parsed_request
+            .as_ref()
+            .and_then(|v| v.get("tools").and_then(|t| t.as_array()))
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        // Codex agent tools: true-stream deltas, hold `response.completed` so we can
+        // still run empty-completion recovery without forcing non-stream (TTFT).
+        let hold_completed = apply_empty_completion
+            && config.empty_completion_retry
+            && is_responses_path(path)
+            && agent_tools
+            && parsed_request.is_some()
+            && status.is_success();
+
+        if hold_completed {
+            tracing::debug!(
+                target: "gateway",
+                "SSE hold-completed path (agent tools + empty-completion recovery)"
+            );
+            let build_arc: UpstreamBuilder = Arc::new(build_upstream);
+            return stream_responses_hold_completed(
+                upstream,
+                status,
+                upstream_headers,
+                http.clone(),
+                token.clone(),
+                build_arc,
+                parsed_request.as_ref().unwrap().clone(),
+                custom_tool_names.as_ref().clone(),
+                build_plane,
+                request_id,
+                account.id.clone(),
+                path.to_string(),
+                requested_model.clone(),
+                resolved_model.clone(),
+                effective_source.to_string(),
+                config.session_affinity,
+                config.session_affinity_ttl_secs,
+                started,
+                ttfb_ms,
+                plane.inject_codex_compat_tools,
+                plane.build_plane,
+                plane.experimental_impersonation,
+                plane.media_path,
+            )
+            .await;
         }
 
         let custom_names = custom_tool_names.clone();
@@ -1575,6 +1605,202 @@ struct EmptyCompletionStreamResult {
     first_token_ms: Option<u64>,
 }
 
+/// Boxed upstream request builder for spawned SSE hold/recovery tasks.
+type UpstreamBuilder = std::sync::Arc<
+    dyn Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder + Send + Sync + 'static,
+>;
+
+/// True-stream Responses SSE for Codex agent tools while preserving empty-completion recovery.
+///
+/// Strategy:
+/// 1. Forward every SSE frame **except** `response.completed` (client sees tokens early).
+/// 2. When the upstream stream ends, inspect the completed payload.
+/// 3. If premature stop → multi-phase non-stream recovery, then emit recovered SSE.
+/// 4. Otherwise flush the held `response.completed` frame(s).
+///
+/// Image-gen bridge still forces non-stream separately.
+#[allow(clippy::too_many_arguments)]
+async fn stream_responses_hold_completed(
+    upstream: reqwest::Response,
+    status: reqwest::StatusCode,
+    upstream_headers: reqwest::header::HeaderMap,
+    http: reqwest::Client,
+    token: String,
+    build_upstream: UpstreamBuilder,
+    original_request: Value,
+    custom_tool_names: HashSet<String>,
+    build_plane: bool,
+    request_id: String,
+    account_id: String,
+    path: String,
+    requested_model: Option<String>,
+    resolved_model: Option<String>,
+    client_source: String,
+    session_affinity: bool,
+    session_affinity_ttl_secs: u64,
+    started: Instant,
+    ttfb_ms: u64,
+    inject_codex_compat_tools: bool,
+    plane_build: bool,
+    plane_experimental: bool,
+    plane_media: bool,
+) -> AppResult<Response> {
+    let status_code = status.as_u16();
+    let preserve_cache = build_plane
+        || original_request
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
+    let account_hdr = account_id.clone();
+
+    let usage_tracker = Arc::new(StreamUsageTracker::new(
+        request_id.clone(),
+        Some(account_id.clone()),
+        path.clone(),
+        requested_model.clone(),
+        resolved_model.clone(),
+        status_code,
+        started,
+        client_source.clone(),
+        session_affinity,
+        session_affinity_ttl_secs,
+        account_id.clone(),
+    ));
+
+    tokio::spawn(async move {
+        let tracker = usage_tracker.clone();
+        let mut stream = upstream.bytes_stream();
+        let mut carry = String::new();
+        let mut held = String::new();
+        let mut full = String::new();
+        let custom_names = custom_tool_names;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    tracker.note_chunk(&bytes);
+                    let rewritten = rewrite_sse_chunk(&bytes, &custom_names);
+                    let text = String::from_utf8_lossy(&rewritten);
+                    full.push_str(&text);
+                    let pass = split_sse_hold_completed(&text, &mut carry, &mut held);
+                    if !pass.is_empty() && tx.send(Ok(Bytes::from(pass))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        // Try to finish a trailing incomplete frame.
+        if !carry.is_empty() {
+            let pass = split_sse_hold_completed("\n\n", &mut carry, &mut held);
+            if !pass.is_empty() {
+                let _ = tx.send(Ok(Bytes::from(pass))).await;
+            }
+        }
+
+        let completed = extract_completed_response_from_sse(&full)
+            .or_else(|| extract_completed_response_from_sse(&held));
+        let mut flushed_recovery = false;
+        if let Some(ref completed) = completed {
+            if should_retry_premature_agent_stop(completed, Some(&original_request)) {
+                match retry_empty_completion_once(
+                    &http,
+                    &token,
+                    build_upstream.as_ref(),
+                    &original_request,
+                    completed,
+                    preserve_cache,
+                )
+                .await
+                {
+                    Ok(Some(mut value)) => {
+                        if !custom_names.is_empty() {
+                            let _ = rewrite_responses_payload(&mut value, &custom_names);
+                        }
+                        if let Some(rid) = value.get("id").and_then(|v| v.as_str()) {
+                            session_affinity::bind_response_chain(
+                                rid,
+                                &account_id,
+                                session_affinity_ttl_secs,
+                            );
+                        }
+                        let sse = responses_json_to_sse(&value);
+                        let bytes = rewrite_sse_chunk(&Bytes::from(sse), &custom_names);
+                        let _ = tx.send(Ok(bytes)).await;
+                        flushed_recovery = true;
+                        tracing::warn!(
+                            target: "gateway",
+                            "SSE hold-completed: recovered premature stop after true stream"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "gateway",
+                            "SSE hold-completed: recovery still empty; flushing original completed"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "gateway",
+                            error = %err,
+                            "SSE hold-completed: recovery failed; flushing original completed"
+                        );
+                    }
+                }
+            }
+        }
+
+        if !flushed_recovery && !held.is_empty() {
+            let _ = tx.send(Ok(Bytes::from(held))).await;
+        }
+        // StreamUsageTracker Drop logs first_token + total latency.
+        drop(tracker);
+    });
+
+    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(item) => Some((item, rx)),
+            None => None,
+        }
+    }));
+
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()));
+    copy_safe_headers(upstream_headers, response.headers_mut());
+    let tools_inj = if inject_codex_compat_tools {
+        Some("x_search,image_gen")
+    } else {
+        None
+    };
+    insert_observability_headers_ex(
+        response.headers_mut(),
+        plane_label(plane_build, plane_experimental, plane_media),
+        &account_hdr,
+        ttfb_ms,
+        false,
+        "",
+        tools_inj,
+        requested_model.as_deref(),
+        resolved_model.as_deref(),
+        None,
+        None,
+    );
+    Ok(response)
+}
+
 /// Buffer an upstream Responses SSE, rewrite custom tools, and if the completed
 /// payload is reasoning-only, retry once (non-stream) with a recovery nudge.
 async fn buffer_sse_and_recover_empty_completion<F>(
@@ -1704,7 +1930,7 @@ async fn retry_empty_completion_once<F>(
     preserve_cache_keys: bool,
 ) -> AppResult<Option<Value>>
 where
-    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
+    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder + ?Sized,
 {
     let kind = classify_premature_stop(empty_response, Some(original_request));
     tracing::warn!(
@@ -1832,7 +2058,7 @@ async fn send_recovery_sample<F>(
     retry_req: &Value,
 ) -> AppResult<Value>
 where
-    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder,
+    F: Fn(&reqwest::Client, &str, Bytes) -> reqwest::RequestBuilder + ?Sized,
 {
     let retry_body = Bytes::from(serde_json::to_vec(retry_req)?);
     let resp = build_upstream(http, token, retry_body)

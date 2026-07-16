@@ -73,6 +73,12 @@ pub struct IntegrationStatus {
     pub codex_agents_path: String,
     /// Absolute path to the versioned guide file under `~/.grok-go/agents-guide.md`.
     pub agents_guide_file_path: String,
+    /// App version stamped into the runtime agents-guide (R2-01/R2-04 self-check).
+    #[serde(default)]
+    pub agents_guide_version: String,
+    /// Effective Claude haiku model id after inject mapping (R2-04).
+    #[serde(default)]
+    pub claude_haiku_model: String,
     pub cc_switch_db_path: String,
     /// Whether Grok Build standard session routing points at this gateway.
     pub grok_build_injected: bool,
@@ -133,13 +139,14 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
     };
     let agents_path = codex_agents_md_path();
     let agents_injected = agents_guide_ref_present_at(&agents_path);
-    // Keep the on-disk guide in sync with this binary whenever the user has a ref.
-    if agents_injected {
-        let _ = ensure_agents_guide_file();
-    }
+    // R2-01: always refresh guide when integrations are queried (version stamp).
+    let _ = ensure_agents_guide_file();
     let guide_file = agents_guide_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    let claude_haiku = crate::config::map_claude_shell_model("claude-haiku")
+        .map(|(m, _)| m.to_string())
+        .unwrap_or_else(|| "grok-4.20-0309-non-reasoning".into());
     let grok_path = grok_build_config_path();
     let grok_auth = grok_build_auth_path();
     let grok_injected = if grok_path.exists() {
@@ -178,6 +185,8 @@ pub fn integration_status() -> AppResult<IntegrationStatus> {
         codex_agents_injected: agents_injected,
         codex_agents_path: agents_path.display().to_string(),
         agents_guide_file_path: guide_file,
+        agents_guide_version: env!("CARGO_PKG_VERSION").into(),
+        claude_haiku_model: claude_haiku,
         cc_switch_db_path: cc_switch_db_path().display().to_string(),
         grok_build_injected: grok_injected,
         grok_build_config_path: grok_path.display().to_string(),
@@ -1720,7 +1729,8 @@ fn agents_guide_file_body(config: &AppConfig) -> String {
          ## 决策树（按顺序判断）\n\n\
          ### 分支 A — 本轮 tools 已注入（含 `x_search` / `image_gen` / `mcp__grok-go__*`）\n\n\
          - **直接 function_call / tool_use**，不要绕 shell。\n\
-         - 图片：优先会话里的 `image_gen`（GrokGo 注入或 MCP）；内置 `imagegen` 不稳时再换 MCP。\n\n\
+         - 图片：优先 **GrokGo 注入的 `image_gen` 或 MCP `image_gen`**（产物在 `~/.grok-go/artifacts/`）；仅当会话另有更稳原生图工具且调用成功时用原生。\n\
+         - 视频（Agent/MCP）：默认 **异步**（`wait=false`）→ 拿 `job_id` → `GET /v1/videos/{{id}}` 或扫 artifacts；勿傻等同步超时。\n\n\
          ### 分支 B — health 通，但本轮 **没有** 上述工具\n\n\
          - **只允许**下列旁路（禁止发明 web_search / 浏览器 / RapidAPI 顶替）：\n\
          1. **简易 Tools HTTP**（推荐）:\n\
@@ -1774,8 +1784,9 @@ fn agents_guide_file_body(config: &AppConfig) -> String {
 
         if !image_fallback.is_empty() {
             out.push_str(
-                "## MCP 图片备选（非默认）\n\n\
-                 > 生图默认用 Codex 内置 `imagegen`/`image_gen`。以下仅在原生不可用时使用。\n\n",
+                "## MCP / 注入图片工具（推荐 GrokGo 路径）\n\n\
+                 > 仿冒 Build / 自定义 provider：优先 GrokGo `image_gen`（会话注入或 MCP）。\n\
+                 > 仅当宿主原生 image 工具明确可用且更稳时用原生。\n\n",
             );
             for id in &image_fallback {
                 out.push_str(&tool_guide_section(id));
@@ -1803,18 +1814,18 @@ fn tool_guide_section(id: &str) -> String {
 - 可选：`allowed_handles` `excluded_handles` `from_date` `to_date`（YYYY-MM-DD）\n\
 - **禁止**用 web_search / Chrome / twitter241 顶替；参数以 `tools/list` 为准\n"
             .into(),
-        "image_gen" => "### `image_gen`（`image_generate` 同义别名）— MCP 备选\n\
-- **非默认**：优先 Codex 内置 `imagegen`/`image_gen`\n\
+        "image_gen" => "### `image_gen`（`image_generate` 同义别名）— GrokGo 推荐\n\
+- 仿冒 Build / 自定义 provider：**优先**本工具（注入或 MCP）\n\
+- 必填：`prompt`\n\
+- 可选：`n`(1–4) `model` `size` `quality`(low|medium|high)\n\
+- 返回：`artifacts[]` / `path` / `markdown` 本地绝对路径\n"
+            .into(),
+        "image_generate" => "### `image_generate`（`image_gen` 别名）— GrokGo 推荐\n\
+- 同 `image_gen`\n\
 - 必填：`prompt`\n\
 - 可选：`n`(1–4) `model` `size` `quality`(low|medium|high)\n"
             .into(),
-        "image_generate" => "### `image_generate`（`image_gen` 别名）— MCP 备选\n\
-- **非默认**：优先 Codex 内置 `imagegen`/`image_gen`\n\
-- 必填：`prompt`\n\
-- 可选：`n`(1–4) `model` `size` `quality`(low|medium|high)\n"
-            .into(),
-        "image_edit" => "### `image_edit` — MCP 备选\n\
-- **非默认**：优先 Codex 内置图片编辑能力（若有）\n\
+        "image_edit" => "### `image_edit` — GrokGo 推荐\n\
 - 必填：`prompt` + `image_url`（URL 或本地路径）\n\
 - 可选：`model`\n"
             .into(),
@@ -1824,9 +1835,10 @@ fn tool_guide_section(id: &str) -> String {
   1. 文生视频：仅 `prompt`\n\
   2. 图生视频：`prompt` + `image_url`（首帧）\n\
   3. 多图参考：`prompt` + `reference_image_urls`（1–7，勿与 `image_url` 同用）\n\
-- 可选：`duration`(1–15) `aspect_ratio`(1:1|16:9|9:16|4:3|3:4|3:2|2:3) `resolution`(480p|720p|1080p) `model`\n\
-- 示例：`{\"prompt\":\"轻推镜头，微风吹动毛发\",\"image_url\":\"/abs/path.png\",\"duration\":6}`\n\
-- 参数以 `tools/list` 为准；**禁止**翻仓库猜参\n"
+- 可选：`duration` `aspect_ratio` `resolution` `model` `wait`\n\
+- **Agent/MCP：默认 wait=false**（立刻 job_id → `GET /v1/videos/{{id}}`）；Tools HTTP 默认同步 wait=true\n\
+- `TOOL_TIMEOUT` 可 retry；查 job_id 或 `~/.grok-go/artifacts/`\n\
+- 示例异步：`{\"prompt\":\"ocean waves\",\"wait\":false}`\n"
             .into(),
         "video_edit" => "### `video_edit`（必须走 GrokGo MCP）\n\
 - 必填：`prompt` + `video_url`（URL 或本地路径）\n\
@@ -1864,14 +1876,16 @@ fn ensure_agents_guide_file_with(config: &AppConfig) -> AppResult<std::path::Pat
 /// Keeps hard routing rules inline so agents see them without opening the full guide.
 fn agents_guide_ref_block(guide_abs: &str, mcp_port: u16) -> String {
     let mcp_url = format!("http://127.0.0.1:{mcp_port}/mcp");
+    let tools_http = format!("http://127.0.0.1:{mcp_port}/v1/tools");
     format!(
         "{AGENTS_GUIDE_START}\n\
          <!-- {AGENTS_GUIDE_REF_ANCHOR} -->\n\
-         - **GrokGo 强制分流**（完整说明：`{guide_abs}`，随软件更新；调用前请读）：\n\
-           - **图片**：优先 Codex 内置 `imagegen`/`image_gen`；**不要**默认走 GrokGo MCP 的 `image_gen`/`image_generate`/`image_edit`。\n\
-           - **其余已启用能力**（尤其 `x_search`、`video_generate`、`video_edit`）：**必须**优先 GrokGo MCP — `{mcp_url}` + `Authorization: Bearer <localToken>`（见 `~/.codex/config.toml` `[mcp_servers.grok-go]`）；先 `tools/list` 再 `tools/call`。\n\
-           - **禁止**因会话未注入 `mcp__grok-go__*`、无原生 `x_search`、或 `tool_search` 失效就改用 `web_search` / Chrome / twitter241 / 翻仓库猜参数。\n\
-           - **仅当** `/health` 或 MCP 明确失败时可降级，并说明原因。参数以 `tools/list` 与上述 guide 为准。\n\
+         - **GrokGo 决策树**（完整：`{guide_abs}`，启动/注入会刷新）：\n\
+           - **有** `x_search`/`image_gen`/`mcp__grok-go__*`：直接调，勿绕 shell。\n\
+           - **无 tools**：只允许 `POST {tools_http}/{{name}}` 或 MCP `{mcp_url}` JSON-RPC（Bearer 见 config.toml）；禁止 web_search/Chrome 顶替 X。\n\
+           - **图片**：优先 GrokGo `image_gen`（注入或 MCP）；产物 `~/.grok-go/artifacts/`。\n\
+           - **视频 Agent**：默认异步 wait=false → job_id → GET /v1/videos/{{id}}。\n\
+           - **仅** health/MCP 明确失败可降级，并说明原因。\n\
          {AGENTS_GUIDE_END}"
     )
 }
@@ -2861,11 +2875,10 @@ mod tests {
         assert!(out.contains(AGENTS_GUIDE_START));
         assert!(out.contains(AGENTS_GUIDE_REF_ANCHOR));
         assert!(out.contains(guide));
-        // Hard routing rules stay in the short ref; full tool catalog stays in guide file.
-        assert!(out.contains("强制分流"));
-        assert!(out.contains("http://127.0.0.1:8787/mcp"));
-        assert!(out.contains("tools/list"));
-        assert!(out.contains("web_search"));
+        // Decision tree stays in the short ref; full tool catalog stays in guide file.
+        assert!(out.contains("决策树") || out.contains("GrokGo"));
+        assert!(out.contains("http://127.0.0.1:8787/mcp") || out.contains("/v1/tools"));
+        assert!(out.contains("wait=false") || out.contains("image_gen"));
         assert!(!out.contains("## 强制分流（必读）"));
         assert!(!out.contains("### `x_search`"));
         assert_eq!(out.matches(AGENTS_GUIDE_START).count(), 1);
@@ -2938,12 +2951,15 @@ mod tests {
         assert!(body.contains("http://127.0.0.1:8787/mcp"));
         assert!(body.contains("TOOL_TIMEOUT") || body.contains("health"));
         assert!(body.contains("策略矩阵") || body.contains("仿冒 Build"));
-        assert!(body.contains("## MCP 图片备选") || body.contains("image_gen"));
+        assert!(body.contains("image_gen"));
+        assert!(body.contains("wait=false") || body.contains("异步"));
         let primary_idx = body
             .find("## 当前应优先走 GrokGo MCP 的工具")
             .expect("primary section");
         let x_idx = body.find("### `x_search`").expect("x_search");
         assert!(primary_idx < x_idx);
+        // R2-07: do not push Codex native imagegen as default over GrokGo
+        assert!(!body.contains("生图默认用 Codex 内置"));
     }
 
     #[test]

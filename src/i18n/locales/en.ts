@@ -383,6 +383,7 @@ export const en: Dictionary = {
     experimentalImpersonateGrokBuild: "Impersonate Grok Build (experimental)",
     experimentalImpersonateGrokBuildDesc: "Route Codex / OpenAI / Claude to SuperGrok plane",
     anthropicThinkingMode: "Claude thinking",
+    anthropicThinkingModeHint: "Hide = no thinking blocks to client; upstream may still reason",
     anthropicThinkingHide: "Hide",
     anthropicThinkingPassthrough: "Show full",
     anthropicThinkingSummary: "Summary",

@@ -88,6 +88,11 @@ pub struct AppConfig {
     /// `hide` (default) | `passthrough` | `summary`.
     #[serde(default = "default_anthropic_thinking_mode")]
     pub anthropic_thinking_mode: String,
+    /// MCP `tools/call` default for `video_generate.wait` when arg omitted.
+    /// Default **false** (async submit + poll) so agent MCP clients avoid -32001.
+    /// `POST /v1/tools/video_generate` still defaults wait=true (human/curl sync).
+    #[serde(default)]
+    pub mcp_video_wait_default: bool,
     #[serde(default = "default_oauth_redirect_port")]
     pub oauth_redirect_port: u16,
     /// When true, upstream xAI/OAuth HTTP goes through `http_proxy_url`.
@@ -253,6 +258,7 @@ impl Default for AppConfig {
             cli_chat_proxy_base_url: default_cli_chat_proxy_base_url(),
             experimental_impersonate_grok_build: false,
             anthropic_thinking_mode: default_anthropic_thinking_mode(),
+            mcp_video_wait_default: false,
             oauth_redirect_port: default_oauth_redirect_port(),
             http_proxy_enabled: false,
             http_proxy_url: String::new(),

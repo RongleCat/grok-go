@@ -489,6 +489,57 @@ mod tests {
         assert_eq!(msgs[1]["content"], "a.txt");
     }
 
+    /// R2-12 / D-002: multi-segment tool_result content must flatten to one tool message.
+    #[test]
+    fn tool_result_multi_content_segments_flatten() {
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {"path": "a"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_1",
+                        "content": [
+                            {"type": "text", "text": "line-a"},
+                            {"type": "text", "text": "line-b"}
+                        ]
+                    }]
+                }
+            ]
+        });
+        let conv = anthropic_to_openai_chat(&body).unwrap();
+        let msgs = conv.body["messages"].as_array().unwrap();
+        let tool_msg = msgs.iter().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")).unwrap();
+        let content = tool_msg.get("content").and_then(|c| c.as_str()).unwrap();
+        assert!(content.contains("line-a"));
+        assert!(content.contains("line-b"));
+    }
+
+    #[test]
+    fn document_block_is_explicit_error() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "document", "source": {"type": "base64", "data": "xx"}}]
+            }]
+        });
+        let err = anthropic_to_openai_chat(&body).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("document"));
+    }
+
     #[test]
     fn filters_batch_tool() {
         let body = json!({

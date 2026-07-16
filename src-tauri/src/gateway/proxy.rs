@@ -49,7 +49,8 @@ use crate::gateway::sanitize::{
 };
 use crate::gateway::tool_surface::{
     plane_label, precheck_vision_in_body, short_account_tag, HDR_ACCOUNT, HDR_CACHE_MODE,
-    HDR_PLANE, HDR_THINKING, HDR_TRUNCATED, HDR_UPSTREAM_MS,
+    HDR_CONVERT_MS, HDR_MODEL_REQUESTED, HDR_MODEL_ROUTED, HDR_MODEL_UPSTREAM, HDR_OPTIMIZE_MS,
+    HDR_PLANE, HDR_THINKING, HDR_TOOLS_INJECTED, HDR_TRUNCATED, HDR_UPSTREAM_MS,
 };
 use crate::http_client::build_http_client;
 use crate::concurrency::AccountPermit;
@@ -272,13 +273,16 @@ async fn proxy_anthropic_messages_inner(
     let anthropic_req: Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::msg(format!("invalid JSON body: {e}")))?;
 
+    let convert_started = Instant::now();
     let converted = anthropic_to_openai_chat(&anthropic_req)
         .map_err(|e| AppError::msg(format!("anthropic request convert: {e}")))?;
+    let convert_ms = convert_started.elapsed().as_millis() as u64;
 
     let (mapped_model, map_reason) =
         map_client_model(&converted.requested_model, &config.default_model);
     let (resolved_model, resolve_reason) = resolve_model(&config, &mapped_model);
     let mapping_reason = format!("anthropic:{map_reason}:{resolve_reason}");
+    let requested_model_str = converted.requested_model.clone();
 
     let mut chat_body = converted.body;
     chat_body["model"] = Value::String(resolved_model.clone());
@@ -295,6 +299,7 @@ async fn proxy_anthropic_messages_inner(
 
     // Byte-oriented multi-turn shrink (images / huge tool outputs) — rarely
     // fires on text-only Claude Code loops (12MiB soft budget).
+    let opt_started = Instant::now();
     let opt = optimize_responses_payload(&mut chat_body);
     if opt.modified {
         opt.log_summary("/v1/messages");
@@ -305,6 +310,7 @@ async fn proxy_anthropic_messages_inner(
     if budget.modified {
         budget.log_summary("/v1/messages#token-budget");
     }
+    let optimize_ms = opt_started.elapsed().as_millis() as u64;
     let truncated = budget.modified || opt.modified;
     let thinking_mode = ThinkingMode::parse(&config.anthropic_thinking_mode);
 
@@ -508,19 +514,26 @@ async fn proxy_anthropic_messages_inner(
                 }
             }
         }
-        insert_observability_headers(
+        insert_observability_headers_ex(
             response.headers_mut(),
             plane_label(plane.build_plane, plane.experimental_impersonation, false),
             &account.id,
             latency_ms,
             truncated,
             &config.anthropic_thinking_mode,
+            None,
+            Some(&requested_model_str),
+            Some(&resolved_model),
+            Some(convert_ms),
+            Some(optimize_ms),
         );
         tracing::debug!(
             target: "gateway",
             %mapping_reason,
             model = %resolved_model,
             thinking = %config.anthropic_thinking_mode,
+            convert_ms,
+            optimize_ms,
             "anthropic messages stream started"
         );
         return Ok(response);
@@ -594,8 +607,8 @@ async fn proxy_anthropic_messages_inner(
         &request_id,
         Some(account.id.clone()),
         path,
-        Some(converted.requested_model),
-        Some(resolved_model),
+        Some(converted.requested_model.clone()),
+        Some(resolved_model.clone()),
         out_status.as_u16(),
         started.elapsed().as_millis() as u64,
         None,
@@ -618,13 +631,18 @@ async fn proxy_anthropic_messages_inner(
         .body(Body::from(serde_json::to_vec(&out_value)?))
         .unwrap_or_else(|_| Response::new(Body::empty()));
     copy_safe_headers(upstream_headers, response.headers_mut());
-    insert_observability_headers(
+    insert_observability_headers_ex(
         response.headers_mut(),
         plane_label(plane.build_plane, plane.experimental_impersonation, false),
         &account.id,
         started.elapsed().as_millis() as u64,
         truncated,
         &config.anthropic_thinking_mode,
+        None,
+        Some(&requested_model_str),
+        Some(&resolved_model),
+        Some(convert_ms),
+        Some(optimize_ms),
     );
     // O-16: cache_control is not full Anthropic semantics on this path.
     if let Ok(hv) = HeaderValue::from_str("upstream-prefix-only") {
@@ -644,6 +662,35 @@ fn insert_observability_headers(
     truncated: bool,
     thinking_mode: &str,
 ) {
+    insert_observability_headers_ex(
+        headers,
+        plane,
+        account_id,
+        upstream_ms,
+        truncated,
+        thinking_mode,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_observability_headers_ex(
+    headers: &mut axum::http::HeaderMap,
+    plane: &str,
+    account_id: &str,
+    upstream_ms: u64,
+    truncated: bool,
+    thinking_mode: &str,
+    tools_injected: Option<&str>,
+    model_requested: Option<&str>,
+    model_routed: Option<&str>,
+    convert_ms: Option<u64>,
+    optimize_ms: Option<u64>,
+) {
     if let Ok(hv) = HeaderValue::from_str(plane) {
         headers.insert(HeaderName::from_static(HDR_PLANE), hv);
     }
@@ -659,8 +706,37 @@ fn insert_observability_headers(
             HeaderValue::from_static("1"),
         );
     }
-    if let Ok(hv) = HeaderValue::from_str(thinking_mode) {
-        headers.insert(HeaderName::from_static(HDR_THINKING), hv);
+    if !thinking_mode.is_empty() {
+        if let Ok(hv) = HeaderValue::from_str(thinking_mode) {
+            headers.insert(HeaderName::from_static(HDR_THINKING), hv);
+        }
+    }
+    if let Some(t) = tools_injected.filter(|s| !s.is_empty()) {
+        if let Ok(hv) = HeaderValue::from_str(t) {
+            headers.insert(HeaderName::from_static(HDR_TOOLS_INJECTED), hv);
+        }
+    }
+    if let Some(m) = model_requested.filter(|s| !s.is_empty()) {
+        if let Ok(hv) = HeaderValue::from_str(m) {
+            headers.insert(HeaderName::from_static(HDR_MODEL_REQUESTED), hv);
+        }
+    }
+    if let Some(m) = model_routed.filter(|s| !s.is_empty()) {
+        if let Ok(hv) = HeaderValue::from_str(m) {
+            headers.insert(HeaderName::from_static(HDR_MODEL_ROUTED), hv.clone());
+            // upstream often same as routed after mapping; clients can refine later
+            headers.insert(HeaderName::from_static(HDR_MODEL_UPSTREAM), hv);
+        }
+    }
+    if let Some(ms) = convert_ms {
+        if let Ok(hv) = HeaderValue::from_str(&ms.to_string()) {
+            headers.insert(HeaderName::from_static(HDR_CONVERT_MS), hv);
+        }
+    }
+    if let Some(ms) = optimize_ms {
+        if let Ok(hv) = HeaderValue::from_str(&ms.to_string()) {
+            headers.insert(HeaderName::from_static(HDR_OPTIMIZE_MS), hv);
+        }
     }
 }
 
@@ -1086,13 +1162,23 @@ async fn proxy_json_inner(
         let body = Body::from_stream(stream);
         let mut response = Response::builder().status(status).body(body).unwrap_or_else(|_| Response::new(Body::empty()));
         copy_safe_headers(upstream_headers, response.headers_mut());
-        insert_observability_headers(
+        let tools_inj = if plane.inject_codex_compat_tools {
+            Some("x_search,image_gen")
+        } else {
+            None
+        };
+        insert_observability_headers_ex(
             response.headers_mut(),
             plane_label(plane.build_plane, plane.experimental_impersonation, plane.media_path),
             &account.id,
             latency_ms,
             false,
             "",
+            tools_inj,
+            requested_model.as_deref(),
+            resolved_model.as_deref(),
+            None,
+            None,
         );
         return Ok(response);
     }
@@ -1293,8 +1379,8 @@ async fn proxy_json_inner(
         &request_id,
         Some(account.id.clone()),
         path,
-        requested_model,
-        resolved_model,
+        requested_model.clone(),
+        resolved_model.clone(),
         status.as_u16(),
         latency_ms,
         None,
@@ -1334,18 +1420,54 @@ async fn proxy_json_inner(
         }
     }
 
+    // R2-05: optional body fields (do not replace `model`)
+    let out_bytes = if status.is_success() {
+        if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(r) = requested_model.as_ref() {
+                    obj.entry("requested_model".to_string())
+                        .or_insert_with(|| json!(r));
+                }
+                if let Some(r) = resolved_model.as_ref() {
+                    obj.entry("routed_model".to_string())
+                        .or_insert_with(|| json!(r));
+                    if let Some(up) = obj.get("model").cloned() {
+                        obj.entry("upstream_model".to_string()).or_insert(up);
+                    }
+                }
+                Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
+            } else {
+                bytes
+            }
+        } else {
+            bytes
+        }
+    } else {
+        bytes
+    };
+
     let mut response = Response::builder()
         .status(status)
-        .body(Body::from(bytes))
+        .body(Body::from(out_bytes))
         .unwrap_or_else(|_| Response::new(Body::empty()));
     copy_safe_headers(upstream_headers, response.headers_mut());
-    insert_observability_headers(
+    let tools_inj = if plane.inject_codex_compat_tools {
+        Some("x_search,image_gen")
+    } else {
+        None
+    };
+    insert_observability_headers_ex(
         response.headers_mut(),
         plane_label(plane.build_plane, plane.experimental_impersonation, plane.media_path),
         &account.id,
         started.elapsed().as_millis() as u64,
         false,
         "",
+        tools_inj,
+        requested_model.as_deref(),
+        resolved_model.as_deref(),
+        None,
+        None,
     );
     Ok(response)
 }
@@ -2808,10 +2930,31 @@ fn response_to_text(resp: Response) -> String {
 
 pub async fn list_models_response(config: &AppConfig) -> Value {
     // Prefer upstream models, fallback to curated list
-    if let Ok(value) = fetch_upstream_models(config).await {
+    if let Ok(mut value) = fetch_upstream_models(config).await {
+        ensure_build_model_aliases(&mut value, config);
         return value;
     }
     curated_models(config)
+}
+
+/// R2-05: ensure `grok-4.5-build` appears when experimental build rewrites model ids.
+fn ensure_build_model_aliases(value: &mut Value, config: &AppConfig) {
+    let Some(data) = value.get_mut("data").and_then(|d| d.as_array_mut()) else {
+        return;
+    };
+    let has_build = data.iter().any(|m| {
+        m.get("id").and_then(|i| i.as_str()) == Some("grok-4.5-build")
+    });
+    if !has_build {
+        data.push(json!({
+            "id": "grok-4.5-build",
+            "object": "model",
+            "owned_by": "xai",
+            "modality": "text",
+            "note": "alias: experimental-build plane may report this id; maps to SuperGrok chat",
+        }));
+    }
+    let _ = config; // reserved for future alias from default_model
 }
 
 /// Fetch raw OpenAI-style `/models` payload from xAI when auth + network allow.
@@ -2856,6 +2999,7 @@ fn curated_models(config: &AppConfig) -> Value {
         }));
     };
     push(&config.default_model, "text");
+    push("grok-4.5-build", "text");
     for id in known_xai_text_models() {
         push(id, "text");
     }

@@ -399,10 +399,22 @@ pub fn media_summary(
         "file": primary,
         // All local absolute paths
         "files": files,
+        // R2-02: unified artifacts[] for agents (same as files)
+        "artifacts": files,
+        "summary": primary
+            .as_ref()
+            .map(|p| format!("{kind} ready: {p}"))
+            .unwrap_or_else(|| format!("{kind} completed")),
+        "result": {
+            "path": primary,
+            "files": files,
+            "markdown": markdown,
+        },
+        "error": null,
         // Ready-to-paste Markdown for Codex desktop rendering
         "markdown": markdown,
         "display_hint": "Use the absolute path from `path`/`files` (or `markdown`) to render inline. Do NOT use remote CDN urls.",
-        // Keep upstream for debugging, but strip huge fields when present.
+        // Compact upstream for light debug (not full b64)
         "upstream": compact_upstream(upstream),
     })
 }

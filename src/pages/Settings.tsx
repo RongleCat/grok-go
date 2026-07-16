@@ -845,6 +845,11 @@ export function SettingsPage() {
                     </option>
                     <option value="summary">{t.settings.anthropicThinkingSummary}</option>
                   </select>
+                  {t.settings.anthropicThinkingModeHint ? (
+                    <p className="mt-1 text-xs text-neutral-500">
+                      {t.settings.anthropicThinkingModeHint}
+                    </p>
+                  ) : null}
                 </div>
               </CardContent>
             </Card>

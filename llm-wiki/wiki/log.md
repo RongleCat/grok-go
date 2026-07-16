@@ -1,5 +1,23 @@
 # Wiki 日志
 
+## 2026-07-16（第二轮 R2：交付闭环 + 跨端安全）
+
+- 方案：`docs/experimental-build-round2-plan.md`
+- **R2-01** 网关 start / integration_status 强制刷新 `agents-guide.md`
+- **R2-02** x_search 顶层 `result.text/citations`；默认不塞 fat `raw`（`debug`/`include_raw` 可开）
+- **R2-03** MCP `video_generate` 默认 `wait=false`（`mcp_video_wait_default`）；Tools HTTP 默认 `wait=true`
+- **R2-04** IntegrationStatus：`agentsGuideVersion` / `claudeHaikuModel`
+- **R2-05** 响应头 model-requested/routed/upstream；body 可选 `requested_model`/`routed_model`/`upstream_model`；`/v1/models` alias `grok-4.5-build`
+- **R2-06** `x-grokgo-tools-injected`
+- **R2-07** guide 图片语义统一为 GrokGo 优先；视频 Agent 异步写死
+- **R2-08** Anthropic `x-grokgo-convert-ms` / `optimize-ms`
+- **R2-09** `GET /v1/videos/{id}` done 时 materialize `artifacts[]`
+- **R2-10** MCP tools/call 失败返回 envelope（isError）而非仅 JSON-RPC 字符串
+- **R2-11** Settings thinking 半句：隐藏≠上游不思考
+- **R2-12** multi tool_result flatten + document block 单测
+- 护栏：Native TUI 不伤；Tools HTTP 仍默认同步；字段只增不删
+- `cargo test --lib` 202 ok
+
 ## 2026-07-16（仿冒 Build 综合优化 O-01–O-19）
 
 - 回滚点：git tag `pre-experimental-opt/2026-07-16` → `f0b4c44`

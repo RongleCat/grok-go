@@ -269,6 +269,13 @@ pub const HDR_TRUNCATED: &str = "x-grokgo-truncated";
 pub const HDR_THINKING: &str = "x-grokgo-thinking-mode";
 pub const HDR_TOKEN_COUNT_MODE: &str = "x-grokgo-token-count-mode";
 pub const HDR_CACHE_MODE: &str = "x-grokgo-cache-mode";
+/// Comma-separated tools injected this request (experimental Build), e.g. `x_search,image_gen`.
+pub const HDR_TOOLS_INJECTED: &str = "x-grokgo-tools-injected";
+pub const HDR_MODEL_REQUESTED: &str = "x-grokgo-model-requested";
+pub const HDR_MODEL_ROUTED: &str = "x-grokgo-model-routed";
+pub const HDR_MODEL_UPSTREAM: &str = "x-grokgo-model-upstream";
+pub const HDR_CONVERT_MS: &str = "x-grokgo-convert-ms";
+pub const HDR_OPTIMIZE_MS: &str = "x-grokgo-optimize-ms";
 
 /// Short stable hash of account id for response headers (not full secret).
 pub fn short_account_tag(account_id: &str) -> String {

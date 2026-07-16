@@ -381,6 +381,7 @@ export const zhCN = {
     experimentalImpersonateGrokBuild: "仿冒 Grok Build（实验）",
     experimentalImpersonateGrokBuildDesc: "Codex / OpenAI / Claude 走 SuperGrok 面",
     anthropicThinkingMode: "Claude 思考块",
+    anthropicThinkingModeHint: "隐藏=不回传思考块；上游仍可能在推理",
     anthropicThinkingHide: "隐藏",
     anthropicThinkingPassthrough: "完整透出",
     anthropicThinkingSummary: "摘要",

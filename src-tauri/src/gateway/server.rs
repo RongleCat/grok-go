@@ -83,6 +83,11 @@ pub async fn start_gateway(state: GatewayState) -> AppResult<SocketAddr> {
         *state.actual_addr.lock().await = Some(addr);
     }
 
+    // R2-01: always refresh runtime agents-guide so Codex sees decision tree / tools API.
+    if let Err(err) = crate::integrations::refresh_agents_guide_file() {
+        tracing::warn!(error = %err, "failed to refresh agents-guide on gateway start");
+    }
+
     let app = build_router(state.clone());
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -151,6 +156,8 @@ async fn health(State(state): State<GatewayState>) -> Json<Value> {
         "accountsTotal": accounts_total,
         "experimentalImpersonateGrokBuild": config.experimental_impersonate_grok_build,
         "anthropicThinkingMode": config.anthropic_thinking_mode,
+        "mcpVideoWaitDefault": config.mcp_video_wait_default,
+        "agentsGuideVersion": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -186,9 +193,13 @@ async fn tools_http_call(
         }
     };
     let mut args = args;
+    // R2-03: Tools HTTP defaults wait=true for human/curl sync (override if client set wait).
+    if name == "video_generate" && args.get("wait").is_none() {
+        args["wait"] = json!(true);
+    }
     let _ = crate::gateway::tool_surface::coerce_mcp_tool_arguments(&mut args);
     let params = json!({"name": name, "arguments": args});
-    match handle_tool_call(&state, &config, params).await {
+    match handle_tool_call(&state, &config, params, ToolCallSource::Http).await {
         Ok(value) => {
             // Prefer structured envelope when present in MCP content text.
             if let Some(text) = value
@@ -489,7 +500,25 @@ async fn video_job_status(
         return resp;
     }
     match poll_video_job_http(&state, &config, &request_id).await {
-        Ok(value) => Json(value).into_response(),
+        Ok(mut value) => {
+            // R2-09: when job is done, materialize local artifacts for agent recovery.
+            let status = value
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            if matches!(status, "done" | "completed" | "succeeded") {
+                let client = state.proxy.client();
+                if let Ok(files) = materialize_video_response(&client, &value).await {
+                    if !files.is_empty() {
+                        value["artifacts"] = json!(files);
+                        value["path"] = json!(files.first());
+                        value["files"] = json!(files);
+                        value["markdown"] = json!(format!("![video]({})", files[0]));
+                    }
+                }
+            }
+            Json(value).into_response()
+        }
         Err(err) => error_response(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -749,7 +778,7 @@ fn mcp_tools_catalog_all() -> Value {
         },
         {
             "name": "video_generate",
-            "description": "Generate a video (text-to-video OR image-to-video OR multi-reference). CALL IMMEDIATELY — do NOT web_search or grep the repo for parameters. This schema is complete.\n\nMODES (pick one):\n1) Text-to-video: prompt only\n2) Image-to-video (图生视频 / animate still): prompt + image_url (starting frame)\n3) Reference-to-video: prompt + reference_image_urls (1–7 style/content refs). Do NOT combine image_url with reference_image_urls.\n\nARGS (complete):\n- prompt (string, REQUIRED): scene + motion description\n- image_url (string, optional): starting-frame image for image-to-video. Accepts https://, data:, absolute local path, file://\n- reference_image_urls (string[], optional): 1–7 reference images (same URL/path forms). Alternative to image_url\n- duration (number 1–15, optional): seconds (default upstream ~5–8)\n- aspect_ratio (string, optional): 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3. Image-to-video defaults to source image AR if omitted\n- resolution (string, optional): 480p | 720p | 1080p (1080p only on some models / image-to-video)\n- model (string, optional; default grok-imagine-video)\n- wait (boolean, optional, default true): if false, return job_id immediately and poll GET /v1/videos/{id}\n\nBEHAVIOR: by default submits job, polls until done, downloads mp4 to ~/.grok-go/artifacts/, returns local path. With wait=false returns job_id + poll path without waiting.\nRETURNS JSON: path/file/files (absolute local mp4), markdown ![video](/abs/path.mp4). Never show remote CDN urls.\n\nEXAMPLES:\n- Text: {\"prompt\":\"cat running through tall grass at golden hour\",\"duration\":8,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\"}\n- Image-to-video: {\"prompt\":\"gentle camera push-in, soft wind in fur\",\"image_url\":\"/Users/me/.grok-go/artifacts/cat.png\",\"duration\":6}\n- Refs: {\"prompt\":\"cinematic fashion walk\",\"reference_image_urls\":[\"/tmp/a.jpg\",\"/tmp/b.jpg\"],\"duration\":6}\n- Async submit: {\"prompt\":\"ocean waves\",\"wait\":false}",
+            "description": "Generate a video (text-to-video OR image-to-video OR multi-reference). CALL IMMEDIATELY — do NOT web_search or grep the repo for parameters. This schema is complete.\n\nMODES (pick one):\n1) Text-to-video: prompt only\n2) Image-to-video (图生视频 / animate still): prompt + image_url (starting frame)\n3) Reference-to-video: prompt + reference_image_urls (1–7 style/content refs). Do NOT combine image_url with reference_image_urls.\n\nARGS (complete):\n- prompt (string, REQUIRED): scene + motion description\n- image_url (string, optional): starting-frame image for image-to-video. Accepts https://, data:, absolute local path, file://\n- reference_image_urls (string[], optional): 1–7 reference images (same URL/path forms). Alternative to image_url\n- duration (number 1–15, optional): seconds (default upstream ~5–8)\n- aspect_ratio (string, optional): 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3. Image-to-video defaults to source image AR if omitted\n- resolution (string, optional): 480p | 720p | 1080p (1080p only on some models / image-to-video)\n- model (string, optional; default grok-imagine-video)\n- wait (boolean, optional): MCP tools/call defaults false (async job_id+poll); POST /v1/tools/video_generate defaults true (sync). Explicit wait always wins.\n\nBEHAVIOR: wait=true polls until done and returns local mp4 path. wait=false returns job_id + poll GET /v1/videos/{id} immediately.\nRETURNS JSON: path/file/files (absolute local mp4), markdown ![video](/abs/path.mp4). Never show remote CDN urls.\n\nEXAMPLES:\n- Text: {\"prompt\":\"cat running through tall grass at golden hour\",\"duration\":8,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\"}\n- Image-to-video: {\"prompt\":\"gentle camera push-in, soft wind in fur\",\"image_url\":\"/Users/me/.grok-go/artifacts/cat.png\",\"duration\":6}\n- Refs: {\"prompt\":\"cinematic fashion walk\",\"reference_image_urls\":[\"/tmp/a.jpg\",\"/tmp/b.jpg\"],\"duration\":6}\n- Async submit: {\"prompt\":\"ocean waves\",\"wait\":false}",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -791,8 +820,7 @@ fn mcp_tools_catalog_all() -> Value {
                     },
                     "wait": {
                         "type": "boolean",
-                        "default": true,
-                        "description": "OPTIONAL. Default true = poll until done. false = submit only and return job_id + poll path GET /v1/videos/{id}."
+                        "description": "OPTIONAL. MCP default false (async). Tools HTTP default true (sync). false = return job_id + poll GET /v1/videos/{id}."
                     }
                 },
                 "required": ["prompt"]
@@ -923,12 +951,30 @@ async fn mcp_endpoint(State(state): State<GatewayState>, headers: HeaderMap, bod
                 &state,
                 &config,
                 payload.get("params").cloned().unwrap_or(json!({})),
+                ToolCallSource::Mcp,
             )
             .await
             {
                 Ok(value) => value,
                 Err(err) => {
-                    return mcp_json_error(id, -32000, err.to_string());
+                    // R2-10: structured envelope for agents (not only JSON-RPC error string).
+                    let name = payload
+                        .pointer("/params/name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("unknown");
+                    let layered =
+                        crate::gateway::error_codes::classify_transport_error(&err.to_string());
+                    let layered = if layered.code == crate::gateway::error_codes::UPSTREAM_ERROR {
+                        crate::gateway::error_codes::tool_failed(name, err.to_string())
+                    } else {
+                        layered
+                    };
+                    let envelope = layered.tool_envelope(name);
+                    // Still return as tools/call result with isError so MCP clients parse it.
+                    return mcp_json_result(
+                        id,
+                        crate::gateway::error_codes::mcp_content_from_envelope(&envelope),
+                    );
                 }
             }
         }
@@ -949,7 +995,21 @@ async fn mcp_endpoint(State(state): State<GatewayState>, headers: HeaderMap, bod
     mcp_json_result(id, result)
 }
 
-async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Value) -> AppResult<Value> {
+/// Call path for tool dispatch — controls video `wait` default (R2-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallSource {
+    /// MCP tools/call — default video wait from `mcp_video_wait_default` (usually false).
+    Mcp,
+    /// POST /v1/tools/* — default video wait=true (sync for humans/curl).
+    Http,
+}
+
+async fn handle_tool_call(
+    state: &GatewayState,
+    config: &AppConfig,
+    params: Value,
+    source: ToolCallSource,
+) -> AppResult<Value> {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or_default();
     if name.is_empty() {
         return Err(AppError::msg("tool name is required"));
@@ -962,6 +1022,11 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
     let mut args = params.get("arguments").cloned().unwrap_or(json!({}));
     // O-13: coerce whole floats (e.g. session_id: 60619.0) to integers.
     let _ = crate::gateway::tool_surface::coerce_mcp_tool_arguments(&mut args);
+    let include_raw = args
+        .get("debug")
+        .and_then(|v| v.as_bool())
+        .or_else(|| args.get("include_raw").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
     match name {
         "x_search" => {
             let query = args.get("query").and_then(|v| v.as_str()).unwrap_or_default();
@@ -976,11 +1041,20 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                 "tools": [tool]
             });
             let up = call_upstream(state, config, "/responses", body, "mcp-x_search").await?;
-            let envelope = crate::gateway::error_codes::tool_ok_envelope(
+            // R2-02: agent-consumable result; no fat raw unless debug.
+            let (summary, result) =
+                crate::gateway::error_codes::extract_x_search_result(&up.value);
+            let raw = if include_raw {
+                Some(up.value)
+            } else {
+                None
+            };
+            let envelope = crate::gateway::error_codes::tool_ok_envelope_with_result(
                 name,
-                "x_search completed",
+                summary,
                 &[],
-                Some(up.value.clone()),
+                Some(result),
+                raw,
             );
             Ok(crate::gateway::error_codes::mcp_content_from_envelope(&envelope))
         }
@@ -1099,12 +1173,13 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
             }
 
             // Submit + poll must use the same OAuth account (job is account-scoped).
-            // O-07: clients may pass wait=false to get job_id immediately and poll
-            // GET /v1/videos/{request_id} (existing affinity route).
-            let wait = args
-                .get("wait")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            // R2-03: MCP defaults wait from config (usually false); HTTP defaults true.
+            let wait = args.get("wait").and_then(|v| v.as_bool()).unwrap_or(
+                match source {
+                    ToolCallSource::Mcp => config.mcp_video_wait_default,
+                    ToolCallSource::Http => true,
+                },
+            );
             let up = call_upstream(state, config, "/videos/generations", body, "mcp-video").await?;
             let request_id = up
                 .value
@@ -1115,7 +1190,7 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
             if !wait {
                 if let Some(rid) = request_id.as_deref() {
                     crate::gateway::job_affinity::remember_video_job(rid, &up.account.id);
-                    let envelope = json!({
+                    let mut envelope = json!({
                         "ok": true,
                         "tool": name,
                         "summary": "video job submitted; poll for completion",
@@ -1123,8 +1198,15 @@ async fn handle_tool_call(state: &GatewayState, config: &AppConfig, params: Valu
                         "poll": format!("/v1/videos/{rid}"),
                         "artifacts": [],
                         "error": null,
-                        "raw": up.value,
+                        "result": {
+                            "job_id": rid,
+                            "poll": format!("/v1/videos/{rid}"),
+                            "status": "pending"
+                        }
                     });
+                    if include_raw {
+                        envelope["raw"] = up.value;
+                    }
                     return Ok(crate::gateway::error_codes::mcp_content_from_envelope(&envelope));
                 }
             }

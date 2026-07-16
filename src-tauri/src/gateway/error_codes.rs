@@ -198,7 +198,21 @@ pub fn invalid_request(message: impl Into<String>, hint: impl Into<String>) -> L
 }
 
 /// Standardized successful tool result envelope (MCP text + HTTP tools API).
+///
+/// R2-02: prefer top-level `result` for agent-consumable data; omit fat `raw`
+/// unless the caller passes `include_raw=true`.
 pub fn tool_ok_envelope(tool: &str, summary: impl Into<String>, artifacts: &[String], raw: Option<Value>) -> Value {
+    tool_ok_envelope_with_result(tool, summary, artifacts, None, raw)
+}
+
+/// Same as [`tool_ok_envelope`] with optional structured `result` payload.
+pub fn tool_ok_envelope_with_result(
+    tool: &str,
+    summary: impl Into<String>,
+    artifacts: &[String],
+    result: Option<Value>,
+    raw: Option<Value>,
+) -> Value {
     let mut body = json!({
         "ok": true,
         "tool": tool,
@@ -206,10 +220,133 @@ pub fn tool_ok_envelope(tool: &str, summary: impl Into<String>, artifacts: &[Str
         "artifacts": artifacts,
         "error": null,
     });
+    if let Some(r) = result {
+        body["result"] = r;
+    }
     if let Some(r) = raw {
         body["raw"] = r;
     }
     body
+}
+
+/// Pull human-readable text + X URLs from a Responses-shaped x_search upstream body.
+pub fn extract_x_search_result(upstream: &Value) -> (String, Value) {
+    let mut texts: Vec<String> = Vec::new();
+    let mut citations: Vec<String> = Vec::new();
+
+    fn walk(v: &Value, texts: &mut Vec<String>, citations: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                // message content strings
+                if let Some(t) = map.get("text").and_then(|x| x.as_str()) {
+                    if !t.trim().is_empty()
+                        && map.get("type").and_then(|ty| ty.as_str()) != Some("reasoning")
+                    {
+                        texts.push(t.to_string());
+                    }
+                }
+                if let Some(content) = map.get("content") {
+                    if let Some(s) = content.as_str() {
+                        if !s.trim().is_empty() {
+                            texts.push(s.to_string());
+                        }
+                    } else if let Some(arr) = content.as_array() {
+                        for part in arr {
+                            if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
+                                if !t.trim().is_empty() {
+                                    texts.push(t.to_string());
+                                }
+                            }
+                            walk(part, texts, citations);
+                        }
+                    }
+                }
+                // output array items
+                if let Some(output) = map.get("output").and_then(|o| o.as_array()) {
+                    for item in output {
+                        let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if ty == "message" || item.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                        {
+                            walk(item, texts, citations);
+                        } else if ty == "x_search_call" || ty.contains("search") {
+                            walk(item, texts, citations);
+                        } else if ty != "reasoning" {
+                            walk(item, texts, citations);
+                        }
+                    }
+                }
+                for (k, child) in map {
+                    if k == "reasoning" || k == "reasoning_content" {
+                        continue;
+                    }
+                    walk(child, texts, citations);
+                }
+            }
+            Value::Array(arr) => {
+                for child in arr {
+                    walk(child, texts, citations);
+                }
+            }
+            Value::String(s) => {
+                // Collect x.com / twitter URLs from free text
+                for token in s.split_whitespace() {
+                    let t = token.trim_matches(|c: char| "()[],.\"'".contains(c));
+                    if t.contains("x.com/") || t.contains("twitter.com/") {
+                        if !citations.iter().any(|c| c == t) {
+                            citations.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(upstream, &mut texts, &mut citations);
+
+    // Also scan combined text for URLs
+    let combined_scan = texts.join("\n");
+    for token in combined_scan.split_whitespace() {
+        let t = token.trim_matches(|c: char| "()[],.\"'".contains(c));
+        if (t.contains("x.com/") || t.contains("twitter.com/"))
+            && !citations.iter().any(|c| c == t)
+        {
+            citations.push(t.to_string());
+        }
+    }
+
+    // Dedup texts while preserving order; prefer longest non-empty
+    let mut seen = std::collections::HashSet::new();
+    texts.retain(|t| {
+        let key = t.trim().to_string();
+        !key.is_empty() && seen.insert(key)
+    });
+    let text = if texts.is_empty() {
+        String::new()
+    } else {
+        // Prefer the longest assistant-looking blob
+        texts
+            .into_iter()
+            .max_by_key(|t| t.len())
+            .unwrap_or_default()
+    };
+
+    let summary = if text.is_empty() {
+        "x_search completed (no text extracted)".to_string()
+    } else {
+        let one: String = text.chars().take(160).collect();
+        if text.chars().count() > 160 {
+            format!("{one}…")
+        } else {
+            one
+        }
+    };
+
+    let result = json!({
+        "text": text,
+        "citations": citations,
+    });
+    (summary, result)
 }
 
 /// MCP content wrapper that embeds the envelope as JSON text (agents parse easily).
@@ -298,5 +435,29 @@ mod tests {
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("UPSTREAM_TIMEOUT"));
         assert!(!body["error"]["hint"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn extract_x_search_pulls_text_and_citations() {
+        let upstream = json!({
+            "output": [
+                {"type": "reasoning", "text": "thinking"},
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "Found @cgnot996 https://x.com/cgnot996/status/1"}
+                    ]
+                }
+            ]
+        });
+        let (summary, result) = extract_x_search_result(&upstream);
+        assert!(summary.contains("cgnot996") || result["text"].as_str().unwrap().contains("cgnot996"));
+        assert!(result["text"].as_str().unwrap().contains("cgnot996"));
+        let cites = result["citations"].as_array().unwrap();
+        assert!(cites.iter().any(|c| c.as_str().unwrap().contains("x.com")));
+        let env = tool_ok_envelope_with_result("x_search", summary, &[], Some(result), None);
+        assert!(env.get("raw").is_none());
+        assert!(env["result"]["text"].as_str().unwrap().contains("cgnot996"));
     }
 }

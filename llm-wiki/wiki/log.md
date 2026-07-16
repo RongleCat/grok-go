@@ -1,5 +1,12 @@
 # Wiki 日志
 
+## 2026-07-16（请求日志管理 + 首字/耗时）
+
+- UI：日志页「管理」弹窗 — 条数/磁盘、保留天数、最大条数、立即按策略清理、按 1/7/30 天清除、按日期区间清除、全部清空
+- 配置：`logRetentionDays`（默认 30）、`logMaxRows`（默认 5e4，0=不限）；写入线程按配置 prune
+- 后端：`get_log_stats` / `clear_logs_older_than` / `clear_logs_range` / `prune_logs_now`
+- 延迟列：流式记录 first_token_ms + 总耗时；UI 上下展示「首字 / 耗时」
+
 ## 2026-07-16（第二轮 R2：交付闭环 + 跨端安全）
 
 - 方案：`docs/experimental-build-round2-plan.md`

@@ -21,7 +21,8 @@
 - **O-16** Anthropic 路径 `x-grokgo-cache-mode: upstream-prefix-only`
 - **O-17** document block 400；未知 content block 打 warn
 - **O-18** `/health` → `accountsRoutable` / `accountsTotal`
-- 模块：`error_codes.rs`、`tool_surface.rs`；`cargo test --lib` 197 ok
+- 模块：`error_codes.rs`、`tool_surface.rs`；`cargo test --lib` 199 ok
+- 复查修复：`map_client_model` 不再把 haiku 塌到 default；proxy 外层 Err 走 LayeredError；CC Switch haiku=`grok-4.20-0309-non-reasoning`；video_generate schema 暴露 `wait`
 
 ## 2026-07-16（实验：仿冒 Grok Build 双平面）
 

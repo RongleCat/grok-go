@@ -1068,6 +1068,16 @@ mod tests {
         let (m, r) = resolve_model(&cfg, "claude-sonnet-4-5-20250929");
         assert_eq!(m, "grok-4.5");
         assert!(r.contains("sonnet") || r == "mapped" || r == "claude-tier-sonnet");
+        // Full Claude Code path: map_client_model → resolve_model must keep haiku tier.
+        let (mapped, _) = crate::gateway::anthropic::map_client_model(
+            "claude-haiku-4-5-20251001",
+            &cfg.default_model,
+        );
+        assert_eq!(mapped, "grok-4.20-0309-non-reasoning");
+        let (resolved, reason) = resolve_model(&cfg, &mapped);
+        assert_eq!(resolved, "grok-4.20-0309-non-reasoning");
+        assert_ne!(resolved, cfg.default_model);
+        assert!(reason == "passthrough" || reason.contains("haiku") || reason == "mapped");
     }
 
     fn resolve_passes_known_text_models_and_maps_gpt() {

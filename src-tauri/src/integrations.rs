@@ -2602,13 +2602,16 @@ fn claude_provider_settings_config(config: &AppConfig) -> serde_json::Value {
     let base = anthropic_base_url(config);
     let token = config.local_token.trim();
     let model = crate::config::cc_switch_import_default_model(&config.default_model);
-    // Haiku can map to a lighter model when catalog allows; keep simple: same default
-    // unless user default is already grok-4.3.
-    let haiku = if model == "grok-4.5" {
-        "grok-4.3"
-    } else {
-        model
-    };
+    // O-10: haiku → faster non-reasoning tier (same as map_claude_shell_model).
+    let haiku = crate::config::map_claude_shell_model("claude-haiku")
+        .map(|(m, _)| m.to_string())
+        .unwrap_or_else(|| "grok-4.20-0309-non-reasoning".into());
+    let sonnet = crate::config::map_claude_shell_model("claude-sonnet")
+        .map(|(m, _)| m.to_string())
+        .unwrap_or_else(|| model.to_string());
+    let opus = crate::config::map_claude_shell_model("claude-opus")
+        .map(|(m, _)| m.to_string())
+        .unwrap_or_else(|| model.to_string());
     json!({
         "env": {
             "ANTHROPIC_BASE_URL": base,
@@ -2616,8 +2619,8 @@ fn claude_provider_settings_config(config: &AppConfig) -> serde_json::Value {
             "ANTHROPIC_API_KEY": token,
             "ANTHROPIC_MODEL": model,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": model
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": opus
         }
     })
 }
@@ -3098,7 +3101,7 @@ mod tests {
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
                 .and_then(|v| v.as_str()),
-            Some("grok-4.3")
+            Some("grok-4.20-0309-non-reasoning")
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")

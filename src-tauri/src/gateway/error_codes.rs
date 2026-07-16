@@ -285,5 +285,18 @@ mod tests {
         assert!(body.get("error").is_some());
         assert_eq!(body["error"]["code"], GATEWAY_DOWN);
         assert!(body["error"]["retryable"].as_bool().unwrap());
+        assert!(!body["error"]["hint"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn anthropic_body_embeds_code_and_hint() {
+        let e = classify_transport_error("operation timed out");
+        let body = e.anthropic_body();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["code"], UPSTREAM_TIMEOUT);
+        assert!(body["error"]["retryable"].as_bool().unwrap());
+        let msg = body["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("UPSTREAM_TIMEOUT"));
+        assert!(!body["error"]["hint"].as_str().unwrap().is_empty());
     }
 }

@@ -15,6 +15,12 @@ pub struct ConvertedChatRequest {
 /// Map Claude Code model names (haiku/sonnet/opus) before `resolve_model`.
 ///
 /// Returns `(candidate_model, mapping_hint)`.
+///
+/// O-10: do **not** collapse Claude shell names to `default_model` here — that
+/// skips tier mapping in [`crate::config::resolve_model`] /
+/// [`crate::config::map_claude_shell_model`]. Return a stable Grok candidate
+/// (haiku → non-reasoning; sonnet/opus → grok-4.5) so resolve_model can still
+/// honor exact `model_mappings` keys when present.
 pub fn map_client_model(requested: &str, default_model: &str) -> (String, String) {
     let trimmed = requested.trim();
     if trimmed.is_empty() {
@@ -25,10 +31,13 @@ pub fn map_client_model(requested: &str, default_model: &str) -> (String, String
     if lower.starts_with("grok") || lower.contains("imagine") {
         return (trimmed.to_string(), "anthropic-passthrough".into());
     }
-    // Claude family aliases → default Grok text model (user can override via model_mappings).
-    if lower.contains("claude") || lower.contains("haiku") || lower.contains("sonnet") || lower.contains("opus")
-    {
-        return (default_model.to_string(), "anthropic-claude-alias".into());
+    // Claude family: tier map (must not use default_model for all shells).
+    if let Some((model, reason)) = crate::config::map_claude_shell_model(trimmed) {
+        return (model.to_string(), reason.into());
+    }
+    if lower.contains("claude") {
+        // Generic claude-* without haiku/sonnet/opus → default text model.
+        return (default_model.to_string(), "anthropic-claude-generic".into());
     }
     (trimmed.to_string(), "anthropic-passthrough".into())
 }
@@ -501,9 +510,21 @@ mod tests {
     fn map_client_model_claude_alias() {
         let (m, reason) = map_client_model("claude-sonnet-4-20250514", "grok-4.5");
         assert_eq!(m, "grok-4.5");
-        assert_eq!(reason, "anthropic-claude-alias");
+        assert_eq!(reason, "claude-tier-sonnet");
         let (m2, _) = map_client_model("grok-4.3", "grok-4.5");
         assert_eq!(m2, "grok-4.3");
+    }
+
+    #[test]
+    fn map_client_model_haiku_is_non_reasoning_tier() {
+        let (m, reason) = map_client_model("claude-haiku-4-5-20251001", "grok-4.5");
+        assert_eq!(m, "grok-4.20-0309-non-reasoning");
+        assert_eq!(reason, "claude-tier-haiku");
+        // Must not collapse to the caller's default_model.
+        assert_ne!(m, "grok-4.5");
+        let (opus, r) = map_client_model("claude-opus-4-6", "grok-4.5");
+        assert_eq!(opus, "grok-4.5");
+        assert_eq!(r, "claude-tier-opus");
     }
 
     #[test]

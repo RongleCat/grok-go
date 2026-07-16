@@ -165,11 +165,18 @@ pub async fn proxy_json(
 ) -> Response {
     match proxy_json_inner(ctx, method, path, headers, body, client_source).await {
         Ok(resp) => resp,
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            json!({"error": {"message": err.to_string(), "type": "proxy_error"}}).to_string(),
-        )
-            .into_response(),
+        Err(err) => {
+            let layered =
+                crate::gateway::error_codes::classify_transport_error(&err.to_string());
+            let status =
+                StatusCode::from_u16(layered.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut body = layered.openai_body();
+            // Keep original message for diagnostics while preserving code/retryable/hint.
+            if let Some(obj) = body.get_mut("error").and_then(|e| e.as_object_mut()) {
+                obj.insert("message".into(), json!(err.to_string()));
+            }
+            (status, Json(body)).into_response()
+        }
     }
 }
 
@@ -184,9 +191,12 @@ pub async fn proxy_anthropic_messages(
     match proxy_anthropic_messages_inner(ctx, headers, body).await {
         Ok(resp) => resp,
         Err(err) => {
-            let status = StatusCode::BAD_GATEWAY;
-            let body = crate::gateway::anthropic::anthropic_error_body("api_error", err.to_string());
-            (status, body.to_string()).into_response()
+            let layered =
+                crate::gateway::error_codes::classify_transport_error(&err.to_string());
+            let status =
+                StatusCode::from_u16(layered.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = layered.anthropic_body();
+            (status, Json(body)).into_response()
         }
     }
 }

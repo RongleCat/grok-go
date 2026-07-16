@@ -749,7 +749,7 @@ fn mcp_tools_catalog_all() -> Value {
         },
         {
             "name": "video_generate",
-            "description": "Generate a video (text-to-video OR image-to-video OR multi-reference). CALL IMMEDIATELY — do NOT web_search or grep the repo for parameters. This schema is complete.\n\nMODES (pick one):\n1) Text-to-video: prompt only\n2) Image-to-video (图生视频 / animate still): prompt + image_url (starting frame)\n3) Reference-to-video: prompt + reference_image_urls (1–7 style/content refs). Do NOT combine image_url with reference_image_urls.\n\nARGS (complete):\n- prompt (string, REQUIRED): scene + motion description\n- image_url (string, optional): starting-frame image for image-to-video. Accepts https://, data:, absolute local path, file://\n- reference_image_urls (string[], optional): 1–7 reference images (same URL/path forms). Alternative to image_url\n- duration (number 1–15, optional): seconds (default upstream ~5–8)\n- aspect_ratio (string, optional): 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3. Image-to-video defaults to source image AR if omitted\n- resolution (string, optional): 480p | 720p | 1080p (1080p only on some models / image-to-video)\n- model (string, optional; default grok-imagine-video)\n\nBEHAVIOR: submits job, polls until done, downloads mp4 to ~/.grok-go/artifacts/, returns local path.\nRETURNS JSON: path/file/files (absolute local mp4), markdown ![video](/abs/path.mp4). Never show remote CDN urls.\n\nEXAMPLES:\n- Text: {\"prompt\":\"cat running through tall grass at golden hour\",\"duration\":8,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\"}\n- Image-to-video: {\"prompt\":\"gentle camera push-in, soft wind in fur\",\"image_url\":\"/Users/me/.grok-go/artifacts/cat.png\",\"duration\":6}\n- Refs: {\"prompt\":\"cinematic fashion walk\",\"reference_image_urls\":[\"/tmp/a.jpg\",\"/tmp/b.jpg\"],\"duration\":6}",
+            "description": "Generate a video (text-to-video OR image-to-video OR multi-reference). CALL IMMEDIATELY — do NOT web_search or grep the repo for parameters. This schema is complete.\n\nMODES (pick one):\n1) Text-to-video: prompt only\n2) Image-to-video (图生视频 / animate still): prompt + image_url (starting frame)\n3) Reference-to-video: prompt + reference_image_urls (1–7 style/content refs). Do NOT combine image_url with reference_image_urls.\n\nARGS (complete):\n- prompt (string, REQUIRED): scene + motion description\n- image_url (string, optional): starting-frame image for image-to-video. Accepts https://, data:, absolute local path, file://\n- reference_image_urls (string[], optional): 1–7 reference images (same URL/path forms). Alternative to image_url\n- duration (number 1–15, optional): seconds (default upstream ~5–8)\n- aspect_ratio (string, optional): 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3. Image-to-video defaults to source image AR if omitted\n- resolution (string, optional): 480p | 720p | 1080p (1080p only on some models / image-to-video)\n- model (string, optional; default grok-imagine-video)\n- wait (boolean, optional, default true): if false, return job_id immediately and poll GET /v1/videos/{id}\n\nBEHAVIOR: by default submits job, polls until done, downloads mp4 to ~/.grok-go/artifacts/, returns local path. With wait=false returns job_id + poll path without waiting.\nRETURNS JSON: path/file/files (absolute local mp4), markdown ![video](/abs/path.mp4). Never show remote CDN urls.\n\nEXAMPLES:\n- Text: {\"prompt\":\"cat running through tall grass at golden hour\",\"duration\":8,\"aspect_ratio\":\"16:9\",\"resolution\":\"720p\"}\n- Image-to-video: {\"prompt\":\"gentle camera push-in, soft wind in fur\",\"image_url\":\"/Users/me/.grok-go/artifacts/cat.png\",\"duration\":6}\n- Refs: {\"prompt\":\"cinematic fashion walk\",\"reference_image_urls\":[\"/tmp/a.jpg\",\"/tmp/b.jpg\"],\"duration\":6}\n- Async submit: {\"prompt\":\"ocean waves\",\"wait\":false}",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -788,6 +788,11 @@ fn mcp_tools_catalog_all() -> Value {
                     "model": {
                         "type": "string",
                         "description": "OPTIONAL. Default: grok-imagine-video."
+                    },
+                    "wait": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "OPTIONAL. Default true = poll until done. false = submit only and return job_id + poll path GET /v1/videos/{id}."
                     }
                 },
                 "required": ["prompt"]
@@ -1472,9 +1477,15 @@ mod mcp_handshake_tests {
             "aspect_ratio",
             "resolution",
             "model",
+            "wait",
         ] {
             assert!(props.get(key).is_some(), "missing property {key}");
         }
+        assert_eq!(
+            props.pointer("/wait/type").and_then(|v| v.as_str()),
+            Some("boolean")
+        );
+        assert!(desc.contains("wait"), "description must document wait");
     }
 
     #[tokio::test]
